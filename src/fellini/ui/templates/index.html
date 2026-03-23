@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fellini</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <script>
+      window.__FELLINI_BOOTSTRAP__ = {
+        profiles: {{ profiles | tojson }},
+        executionModes: {{ execution_modes | tojson }},
+        stepNames: {{ step_names | tojson }},
+        jobs: {{ jobs | tojson }}
+      };
+    </script>
+
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <p class="eyebrow">Local Short-Form Studio</p>
+          <h1>Fellini</h1>
+          <p class="topbar-copy">
+            Ingest, transcript, editorial cut, subtitle ASS e render finale in una control room
+            pensata per produzione e debug.
+          </p>
+        </div>
+
+        <nav class="workspace-nav">
+          <button type="button" class="nav-chip active" data-view-target="launchpad">Launchpad</button>
+          <button type="button" class="nav-chip" data-view-target="automatic">Auto Room</button>
+          <button type="button" class="nav-chip" data-view-target="manual">Manual Studio</button>
+        </nav>
+
+        <div class="topbar-meta">
+          <span class="meta-pill">FFmpeg + Faster-Whisper + WhisperX</span>
+          <p id="topbar-status" class="muted">
+            Seleziona un job oppure apri il Launchpad per configurare una nuova sessione.
+          </p>
+        </div>
+      </header>
+
+      <main class="app-grid">
+        <aside class="navigator-pane">
+          <div class="pane-head">
+            <p class="eyebrow">Projects</p>
+            <h2>Browser</h2>
+            <p class="muted">
+              Naviga i job recenti e passa velocemente tra produzione automatica e sessioni di debug.
+            </p>
+          </div>
+
+          <div class="filter-row">
+            <button type="button" class="filter-chip active" data-job-filter="all">Tutti</button>
+            <button type="button" class="filter-chip" data-job-filter="automatic">Automatici</button>
+            <button type="button" class="filter-chip" data-job-filter="step_by_step">Manuali</button>
+          </div>
+
+          <div id="job-list" class="job-list"></div>
+        </aside>
+
+        <section class="workspace-frame">
+          <section id="launchpad-view" class="workspace-view active">
+            <div class="launchpad-grid">
+              <article class="panel launch-hero">
+                <div class="panel-eyebrow">Setup</div>
+                <h2>Scegli il ritmo della sessione</h2>
+                <p class="muted">
+                  Automatico per portare rapidamente a casa il deliverable. Manuale per vedere ogni
+                  elaborazione, ripetere gli step e fare debug come in una suite di editing.
+                </p>
+
+                <div class="mode-grid">
+                  <button type="button" class="mode-card" data-quick-mode="automatic">
+                    <small>Automatic</small>
+                    <strong>Run Full Pipeline</strong>
+                    <p>Ideale per batch veloci, review di output, controllo room e download immediato.</p>
+                  </button>
+
+                  <button type="button" class="mode-card" data-quick-mode="step_by_step">
+                    <small>Manual</small>
+                    <strong>Open Manual Studio</strong>
+                    <p>Perfetto per tuning fine, preview di artefatti, rerun step-by-step e debug.</p>
+                  </button>
+                </div>
+
+                <div class="launch-metrics">
+                  <div class="metric-card">
+                    <span>Workflow</span>
+                    <strong>Pipeline ispezionabile</strong>
+                    <p>Ogni step salva artefatti e output intermedi nel workspace.</p>
+                  </div>
+                  <div class="metric-card">
+                    <span>Debug</span>
+                    <strong>Rerun controllati</strong>
+                    <p>Carica la config di un job nel form, ritocca e rilancia solo quello che serve.</p>
+                  </div>
+                </div>
+              </article>
+
+              <section class="panel panel-form">
+                <div class="panel-head">
+                  <h2>Nuovo job</h2>
+                  <p>Configura il progetto e decidi subito se lavorare in automatico o step-by-step.</p>
+                </div>
+
+                <form id="job-form">
+                  <div class="form-grid">
+                    <label>
+                      <span>Titolo</span>
+                      <input type="text" name="title" value="Nuovo progetto" required />
+                    </label>
+
+                    <label>
+                      <span>Profilo</span>
+                      <select name="profile" id="profile-select"></select>
+                    </label>
+
+                    <label>
+                      <span>Modalità esecuzione</span>
+                      <select name="execution_mode" id="execution-mode-select"></select>
+                    </label>
+
+                    <label>
+                      <span>Lingua</span>
+                      <input type="text" name="language" value="it" />
+                    </label>
+                  </div>
+
+                  <label>
+                    <span>Note editoriali</span>
+                    <textarea
+                      name="editorial_notes"
+                      rows="4"
+                      placeholder="Tone of voice, CTA, hook da privilegiare, tagli da evitare..."
+                    ></textarea>
+                  </label>
+
+                  <label class="file-field">
+                    <span>File input</span>
+                    <input type="file" name="files" multiple />
+                    <small>
+                      Puoi caricare uno o più file per lo stesso video. Se stai facendo debug su un
+                      job esistente i file non servono.
+                    </small>
+                  </label>
+
+                  <div class="toggles">
+                    <label class="toggle">
+                      <input type="checkbox" name="use_whisperx" checked />
+                      <span>WhisperX alignment</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" name="use_local_llm" />
+                      <span>LLM locale per refinement</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" name="render_clean" checked />
+                      <span>Export clean</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" name="render_captioned" checked />
+                      <span>Export captioned</span>
+                    </label>
+                  </div>
+
+                  <div id="custom-settings" class="config-stack hidden">
+                    <div class="config-card">
+                      <div class="config-head">
+                        <strong>Transcription</strong>
+                        <p>Decoder, compute type e controlli base dell’ASR.</p>
+                      </div>
+                      <div class="form-grid">
+                        <label>
+                          <span>Model</span>
+                          <input type="text" name="transcription_model" value="large-v3" />
+                        </label>
+                        <label>
+                          <span>Beam size</span>
+                          <input type="number" name="transcription_beam_size" min="1" max="10" value="5" />
+                        </label>
+                        <label>
+                          <span>Compute type</span>
+                          <input type="text" name="transcription_compute_type" value="int8" />
+                        </label>
+                        <label>
+                          <span>Device</span>
+                          <input type="text" name="transcription_device" value="auto" />
+                        </label>
+                      </div>
+                      <div class="toggles compact">
+                        <label class="toggle">
+                          <input type="checkbox" name="transcription_vad_filter" checked />
+                          <span>VAD filter</span>
+                        </label>
+                        <label class="toggle">
+                          <input type="checkbox" name="transcription_condition_on_prev_text" />
+                          <span>Condition on prev text</span>
+                        </label>
+                        <label class="toggle">
+                          <input type="checkbox" name="transcription_word_timestamps" checked />
+                          <span>Word timestamps</span>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div class="config-card">
+                      <div class="config-head">
+                        <strong>Editorial Decision</strong>
+                        <p>Fine tuning di pause, contesto ai bordi e parole filler.</p>
+                      </div>
+                      <div class="form-grid">
+                        <label>
+                          <span>Soft pause sec</span>
+                          <input type="number" step="0.01" name="decision_soft_pause_threshold_seconds" value="0.25" />
+                        </label>
+                        <label>
+                          <span>Hard pause sec</span>
+                          <input type="number" step="0.01" name="decision_hard_pause_threshold_seconds" value="0.7" />
+                        </label>
+                        <label>
+                          <span>Leading context sec</span>
+                          <input type="number" step="0.01" name="decision_leading_context_seconds" value="0.18" />
+                        </label>
+                        <label>
+                          <span>Trailing context sec</span>
+                          <input type="number" step="0.01" name="decision_trailing_context_seconds" value="0.18" />
+                        </label>
+                        <label>
+                          <span>Retained pause sec</span>
+                          <input type="number" step="0.01" name="decision_retained_pause_seconds" value="0.24" />
+                        </label>
+                        <label>
+                          <span>Repetition window sec</span>
+                          <input type="number" step="0.01" name="decision_repetition_window_seconds" value="0.6" />
+                        </label>
+                        <label class="field-span-2">
+                          <span>Filler words</span>
+                          <textarea name="decision_filler_words" rows="3">eh, ehm, emm, mmm, uhm, allora, cioe, cioè, ok, diciamo, praticamente, tipo</textarea>
+                        </label>
+                      </div>
+                    </div>
+
+                    <div class="config-card">
+                      <div class="config-head">
+                        <strong>Subtitles</strong>
+                        <p>Chunking, stile ASS e comportamento del caption pop.</p>
+                      </div>
+                      <div class="form-grid">
+                        <label>
+                          <span>Parole per chunk</span>
+                          <input type="number" min="1" max="6" name="subtitle_chunk_words" value="3" />
+                        </label>
+                        <label>
+                          <span>Font</span>
+                          <input type="text" name="subtitle_font_name" value="Avenir Next" />
+                        </label>
+                        <label>
+                          <span>Font size</span>
+                          <input type="number" min="24" max="140" name="subtitle_font_size" value="68" />
+                        </label>
+                        <label>
+                          <span>Bottom margin</span>
+                          <input type="number" min="80" max="480" name="subtitle_bottom_margin" value="220" />
+                        </label>
+                        <label>
+                          <span>Pop in ms</span>
+                          <input type="number" min="0" max="1000" name="subtitle_pop_in_ms" value="140" />
+                        </label>
+                        <label>
+                          <span>Text color</span>
+                          <input type="text" name="subtitle_text_color" value="FFFFFF" />
+                        </label>
+                        <label>
+                          <span>Active color</span>
+                          <input type="text" name="subtitle_active_color" value="73E3FF" />
+                        </label>
+                        <label>
+                          <span>Outline color</span>
+                          <input type="text" name="subtitle_outline_color" value="101214" />
+                        </label>
+                      </div>
+                    </div>
+
+                    <div class="config-card">
+                      <div class="config-head">
+                        <strong>Render</strong>
+                        <p>Codec, risoluzione e compressione finale.</p>
+                      </div>
+                      <div class="form-grid">
+                        <label>
+                          <span>Width</span>
+                          <input type="number" min="720" name="render_width" value="1080" />
+                        </label>
+                        <label>
+                          <span>Height</span>
+                          <input type="number" min="1280" name="render_height" value="1920" />
+                        </label>
+                        <label>
+                          <span>Video codec</span>
+                          <input type="text" name="render_video_codec" value="libx264" />
+                        </label>
+                        <label>
+                          <span>Audio codec</span>
+                          <input type="text" name="render_audio_codec" value="aac" />
+                        </label>
+                        <label>
+                          <span>Preset</span>
+                          <input type="text" name="render_preset" value="slow" />
+                        </label>
+                        <label>
+                          <span>CRF</span>
+                          <input type="number" min="0" max="35" name="render_crf" value="18" />
+                        </label>
+                        <label>
+                          <span>Audio bitrate</span>
+                          <input type="text" name="render_audio_bitrate" value="192k" />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="actions">
+                    <div class="inline-actions">
+                      <button type="submit" id="submit-button">Crea job</button>
+                      <button type="button" class="secondary-button" id="load-selected-button">Carica job nel form</button>
+                      <button type="button" class="secondary-button" id="update-selected-button">Salva tuning sul job</button>
+                    </div>
+                    <p id="submit-status" class="muted"></p>
+                  </div>
+                </form>
+              </section>
+            </div>
+          </section>
+
+          <section id="automatic-view" class="workspace-view">
+            <div id="automatic-workspace" class="workspace-canvas empty">
+              <h2>Auto Room</h2>
+              <p>Seleziona un job automatico per vedere player, timeline, output e artifact spotlight.</p>
+            </div>
+          </section>
+
+          <section id="manual-view" class="workspace-view">
+            <div id="manual-workspace" class="workspace-canvas empty">
+              <h2>Manual Studio</h2>
+              <p>Seleziona un job manuale per aprire il workspace con preview, inspector e rerun step-by-step.</p>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

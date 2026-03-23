@@ -1,0 +1,9 @@
+app_name: Fellini
+workspace_root: workspace
+host: 127.0.0.1
+port: 8123
+ffmpeg_bin: ffmpeg
+ffprobe_bin: ffprobe
+fonts_dir:
+recent_jobs: 12
+degraded_mode_when_ai_missing: true
