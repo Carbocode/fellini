@@ -50,38 +50,64 @@ class AssSubtitleBuilder:
         )
 
     def _dialogues_for_chunk(self, chunk, config: SubtitleConfig, width: int, height: int) -> str:
-        lines: list[str] = []
+        words = chunk.words
+        display = list(chunk.display_words or [w.text for w in words])
+        if not words:
+            return ""
+
         pos_x = width // 2
         pos_y = height - config.bottom_margin
+        chunk_start = words[0].start
+        chunk_end = words[-1].end
 
-        for active_index, active_word in enumerate(chunk.words):
-            display_words = list(chunk.display_words or [word.text for word in chunk.words])
-            display_words[active_index] = (
-                "{\\c&H00"
-                + config.active_color
-                + "&\\fscx106\\fscy106}"
-                + self._escape(display_words[active_index])
-                + "{\\r}"
-            )
-            text = " ".join(
-                self._escape(word) if "{\\c&H00" not in word else word for word in display_words
-            )
-            lines.append(
-                "Dialogue: 0,"
-                + self._timestamp(active_word.start)
-                + ","
-                + self._timestamp(active_word.end)
-                + ",Base,,0,0,0,,"
-                + "{\\an2"
-                + f"\\pos({pos_x},{pos_y})"
-                + "\\fscx92\\fscy92"
-                + f"\\t(0,{config.pop_in_ms},\\fscx100\\fscy100)"
-                + "}"
-                + text
-                + "\n"
-            )
+        # Build a single Dialogue line for the entire chunk.
+        # Each word uses timed color overrides so only the active word
+        # highlights — the text block stays on screen without re-animating.
+        parts: list[str] = []
+        for i, word in enumerate(words):
+            escaped = self._escape(display[i])
+            # Time offsets relative to the Dialogue start (in ms)
+            word_on = max(0, round((word.start - chunk_start) * 1000))
+            word_off = max(word_on + 1, round((word.end - chunk_start) * 1000))
 
-        return "".join(lines)
+            if i == 0:
+                # First word: start already highlighted, then revert at word_off.
+                parts.append(
+                    "{\\c&H00" + config.active_color + "&\\fscx106\\fscy106"
+                    + f"\\t({word_off},{word_off},"
+                    + f"\\c&H00{config.text_color}&\\fscx100\\fscy100)"
+                    + "}"
+                    + escaped
+                )
+            else:
+                # Subsequent words: default color, highlight on, then revert.
+                parts.append(
+                    "{\\c&H00" + config.text_color + "&"
+                    + f"\\t({word_on},{word_on},"
+                    + f"\\c&H00{config.active_color}&\\fscx106\\fscy106)"
+                    + f"\\t({word_off},{word_off},"
+                    + f"\\c&H00{config.text_color}&\\fscx100\\fscy100)"
+                    + "}"
+                    + escaped
+                )
+
+        text = " ".join(parts)
+
+        line = (
+            "Dialogue: 0,"
+            + self._timestamp(chunk_start)
+            + ","
+            + self._timestamp(chunk_end)
+            + ",Base,,0,0,0,,"
+            + "{\\an2"
+            + f"\\pos({pos_x},{pos_y})"
+            + "\\fscx100\\fscy100"
+            + f"\\t(0,{config.pop_in_ms},\\fscx100\\fscy100)"
+            + "}"
+            + text
+            + "\n"
+        )
+        return line
 
     @staticmethod
     def _timestamp(seconds: float) -> str:

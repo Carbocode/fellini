@@ -7,14 +7,15 @@ from fellini.domain.models import StepName
 from fellini.settings import AppSettings
 
 
-def test_index_and_jobs_api(tmp_path):
+def test_api_config_and_jobs(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     app = create_app(settings)
     client = TestClient(app)
 
-    index = client.get("/")
-    assert index.status_code == 200
-    assert "Fellini" in index.text
+    config = client.get("/api/config")
+    assert config.status_code == 200
+    assert "profiles" in config.json()
+    assert "balanced" in config.json()["profiles"]
 
     jobs = client.get("/api/jobs")
     assert jobs.status_code == 200

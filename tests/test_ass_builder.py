@@ -21,6 +21,13 @@ def test_ass_builder_generates_highlight_dialogues():
     ass = builder.build(artifact, SubtitleConfig(), width=1080, height=1920)
 
     assert "[Script Info]" in ass
-    assert "Dialogue: 0,0:00:00.00,0:00:00.40" in ass
-    assert "\\c&H00" in ass
+    # Single Dialogue spanning the entire chunk
+    assert "Dialogue: 0,0:00:00.00,0:00:00.80" in ass
+    # Both words in the same line
+    assert "questa" in ass
     assert "parte" in ass
+    # Timed color overrides for karaoke highlight
+    assert "\\c&H00" in ass
+    assert "\\t(" in ass
+    # Only one Dialogue line per chunk
+    assert ass.count("Dialogue:") == 1

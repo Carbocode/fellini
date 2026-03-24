@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from threading import Lock
 from uuid import uuid4
 
@@ -59,6 +60,11 @@ class JobStore:
         return sorted(jobs, key=lambda item: item.updated_at, reverse=True)[
             : self.settings.recent_jobs
         ]
+
+    def delete(self, job_id: str) -> None:
+        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        if workspace.job_dir.exists():
+            shutil.rmtree(workspace.job_dir)
 
     def update(self, job_id: str, mutator) -> JobSnapshot:
         with self._lock:

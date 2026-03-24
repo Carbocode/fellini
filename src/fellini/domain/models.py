@@ -125,11 +125,11 @@ class DecisionConfig(BaseModel):
         ]
     )
     repetition_window_seconds: float = Field(default=0.6, ge=0.1, le=2.0)
-    soft_pause_threshold_seconds: float = Field(default=0.25, ge=0.05, le=2.0)
-    hard_pause_threshold_seconds: float = Field(default=0.7, ge=0.1, le=4.0)
-    leading_context_seconds: float = Field(default=0.18, ge=0.02, le=1.0)
-    trailing_context_seconds: float = Field(default=0.18, ge=0.02, le=1.0)
-    retained_pause_seconds: float = Field(default=0.24, ge=0.0, le=1.5)
+    soft_pause_threshold_seconds: float = Field(default=0.8, ge=0.05, le=4.0)
+    hard_pause_threshold_seconds: float = Field(default=1.5, ge=0.1, le=6.0)
+    leading_context_seconds: float = Field(default=0.4, ge=0.02, le=2.0)
+    trailing_context_seconds: float = Field(default=0.4, ge=0.02, le=2.0)
+    retained_pause_seconds: float = Field(default=0.5, ge=0.0, le=3.0)
     local_model_name: str = "Qwen/Qwen3-8B"
 
 

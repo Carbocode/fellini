@@ -4,10 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 
 from fellini.domain.models import (
     DEFAULT_STEPS,
@@ -125,6 +124,13 @@ def _validate_step_run(snapshot, step_name: StepName) -> None:
         )
 
 
+def _resolve_frontend_dist() -> Path | None:
+    candidate = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
+    if candidate.is_dir() and (candidate / "index.html").is_file():
+        return candidate
+    return None
+
+
 def create_app(settings: AppSettings | None = None) -> FastAPI:
     app_settings = settings or load_settings()
     store = JobStore(app_settings)
@@ -135,22 +141,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.store = store
     app.state.manager = manager
 
-    base_dir = Path(__file__).parent / "ui"
-    templates = Jinja2Templates(directory=str(base_dir / "templates"))
-    app.mount("/static", StaticFiles(directory=str(base_dir / "static")), name="static")
+    frontend_dist = _resolve_frontend_dist()
 
-    @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> HTMLResponse:
-        return templates.TemplateResponse(
-            request=request,
-            name="index.html",
-            context={
-                "jobs": [job.model_dump(mode="json") for job in store.list_jobs()],
-                "profiles": [profile.value for profile in RunProfile],
-                "execution_modes": [mode.value for mode in ExecutionMode],
-                "step_names": [step.value for step in DEFAULT_STEPS],
-            },
-        )
+    if frontend_dist:
+        assets_dir = frontend_dist / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/api/config")
+    async def get_config():
+        return {
+            "profiles": [profile.value for profile in RunProfile],
+            "execution_modes": [mode.value for mode in ExecutionMode],
+            "step_names": [step.value for step in DEFAULT_STEPS],
+        }
 
     @app.get("/api/jobs")
     async def list_jobs():
@@ -159,6 +163,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str):
         return _require_job(store, job_id)
+
+    @app.delete("/api/jobs/{job_id}")
+    async def delete_job(job_id: str):
+        snapshot = _require_job(store, job_id)
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="Cannot delete a running job.")
+        store.delete(job_id)
+        return {"deleted": True, "job_id": job_id}
 
     @app.post("/api/jobs")
     async def create_job(
@@ -194,6 +206,32 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         updated = manager.update_request(job_id, request_model)
         return updated
 
+    @app.put("/api/jobs/{job_id}/transcript")
+    async def update_transcript(job_id: str, payload: dict[str, Any] = Body(...)):
+        snapshot = _require_job(store, job_id)
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot edit transcript while a run is in progress.",
+            )
+
+        from fellini.domain.models import TranscriptArtifact
+
+        try:
+            transcript = TranscriptArtifact.model_validate(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid transcript: {exc}") from exc
+
+        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        aligned_path = workspace.artifact_path("04_transcript_aligned.json")
+        aligned_path.write_text(
+            transcript.model_dump_json(indent=2), encoding="utf-8"
+        )
+
+        # Reset downstream steps (editorial + render) since transcript changed
+        store.reset_from_step(job_id, StepName.editorial)
+        return store.load(job_id)
+
     @app.post("/api/jobs/{job_id}/steps/{step_name}/run")
     async def run_job_step(job_id: str, step_name: StepName):
         snapshot = _require_job(store, job_id)
@@ -211,5 +249,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if not target.exists():
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(target)
+
+    if frontend_dist:
+        @app.get("/{full_path:path}")
+        async def spa_fallback(full_path: str):
+            return FileResponse(frontend_dist / "index.html")
 
     return app
