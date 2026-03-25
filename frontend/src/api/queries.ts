@@ -7,6 +7,17 @@ import type { Accessor } from "solid-js";
 import * as api from "./client";
 import type { JobSnapshot } from "../types";
 
+function syncJobSnapshot(qc: ReturnType<typeof useQueryClient>, snapshot: JobSnapshot) {
+  qc.setQueryData(["job", snapshot.id], snapshot);
+  const jobs = qc.getQueryData<JobSnapshot[]>(["jobs"]);
+  if (!jobs) return;
+
+  const nextJobs = jobs.some((job) => job.id === snapshot.id)
+    ? jobs.map((job) => (job.id === snapshot.id ? snapshot : job))
+    : [snapshot, ...jobs];
+  qc.setQueryData(["jobs"], nextJobs);
+}
+
 export function useConfigQuery() {
   return createQuery(() => ({
     queryKey: ["config"],
@@ -49,8 +60,8 @@ export function useCreateJobMutation() {
   const qc = useQueryClient();
   return createMutation(() => ({
     mutationFn: (formData: FormData) => api.createJob(formData),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["jobs"] });
+    onSuccess: (snapshot) => {
+      syncJobSnapshot(qc, snapshot);
     },
   }));
 }
@@ -70,10 +81,13 @@ export function useRunStepMutation() {
   return createMutation(() => ({
     mutationFn: (vars: { jobId: string; stepName: string }) =>
       api.runStep(vars.jobId, vars.stepName),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ["jobs"] });
+    onSuccess: (snapshot) => {
+      syncJobSnapshot(qc, snapshot);
+      qc.invalidateQueries({ queryKey: ["artifact", snapshot.id] });
+    },
+    onError: (_error, vars) => {
       qc.invalidateQueries({ queryKey: ["job", vars.jobId] });
-      // Invalidate artifacts — steps produce new ones
+      qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["artifact", vars.jobId] });
     },
   }));
@@ -82,12 +96,11 @@ export function useRunStepMutation() {
 export function useUpdateTranscriptMutation() {
   const qc = useQueryClient();
   return createMutation(() => ({
-    mutationFn: (vars: { jobId: string; transcript: unknown }) =>
-      api.updateTranscript(vars.jobId, vars.transcript),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ["jobs"] });
-      qc.invalidateQueries({ queryKey: ["job", vars.jobId] });
-      qc.invalidateQueries({ queryKey: ["artifact", vars.jobId] });
+    mutationFn: (vars: { jobId: string; transcript: unknown; target: "transcription" | "alignment" }) =>
+      api.updateTranscript(vars.jobId, vars.transcript, vars.target),
+    onSuccess: (snapshot) => {
+      syncJobSnapshot(qc, snapshot);
+      qc.invalidateQueries({ queryKey: ["artifact", snapshot.id] });
     },
   }));
 }
@@ -97,9 +110,9 @@ export function useUpdateRequestMutation() {
   return createMutation(() => ({
     mutationFn: (vars: { jobId: string; payload: Record<string, unknown> }) =>
       api.updateRequest(vars.jobId, vars.payload),
-    onSuccess: (_data, vars) => {
-      qc.invalidateQueries({ queryKey: ["jobs"] });
-      qc.invalidateQueries({ queryKey: ["job", vars.jobId] });
+    onSuccess: (snapshot) => {
+      syncJobSnapshot(qc, snapshot);
+      qc.invalidateQueries({ queryKey: ["artifact", snapshot.id] });
     },
   }));
 }
@@ -125,8 +138,7 @@ export function useJobPolling(jobId: Accessor<string | null>) {
         const fp = jobFingerprint(fresh);
         if (fp !== fingerprint) {
           fingerprint = fp;
-          qc.setQueryData(["job", id], fresh);
-          qc.invalidateQueries({ queryKey: ["jobs"] });
+          syncJobSnapshot(qc, fresh);
           // If step just completed, refresh artifacts
           qc.invalidateQueries({ queryKey: ["artifact", id] });
         }

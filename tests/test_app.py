@@ -3,7 +3,8 @@ import json
 from fastapi.testclient import TestClient
 
 from fellini.app import create_app
-from fellini.domain.models import StepName
+from fellini.domain.models import JobStatus, StepName, StepStatus
+from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
 
 
@@ -103,7 +104,364 @@ def test_custom_job_update_and_step_run_api(tmp_path):
     assert updated_job["request"]["subtitle"]["chunk_words"] == 5
 
     calls = []
-    app.state.manager.start_step = lambda job_id, step_name: calls.append((job_id, step_name))
+    def fake_start_step(job_id, step_name):
+        calls.append((job_id, step_name))
+        app.state.store.mark_running(job_id)
+        return app.state.store.begin_step(job_id, step_name, "running")
+
+    app.state.manager.start_step = fake_start_step
     run_step = client.post(f"/api/jobs/{created_job['id']}/steps/{StepName.ingest.value}/run")
     assert run_step.status_code == 200
     assert calls == [(created_job["id"], StepName.ingest)]
+    assert run_step.json()["status"] == "running"
+    assert run_step.json()["current_step"] == StepName.ingest.value
+
+
+def test_request_update_resets_only_affected_downstream_steps(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    payload = {
+        "title": "Debug job",
+        "profile": "custom",
+        "execution_mode": "step_by_step",
+        "language": "it",
+        "editorial_notes": "",
+        "toggles": {
+            "use_whisperx": True,
+            "use_local_llm": False,
+            "render_clean": True,
+            "render_captioned": True,
+        },
+        "transcription": {
+            "model": "large-v3",
+            "beam_size": 4,
+            "vad_filter": True,
+            "condition_on_prev_text": False,
+            "word_timestamps": True,
+            "compute_type": "int8",
+            "device": "auto",
+        },
+        "subtitle": {
+            "chunk_words": 4,
+            "font_name": "Avenir Next",
+            "font_size": 70,
+            "text_color": "FFFFFF",
+            "active_color": "73E3FF",
+            "outline_color": "101214",
+            "bottom_margin": 220,
+            "pop_in_ms": 140,
+        },
+        "render": {
+            "width": 1080,
+            "height": 1920,
+            "video_codec": "libx264",
+            "audio_codec": "aac",
+            "crf": 18,
+            "preset": "slow",
+            "audio_bitrate": "192k",
+        },
+        "decision": {
+            "filler_words": ["eh", "allora"],
+            "repetition_window_seconds": 0.6,
+            "soft_pause_threshold_seconds": 0.25,
+            "hard_pause_threshold_seconds": 0.7,
+            "leading_context_seconds": 0.18,
+            "trailing_context_seconds": 0.18,
+            "retained_pause_seconds": 0.24,
+        },
+    }
+
+    created_job = client.post(
+        "/api/jobs",
+        data={"job_payload": json.dumps(payload)},
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    def mark_all_steps_completed(snapshot) -> None:
+        snapshot.status = JobStatus.completed
+        snapshot.outputs = ["output/master_vertical_clean.mp4"]
+        for step in snapshot.steps:
+            step.status = StepStatus.completed
+            step.message = "done"
+            step.artifacts = [f"artifacts/{step.name}.json"]
+
+    app.state.store.update(created_job["id"], mark_all_steps_completed)
+
+    chunk_update = client.put(
+        f"/api/jobs/{created_job['id']}/request",
+        json={**payload, "subtitle": {**payload["subtitle"], "chunk_words": 5}},
+    )
+    assert chunk_update.status_code == 200
+    chunk_job = chunk_update.json()
+    assert [step["status"] for step in chunk_job["steps"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert chunk_job["outputs"] == ["output/master_vertical_clean.mp4"]
+
+    app.state.store.update(created_job["id"], mark_all_steps_completed)
+
+    style_update = client.put(
+        f"/api/jobs/{created_job['id']}/request",
+        json={
+            **payload,
+            "subtitle": {**payload["subtitle"], "chunk_words": 5, "font_size": 96},
+        },
+    )
+    assert style_update.status_code == 200
+    style_job = style_update.json()
+    assert [step["status"] for step in style_job["steps"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert style_job["outputs"] == ["output/master_vertical_clean.mp4"]
+
+
+def test_partial_request_update_preserves_existing_state_for_render_tuning(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Balanced job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                    "toggles": {
+                        "use_whisperx": True,
+                        "use_local_llm": False,
+                        "render_clean": True,
+                        "render_captioned": True,
+                    },
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    def mark_all_steps_completed(snapshot) -> None:
+        snapshot.status = JobStatus.completed
+        snapshot.outputs = ["output/master_vertical_clean.mp4"]
+        for step in snapshot.steps:
+            step.status = StepStatus.completed
+            step.message = "done"
+            step.artifacts = [f"artifacts/{step.name}.json"]
+
+    app.state.store.update(created_job["id"], mark_all_steps_completed)
+
+    update = client.put(
+        f"/api/jobs/{created_job['id']}/request",
+        json={
+            "subtitle": {
+                "active_color": "FF0700",
+                "outline_color": "000000",
+                "bottom_margin": 203,
+                "pop_in_ms": 430,
+            }
+        },
+    )
+    assert update.status_code == 200
+    updated = update.json()
+    assert updated["request"]["toggles"]["use_whisperx"] is True
+    assert updated["request"]["toggles"]["render_clean"] is True
+    assert updated["request"]["toggles"]["render_captioned"] is True
+    assert updated["request"]["subtitle"]["active_color"] == "FF0700"
+    assert [step["status"] for step in updated["steps"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert updated["outputs"] == ["output/master_vertical_clean.mp4"]
+
+
+def test_transcript_updates_target_correct_artifact_and_downstream_step(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Transcript target job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    def mark_all_steps_completed(snapshot) -> None:
+        snapshot.status = JobStatus.completed
+        for step in snapshot.steps:
+            step.status = StepStatus.completed
+            step.message = "done"
+            step.artifacts = [f"artifacts/{step.name}.json"]
+
+    app.state.store.update(created_job["id"], mark_all_steps_completed)
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.artifact_path("04_transcript_aligned.json").write_text(
+        json.dumps({"language": "it", "source": "stale", "notes": [], "segments": []}),
+        encoding="utf-8",
+    )
+    workspace.artifact_path("06_edit_decision_list.json").write_text(
+        json.dumps({"source_video": "input.mp4", "keep_ranges": [], "soft_cuts": []}),
+        encoding="utf-8",
+    )
+
+    raw_payload = {
+        "language": "it",
+        "source": "manual",
+        "notes": [],
+        "segments": [
+            {
+                "id": "seg-1",
+                "start": 0.0,
+                "end": 0.6,
+                "text": "ciao",
+                "words": [
+                    {"text": "ciao", "start": 0.0, "end": 0.6, "confidence": 1.0},
+                ],
+            }
+        ],
+    }
+    raw_update = client.put(
+        f"/api/jobs/{created_job['id']}/transcript?target=transcription",
+        json=raw_payload,
+    )
+    assert raw_update.status_code == 200
+    assert workspace.artifact_path("03_transcript_raw.json").exists()
+    assert json.loads(workspace.artifact_path("03_transcript_raw.json").read_text())["segments"][0]["text"] == "ciao"
+    assert workspace.artifact_path("04_transcript_aligned.json").exists()
+    assert json.loads(workspace.artifact_path("04_transcript_aligned.json").read_text())["segments"][0]["text"] == "ciao"
+    assert workspace.artifact_path("06_edit_decision_list.json").exists()
+    assert [step["status"] for step in raw_update.json()["steps"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+
+    app.state.store.update(created_job["id"], mark_all_steps_completed)
+
+    aligned_payload = {
+        "language": "it",
+        "source": "alignment",
+        "notes": [],
+        "segments": [
+            {
+                "id": "seg-1",
+                "start": 0.1,
+                "end": 0.7,
+                "text": "ciao",
+                "words": [
+                    {"text": "ciao", "start": 0.1, "end": 0.7, "confidence": 1.0},
+                ],
+            }
+        ],
+    }
+    aligned_update = client.put(
+        f"/api/jobs/{created_job['id']}/transcript?target=alignment",
+        json=aligned_payload,
+    )
+    assert aligned_update.status_code == 200
+    assert workspace.artifact_path("04_transcript_aligned.json").exists()
+    assert json.loads(workspace.artifact_path("04_transcript_aligned.json").read_text())["segments"][0]["start"] == 0.1
+    assert [step["status"] for step in aligned_update.json()["steps"]] == [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    ]
+
+
+def test_existing_workspace_transcript_marks_transcription_as_completed(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Recovered transcript job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 3.2,
+                        "width": 720,
+                        "height": 1280,
+                        "fps": 25.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    workspace.artifact_path("04_transcript_aligned.json").write_text(
+        json.dumps(
+            {
+                "language": "it",
+                "source": "manual",
+                "notes": [],
+                "segments": [
+                    {
+                        "id": "seg-1",
+                        "start": 0.0,
+                        "end": 0.6,
+                        "text": "ciao",
+                        "words": [
+                            {
+                                "text": "ciao",
+                                "start": 0.0,
+                                "end": 0.6,
+                                "confidence": 1.0,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recovered = client.get(f"/api/jobs/{created_job['id']}")
+    assert recovered.status_code == 200
+    recovered_job = recovered.json()
+    assert [step["status"] for step in recovered_job["steps"]] == [
+        "completed",
+        "completed",
+        "pending",
+        "pending",
+    ]
+    assert recovered_job["steps"][2]["can_run"] is True

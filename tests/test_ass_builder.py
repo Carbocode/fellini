@@ -18,7 +18,17 @@ def test_ass_builder_generates_highlight_dialogues():
         ]
     )
 
-    ass = builder.build(artifact, SubtitleConfig(), width=1080, height=1920)
+    ass = builder.build(
+        artifact,
+        SubtitleConfig(
+            text_color="112233",
+            active_color="73E3FF",
+            outline_color="445566",
+            pop_in_ms=180,
+        ),
+        width=1080,
+        height=1920,
+    )
 
     assert "[Script Info]" in ass
     # Single Dialogue spanning the entire chunk
@@ -26,8 +36,12 @@ def test_ass_builder_generates_highlight_dialogues():
     # Both words in the same line
     assert "questa" in ass
     assert "parte" in ass
+    # ASS colors must be stored in BBGGRR order, not CSS RRGGBB.
+    assert "Style: Base,Avenir Next,68,&H00332211,&H00FFE373,&H00665544" in ass
     # Timed color overrides for karaoke highlight
-    assert "\\c&H00" in ass
+    assert "\\c&H00FFE373&" in ass
     assert "\\t(" in ass
+    # The chunk pop-in now animates from a smaller scale instead of being a no-op.
+    assert "\\fscx84\\fscy84\\t(0,180,\\fscx100\\fscy100)" in ass
     # Only one Dialogue line per chunk
     assert ass.count("Dialogue:") == 1

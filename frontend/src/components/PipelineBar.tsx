@@ -1,7 +1,7 @@
 import { createEffect, For, on, type Component } from "solid-js";
 import { useJobQuery, useRunStepMutation } from "../api/queries";
 import { selectedJobId, selectedStep, setSelectedStep } from "../store";
-import { capitalize, canRunStep, getNextRunnableStep } from "../lib/utils";
+import { capitalize, canRunStep } from "../lib/utils";
 import type { JobSnapshot } from "../types";
 
 const PipelineBar: Component = () => {
@@ -26,23 +26,24 @@ const PipelineBar: Component = () => {
     ),
   );
 
-  const nextStep = () => {
+  const currentStep = () => {
     const j = data();
-    return j ? getNextRunnableStep(j) : null;
+    const stepName = selectedStep();
+    if (!j || !stepName) return null;
+    return j.steps.find((step) => step.name === stepName) ?? null;
   };
 
-  const handleRunNext = () => {
+  const canRunCurrentStep = () => {
     const j = data();
-    const step = nextStep();
-    if (j && step) {
-      runStepMut.mutate({ jobId: j.id, stepName: step });
-    }
+    const step = currentStep();
+    return !!j && !!step && canRunStep(j, step.name);
   };
 
-  const handleRunAll = () => {
-    // Run the next step — polling will pick up completion and the UI
-    // will update. The backend auto-chains in automatic mode.
-    handleRunNext();
+  const handleRunCurrent = () => {
+    const j = data();
+    const step = currentStep();
+    if (!j || !step || !canRunStep(j, step.name)) return;
+    runStepMut.mutate({ jobId: j.id, stepName: step.name });
   };
 
   return (
@@ -56,7 +57,7 @@ const PipelineBar: Component = () => {
                 type="button"
                 class={`pipeline-step ${step.status}${selectedStep() === step.name ? " selected" : ""}`}
                 onClick={() => setSelectedStep(step.name)}
-                title={step.message || step.name}
+                title={step.blocked_reason || step.message || step.name}
               >
                 <span class="step-dot" />
                 <span>{capitalize(step.name)}</span>
@@ -69,14 +70,15 @@ const PipelineBar: Component = () => {
         <button
           type="button"
           class="btn btn-primary btn-sm"
-          disabled={!nextStep() || data()?.status === "running"}
-          onClick={handleRunAll}
+          disabled={!canRunCurrentStep() || data()?.status === "running"}
+          onClick={handleRunCurrent}
+          title={currentStep()?.blocked_reason || ""}
         >
           {data()?.status === "running"
             ? "In esecuzione..."
-            : nextStep()
-              ? `Esegui ${capitalize(nextStep()!)}`
-              : "Pipeline completa"}
+            : currentStep()
+              ? `${currentStep()!.status === "completed" ? "Riesegui" : "Esegui"} ${capitalize(currentStep()!.name)}`
+              : "Seleziona step"}
         </button>
       </div>
     </div>

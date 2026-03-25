@@ -56,19 +56,26 @@ class JobManager:
         self.store.save(snapshot, workspace)
         return snapshot
 
-    def start(self, job_id: str) -> None:
+    def start(self, job_id: str) -> JobSnapshot:
+        prepared = self.orchestrator.prepare_run(self.store.load(job_id))
         thread = Thread(
-            target=lambda: self.orchestrator.run(self.store.load(job_id)),
+            target=lambda: self.orchestrator.run_prepared(self.store.load(job_id)),
             daemon=True,
         )
         thread.start()
+        return prepared
 
-    def start_step(self, job_id: str, step_name: StepName) -> None:
+    def start_step(self, job_id: str, step_name: StepName) -> JobSnapshot:
+        prepared = self.orchestrator.prepare_step_run(self.store.load(job_id), step_name)
         thread = Thread(
-            target=lambda: self.orchestrator.run_step(self.store.load(job_id), step_name),
+            target=lambda: self.orchestrator.run_step_prepared(
+                self.store.load(job_id),
+                step_name,
+            ),
             daemon=True,
         )
         thread.start()
+        return prepared
 
     def run_sync(self, job_id: str) -> JobSnapshot:
         snapshot = self.store.load(job_id)

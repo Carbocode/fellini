@@ -14,6 +14,9 @@ class AssSubtitleBuilder:
         return header + "".join(body)
 
     def _header(self, config: SubtitleConfig, width: int, height: int) -> str:
+        text_color = self._ass_color(config.text_color)
+        active_color = self._ass_color(config.active_color)
+        outline_color = self._ass_color(config.outline_color)
         return "".join(
             [
                 "[Script Info]\n",
@@ -34,10 +37,10 @@ class AssSubtitleBuilder:
                 "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n",
                 (
                     f"Style: Base,{config.font_name},{config.font_size},"
-                    f"&H00{config.text_color},&H00{config.active_color},"
+                    f"{text_color},{active_color},"
                 ),
                 (
-                    f"&H00{config.outline_color},&H64000000,1,0,0,0,100,100,0,0,1,4,2,2,"
+                    f"{outline_color},&H64000000,1,0,0,0,100,100,0,0,1,4,2,2,"
                     f"96,96,{config.bottom_margin},1\n"
                 ),
                 "\n",
@@ -55,6 +58,8 @@ class AssSubtitleBuilder:
         if not words:
             return ""
 
+        text_color = self._ass_color(config.text_color)
+        active_color = self._ass_color(config.active_color)
         pos_x = width // 2
         pos_y = height - config.bottom_margin
         chunk_start = words[0].start
@@ -73,20 +78,20 @@ class AssSubtitleBuilder:
             if i == 0:
                 # First word: start already highlighted, then revert at word_off.
                 parts.append(
-                    "{\\c&H00" + config.active_color + "&\\fscx106\\fscy106"
+                    "{\\c" + active_color + "&\\fscx106\\fscy106"
                     + f"\\t({word_off},{word_off},"
-                    + f"\\c&H00{config.text_color}&\\fscx100\\fscy100)"
+                    + f"\\c{text_color}&\\fscx100\\fscy100)"
                     + "}"
                     + escaped
                 )
             else:
                 # Subsequent words: default color, highlight on, then revert.
                 parts.append(
-                    "{\\c&H00" + config.text_color + "&"
+                    "{\\c" + text_color + "&"
                     + f"\\t({word_on},{word_on},"
-                    + f"\\c&H00{config.active_color}&\\fscx106\\fscy106)"
+                    + f"\\c{active_color}&\\fscx106\\fscy106)"
                     + f"\\t({word_off},{word_off},"
-                    + f"\\c&H00{config.text_color}&\\fscx100\\fscy100)"
+                    + f"\\c{text_color}&\\fscx100\\fscy100)"
                     + "}"
                     + escaped
                 )
@@ -101,8 +106,7 @@ class AssSubtitleBuilder:
             + ",Base,,0,0,0,,"
             + "{\\an2"
             + f"\\pos({pos_x},{pos_y})"
-            + "\\fscx100\\fscy100"
-            + f"\\t(0,{config.pop_in_ms},\\fscx100\\fscy100)"
+            + self._line_intro_transform(config.pop_in_ms)
             + "}"
             + text
             + "\n"
@@ -120,3 +124,16 @@ class AssSubtitleBuilder:
     @staticmethod
     def _escape(text: str) -> str:
         return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+
+    @staticmethod
+    def _ass_color(rgb_hex: str) -> str:
+        red = rgb_hex[0:2]
+        green = rgb_hex[2:4]
+        blue = rgb_hex[4:6]
+        return f"&H00{blue}{green}{red}"
+
+    @staticmethod
+    def _line_intro_transform(pop_in_ms: int) -> str:
+        if pop_in_ms <= 0:
+            return "\\fscx100\\fscy100"
+        return f"\\fscx84\\fscy84\\t(0,{pop_in_ms},\\fscx100\\fscy100)"

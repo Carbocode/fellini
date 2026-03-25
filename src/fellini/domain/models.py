@@ -149,16 +149,19 @@ class JobRequest(BaseModel):
     @classmethod
     def with_profile(cls, **kwargs: Any) -> JobRequest:
         request = cls(**kwargs)
-        if request.profile == RunProfile.fast:
-            request.transcription.compute_type = "int8"
-            request.toggles.use_local_llm = False
-            request.subtitle.chunk_words = min(request.subtitle.chunk_words, 3)
-        elif request.profile == RunProfile.quality:
-            request.transcription.compute_type = "float16"
-            request.toggles.use_whisperx = True
-            request.toggles.use_local_llm = True
-            request.subtitle.chunk_words = max(request.subtitle.chunk_words, 3)
-        return request
+        return request.apply_profile_overrides()
+
+    def apply_profile_overrides(self) -> JobRequest:
+        if self.profile == RunProfile.fast:
+            self.transcription.compute_type = "int8"
+            self.toggles.use_local_llm = False
+            self.subtitle.chunk_words = min(self.subtitle.chunk_words, 3)
+        elif self.profile == RunProfile.quality:
+            self.transcription.compute_type = "float16"
+            self.toggles.use_whisperx = True
+            self.toggles.use_local_llm = True
+            self.subtitle.chunk_words = max(self.subtitle.chunk_words, 3)
+        return self
 
 
 class ProbeInfo(BaseModel):
@@ -263,6 +266,8 @@ class StepSnapshot(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     artifacts: list[str] = Field(default_factory=list)
+    can_run: bool = False
+    blocked_reason: str = ""
 
 
 class JobSnapshot(BaseModel):
@@ -303,7 +308,6 @@ class PipelineState(BaseModel):
 DEFAULT_STEPS = [
     StepName.ingest,
     StepName.transcription,
-    StepName.alignment,
     StepName.editorial,
     StepName.render,
 ]

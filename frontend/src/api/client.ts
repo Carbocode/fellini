@@ -13,11 +13,11 @@ export async function fetchConfig(): Promise<AppConfig> {
 }
 
 export async function fetchJobs(): Promise<JobSnapshot[]> {
-  return json(await fetch("/api/jobs"));
+  return json(await fetch("/api/jobs", { cache: "no-store" }));
 }
 
 export async function fetchJob(jobId: string): Promise<JobSnapshot> {
-  return json(await fetch(`/api/jobs/${jobId}`));
+  return json(await fetch(`/api/jobs/${jobId}`, { cache: "no-store" }));
 }
 
 export async function createJob(formData: FormData): Promise<JobSnapshot> {
@@ -44,9 +44,10 @@ export async function deleteJob(jobId: string): Promise<{ deleted: boolean }> {
 export async function updateTranscript(
   jobId: string,
   transcript: unknown,
+  target: "transcription" | "alignment",
 ): Promise<JobSnapshot> {
   return json(
-    await fetch(`/api/jobs/${jobId}/transcript`, {
+    await fetch(`/api/jobs/${jobId}/transcript?target=${target}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(transcript),
@@ -57,7 +58,7 @@ export async function updateTranscript(
 export async function runStep(
   jobId: string,
   stepName: string,
-): Promise<{ accepted: boolean }> {
+): Promise<JobSnapshot> {
   return json(
     await fetch(`/api/jobs/${jobId}/steps/${stepName}/run`, { method: "POST" }),
   );
@@ -67,7 +68,7 @@ export async function fetchArtifact(
   jobId: string,
   path: string,
 ): Promise<{ type: "json" | "text"; text: string; data?: unknown }> {
-  const res = await fetch(`/jobs/${jobId}/files/${encodeURI(path)}`);
+  const res = await fetch(`/jobs/${jobId}/files/${encodeURI(path)}`, { cache: "no-store" });
   if (!res.ok) throw new Error("Non disponibile");
   const text = await res.text();
   try {

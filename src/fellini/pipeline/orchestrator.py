@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from fellini.domain.models import JobSnapshot, StepName
 from fellini.pipeline.context import PipelineContext
-from fellini.pipeline.steps.alignment import AlignmentStep
 from fellini.pipeline.steps.editorial import EditorialStep
 from fellini.pipeline.steps.ingest import IngestStep
 from fellini.pipeline.steps.render import RenderStep
@@ -19,7 +18,6 @@ class PipelineOrchestrator:
         self.steps = [
             IngestStep(),
             TranscriptionStep(),
-            AlignmentStep(),
             EditorialStep(),
             RenderStep(),
         ]
@@ -31,12 +29,25 @@ class PipelineOrchestrator:
     def run_step(self, snapshot: JobSnapshot, step_name: StepName) -> JobSnapshot:
         return self._run(snapshot, start_at=step_name, stop_after=step_name)
 
+    def prepare_run(self, snapshot: JobSnapshot) -> JobSnapshot:
+        return self._prepare(snapshot, start_at=StepName.ingest, stop_after=None)
+
+    def prepare_step_run(self, snapshot: JobSnapshot, step_name: StepName) -> JobSnapshot:
+        return self._prepare(snapshot, start_at=step_name, stop_after=step_name)
+
+    def run_prepared(self, snapshot: JobSnapshot) -> JobSnapshot:
+        return self._run(snapshot, start_at=StepName.ingest, stop_after=None, prepared=True)
+
+    def run_step_prepared(self, snapshot: JobSnapshot, step_name: StepName) -> JobSnapshot:
+        return self._run(snapshot, start_at=step_name, stop_after=step_name, prepared=True)
+
     def _run(
         self,
         snapshot: JobSnapshot,
         *,
         start_at: StepName,
         stop_after: StepName | None,
+        prepared: bool = False,
     ) -> JobSnapshot:
         workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
         context = PipelineContext(
@@ -45,16 +56,28 @@ class PipelineOrchestrator:
             workspace=workspace,
             store=self.store,
         )
-        context.load_state()
-        context.prune_from_step(start_at)
-        self.store.reset_from_step(snapshot.id, start_at)
-        self.store.mark_running(snapshot.id)
         steps_to_run = self._steps_for_run(start_at, stop_after)
+        context.load_state()
+        if not prepared:
+            context.prune_from_step(start_at)
+            context.save_state()
+            self.store.invalidate_workspace_from_step(
+                snapshot.id,
+                start_at,
+                preserve_outputs=start_at == StepName.render,
+            )
+            self.store.reset_from_step(
+                snapshot.id,
+                start_at,
+                preserve_outputs=start_at == StepName.render,
+            )
+            self.store.mark_running(snapshot.id)
 
         try:
-            for step in steps_to_run:
-                self.store.begin_step(snapshot.id, step.name, step.description)
-                self.store.append_log(snapshot.id, f"{step.name}: {step.description}")
+            for index, step in enumerate(steps_to_run):
+                if not (prepared and index == 0):
+                    self.store.begin_step(snapshot.id, step.name, step.description)
+                    self.store.append_log(snapshot.id, f"{step.name}: {step.description}")
                 artifacts = step.run(context)
                 context.save_state()
                 self.store.complete_step(
@@ -73,6 +96,40 @@ class PipelineOrchestrator:
             self.store.fail_step(snapshot.id, failed_step, str(exc))
             self.store.append_log(snapshot.id, f"failed: {exc}")
             return self.store.mark_failed(snapshot.id, str(exc))
+
+    def _prepare(
+        self,
+        snapshot: JobSnapshot,
+        *,
+        start_at: StepName,
+        stop_after: StepName | None,
+    ) -> JobSnapshot:
+        workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
+        context = PipelineContext(
+            settings=self.settings,
+            request=snapshot.request,
+            workspace=workspace,
+            store=self.store,
+        )
+        context.load_state()
+        context.prune_from_step(start_at)
+        context.save_state()
+
+        self.store.invalidate_workspace_from_step(
+            snapshot.id,
+            start_at,
+            preserve_outputs=start_at == StepName.render,
+        )
+        self.store.reset_from_step(
+            snapshot.id,
+            start_at,
+            preserve_outputs=start_at == StepName.render,
+        )
+        self.store.mark_running(snapshot.id)
+        first_step = self._steps_for_run(start_at, stop_after)[0]
+        self.store.begin_step(snapshot.id, first_step.name, first_step.description)
+        self.store.append_log(snapshot.id, f"{first_step.name}: {first_step.description}")
+        return self.store.load(snapshot.id)
 
     def _steps_for_run(
         self,

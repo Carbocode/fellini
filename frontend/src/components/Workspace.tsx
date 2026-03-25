@@ -1,8 +1,9 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, Show, type Component } from "solid-js";
-import { useJobQuery, useArtifactQuery, useJobPolling } from "../api/queries";
+import { useJobQuery, useArtifactQuery, useJobPolling, useUpdateTranscriptMutation } from "../api/queries";
 import { fileUrl } from "../api/client";
 import {
   selectedJobId,
+  selectedStep,
   updateTabLabel,
   getPreviewForJob,
   getMonitorForJob,
@@ -48,14 +49,14 @@ const Workspace: Component = () => {
     ),
   );
 
-  // Smart polling: only poll when job is running/pending
+  // Poll only while a backend worker is actually running.
   const polling = useJobPolling(selectedJobId);
 
   createEffect(
     on(
       () => (job.data as JobSnapshot | undefined)?.status,
       (status) => {
-        if (status === "running" || status === "pending") {
+        if (status === "running") {
           polling.start();
         } else {
           polling.stop();
@@ -68,7 +69,7 @@ const Workspace: Component = () => {
   createEffect(
     on(selectedJobId, () => {
       const status = (job.data as JobSnapshot | undefined)?.status;
-      if (status === "running" || status === "pending") {
+      if (status === "running") {
         polling.start();
       } else {
         polling.stop();
@@ -168,9 +169,9 @@ const MonitorPanel: Component = () => {
   const activePath = createMemo(() => {
     const id = jobId();
     if (!id) return null;
-    const c = getMonitorForJob(id);
-    if (c) return c;
     const s = sources();
+    const c = getMonitorForJob(id);
+    if (c && s.some((source) => source.path === c)) return c;
     if (s.length) {
       setMonitorForJob(id, s[0].path);
       return s[0].path;
@@ -182,7 +183,9 @@ const MonitorPanel: Component = () => {
     const id = jobId();
     const p = activePath();
     if (!id || !p) return null;
-    return fileUrl(id, p);
+    // Cache buster: append updated_at so browser reloads after re-render
+    const ts = data()?.updated_at ?? "";
+    return `${fileUrl(id, p)}?t=${encodeURIComponent(ts)}`;
   });
 
   const mediaType = createMemo(() => {
@@ -385,14 +388,43 @@ const MonitorPanel: Component = () => {
 
 /* ---- Timeline ---- */
 
+interface AlignmentWord {
+  text: string;
+  start: number;
+  end: number;
+  confidence: number;
+}
+
+interface AlignmentSegment {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  words: AlignmentWord[];
+}
+
+interface AlignmentTranscript {
+  language: string;
+  segments: AlignmentSegment[];
+  source: string;
+  notes: string[];
+}
+
 const ZOOM_STEPS = [0.5, 1, 2, 4, 8, 16];
 const MIN_PX_PER_SEC = 60; // at zoom 1x
+const MIN_ALIGNMENT_WORD_DURATION = 0.02;
 
 const TimelinePanel: Component = () => {
   const job = useJob();
   const data = () => job.data as JobSnapshot | undefined;
   const [zoomIdx, setZoomIdx] = createSignal(1); // index into ZOOM_STEPS, start at 1x
   const zoom = () => ZOOM_STEPS[zoomIdx()];
+  const alignmentMode = createMemo(() => selectedStep() === "transcription");
+  const updateAlignmentMut = useUpdateTranscriptMutation();
+  const [localAlignment, setLocalAlignment] = createSignal<AlignmentTranscript | null>(null);
+  const [alignmentDirty, setAlignmentDirty] = createSignal(false);
+  const [activeAlignmentWord, setActiveAlignmentWord] = createSignal<{ seg: number; word: number } | null>(null);
+  let alignmentDragCleanup: (() => void) | undefined;
 
   // Artifact paths
   const artifactPath = (suffix: string) =>
@@ -405,12 +437,16 @@ const TimelinePanel: Component = () => {
   const probePath = artifactPath("01_media_probe.json");
   const spansPath = artifactPath("05_spans_labeled.json");
   const captionsPath = artifactPath("07_caption_display.json");
+  const rawTranscriptPath = artifactPath("03_transcript_raw.json");
+  const alignedTranscriptPath = artifactPath("04_transcript_aligned.json");
 
   const jobIdAccessor = () => data()?.id ?? null;
   const edl = useArtifactQuery(jobIdAccessor, edlPath);
   const probe = useArtifactQuery(jobIdAccessor, probePath);
   const spansQ = useArtifactQuery(jobIdAccessor, spansPath);
   const captionsQ = useArtifactQuery(jobIdAccessor, captionsPath);
+  const rawTranscriptQ = useArtifactQuery(jobIdAccessor, rawTranscriptPath);
+  const alignedTranscriptQ = useArtifactQuery(jobIdAccessor, alignedTranscriptPath);
 
   // Derived data
   const duration = createMemo(() => {
@@ -438,7 +474,116 @@ const TimelinePanel: Component = () => {
     return d?.chunks ?? [];
   });
 
-  const hasData = createMemo(() => duration() > 0 && (ranges().length > 0 || spans().length > 0));
+  const transcript = createMemo((): AlignmentTranscript | null => {
+    const aligned = alignedTranscriptQ.data?.data as AlignmentTranscript | undefined;
+    const raw = rawTranscriptQ.data?.data as AlignmentTranscript | undefined;
+    if (aligned?.segments?.length) return aligned;
+    if (raw?.segments?.length) return raw;
+    return null;
+  });
+
+  createEffect(
+    on(transcript, (value) => {
+      if (!alignmentDirty()) {
+        setLocalAlignment(value ? JSON.parse(JSON.stringify(value)) : null);
+      }
+    }),
+  );
+
+  const stopAlignmentDrag = () => {
+    alignmentDragCleanup?.();
+    alignmentDragCleanup = undefined;
+  };
+
+  onCleanup(stopAlignmentDrag);
+
+  createEffect(
+    on(jobIdAccessor, () => {
+      stopAlignmentDrag();
+      setAlignmentDirty(false);
+      setActiveAlignmentWord(null);
+    }),
+  );
+
+  createEffect(
+    on(alignmentMode, (active) => {
+      if (!active) {
+        stopAlignmentDrag();
+        setActiveAlignmentWord(null);
+      }
+    }),
+  );
+
+  const alignmentSegments = createMemo(() => localAlignment()?.segments ?? []);
+  const canEditAlignment = () => alignmentMode() && data()?.status !== "running";
+  const hasEditorialData = createMemo(() => duration() > 0 && (ranges().length > 0 || spans().length > 0));
+  const hasAlignmentData = createMemo(() => duration() > 0 && alignmentSegments().length > 0);
+  const hasData = createMemo(() => (alignmentMode() ? hasAlignmentData() : hasEditorialData()));
+
+  const syncAlignmentSegment = (copy: AlignmentTranscript, segIdx: number) => {
+    const segment = copy.segments[segIdx];
+    segment.text = segment.words.map((word) => word.text).join(" ");
+    if (segment.words.length > 0) {
+      segment.start = segment.words[0].start;
+      segment.end = segment.words[segment.words.length - 1].end;
+    }
+  };
+
+  const previousWordEnd = (copy: AlignmentTranscript, segIdx: number, wordIdx: number) => {
+    if (wordIdx > 0) return copy.segments[segIdx].words[wordIdx - 1].end;
+    for (let prevSeg = segIdx - 1; prevSeg >= 0; prevSeg -= 1) {
+      const words = copy.segments[prevSeg].words;
+      if (words.length > 0) return words[words.length - 1].end;
+    }
+    return 0;
+  };
+
+  const nextWordStart = (copy: AlignmentTranscript, segIdx: number, wordIdx: number) => {
+    const words = copy.segments[segIdx].words;
+    if (wordIdx < words.length - 1) return words[wordIdx + 1].start;
+    for (let nextSeg = segIdx + 1; nextSeg < copy.segments.length; nextSeg += 1) {
+      const nextWords = copy.segments[nextSeg].words;
+      if (nextWords.length > 0) return nextWords[0].start;
+    }
+    return duration() > 0 ? duration() : Number.POSITIVE_INFINITY;
+  };
+
+  const updateAlignmentWordEdge = (
+    segIdx: number,
+    wordIdx: number,
+    edge: "start" | "end",
+    nextTime: number,
+  ) => {
+    setLocalAlignment((prev) => {
+      if (!prev) return prev;
+      const copy: AlignmentTranscript = JSON.parse(JSON.stringify(prev));
+      const word = copy.segments[segIdx]?.words[wordIdx];
+      if (!word) return prev;
+
+      if (edge === "start") {
+        const minStart = previousWordEnd(copy, segIdx, wordIdx);
+        const maxStart = word.end - MIN_ALIGNMENT_WORD_DURATION;
+        word.start = Math.max(minStart, Math.min(maxStart, nextTime));
+      } else {
+        const minEnd = word.start + MIN_ALIGNMENT_WORD_DURATION;
+        const maxEnd = nextWordStart(copy, segIdx, wordIdx);
+        word.end = Math.max(minEnd, Math.min(maxEnd, nextTime));
+      }
+
+      syncAlignmentSegment(copy, segIdx);
+      return copy;
+    });
+    setAlignmentDirty(true);
+  };
+
+  const activeAlignmentWordData = createMemo(() => {
+    const active = activeAlignmentWord();
+    if (!active) return null;
+    const segment = alignmentSegments()[active.seg];
+    const word = segment?.words?.[active.word];
+    if (!segment || !word) return null;
+    return { segment, word };
+  });
 
   // Gaps between keep ranges (for minimap)
   const gaps = createMemo(() => {
@@ -568,9 +713,73 @@ const TimelinePanel: Component = () => {
   };
   const onSegmentLeave = () => setTooltip(null);
 
+  const edgeHitZone = (el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    return Math.min(10, Math.max(4, rect.width * 0.25));
+  };
+
+  const edgeFromPointer = (el: HTMLElement, clientX: number): "start" | "end" | null => {
+    const rect = el.getBoundingClientRect();
+    const zone = edgeHitZone(el);
+    if (clientX - rect.left <= zone) return "start";
+    if (rect.right - clientX <= zone) return "end";
+    return null;
+  };
+
+  const beginAlignmentResize = (
+    event: PointerEvent,
+    segIdx: number,
+    wordIdx: number,
+    edge: "start" | "end",
+  ) => {
+    if (!innerRef || !canEditAlignment()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setActiveAlignmentWord({ seg: segIdx, word: wordIdx });
+
+    const applyClientX = (clientX: number) => {
+      const rect = innerRef!.getBoundingClientRect();
+      const nextTime = pxToSec(clientX - rect.left);
+      updateAlignmentWordEdge(segIdx, wordIdx, edge, nextTime);
+      setSeekRequest(nextTime);
+    };
+
+    stopAlignmentDrag();
+    applyClientX(event.clientX);
+
+    const onMove = (moveEvent: PointerEvent) => applyClientX(moveEvent.clientX);
+    const onUp = () => stopAlignmentDrag();
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    alignmentDragCleanup = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+  };
+
+  const saveAlignment = async () => {
+    const snapshot = localAlignment();
+    const jobId = jobIdAccessor();
+    if (!snapshot || !jobId) return;
+    await updateAlignmentMut.mutateAsync({
+      jobId,
+      transcript: snapshot,
+      target: "transcription",
+    });
+    setAlignmentDirty(false);
+  };
+
   const showWords = () => spans().length > 0;
   const showCaptions = () => captions().length > 0;
   const showCuts = () => cuts().length > 0;
+  const placeholderText = createMemo(() => {
+    if (alignmentMode()) {
+      if (duration() <= 0) return "La timeline della transcription apparira dopo ingest.";
+      return "Esegui transcription per modificare parole e timing.";
+    }
+    return "La timeline apparira dopo lo step editorial";
+  });
 
   return (
     <div class="panel timeline-panel">
@@ -578,6 +787,16 @@ const TimelinePanel: Component = () => {
         <span class="panel-title">Timeline</span>
         <div class="timeline-toolbar">
           <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
+          <Show when={alignmentMode()}>
+            <span class="timeline-mode-tag">Transcription</span>
+          </Show>
+          <Show when={alignmentMode() && activeAlignmentWordData()}>
+            {(active) => (
+              <span class="timeline-selection-readout">
+                {active().word.text} {fmtTimePrecise(active().word.start)} - {fmtTimePrecise(active().word.end)}
+              </span>
+            )}
+          </Show>
           <button
             type="button"
             class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`}
@@ -589,13 +808,23 @@ const TimelinePanel: Component = () => {
           <button type="button" class="btn btn-ghost btn-xs" onClick={zoomOut} disabled={zoomIdx() === 0}>-</button>
           <span class="timeline-zoom-label">{zoom()}x</span>
           <button type="button" class="btn btn-ghost btn-xs" onClick={zoomIn} disabled={zoomIdx() === ZOOM_STEPS.length - 1}>+</button>
+          <Show when={alignmentMode() && alignmentDirty()}>
+            <button
+              type="button"
+              class="btn btn-primary btn-xs"
+              disabled={updateAlignmentMut.isPending || !canEditAlignment()}
+              onClick={saveAlignment}
+            >
+              {updateAlignmentMut.isPending ? "Salvataggio..." : "Salva transcript"}
+            </button>
+          </Show>
         </div>
       </div>
       <div
         class="placeholder"
         style={{ display: hasData() ? "none" : "block" }}
       >
-        La timeline apparira dopo lo step editorial
+        {placeholderText()}
       </div>
       <div
         class="timeline-body"
@@ -604,10 +833,22 @@ const TimelinePanel: Component = () => {
         {/* Left column: fixed labels */}
         <div class="tl-labels">
           <div class="tl-label tl-label--ruler" />
-          <div class="tl-label tl-label--edl">EDL</div>
-          <div class="tl-label tl-label--words" style={{ display: showWords() ? "flex" : "none" }}>Words</div>
-          <div class="tl-label tl-label--captions" style={{ display: showCaptions() ? "flex" : "none" }}>Captions</div>
-          <div class="tl-label tl-label--cuts" style={{ display: showCuts() ? "flex" : "none" }}>Cuts</div>
+          <Show
+            when={alignmentMode()}
+            fallback={
+              <>
+                <div class="tl-label tl-label--edl">EDL</div>
+                <div class="tl-label tl-label--words" style={{ display: showWords() ? "flex" : "none" }}>Words</div>
+                <div class="tl-label tl-label--captions" style={{ display: showCaptions() ? "flex" : "none" }}>Captions</div>
+                <div class="tl-label tl-label--cuts" style={{ display: showCuts() ? "flex" : "none" }}>Cuts</div>
+              </>
+            }
+          >
+            <>
+              <div class="tl-label tl-label--groups">Groups</div>
+              <div class="tl-label tl-label--align-words">Words</div>
+            </>
+          </Show>
         </div>
 
         {/* Right column: scrollable tracks */}
@@ -645,77 +886,155 @@ const TimelinePanel: Component = () => {
               </For>
             </div>
 
-            {/* Track: EDL Keep Ranges */}
-            <div class="tl-track tl-track--edl">
-              <For each={ranges()}>
-                {(r) => {
-                  const tip = `KEEP  ${fmtTimePrecise(r.start)} → ${fmtTimePrecise(r.end)}\n${r.reason}`;
-                  return (
-                    <div
-                      class="tl-seg tl-seg--keep"
-                      style={{ left: `${toPx(r.start)}px`, width: `${Math.max(3, toPx(r.end) - toPx(r.start))}px` }}
-                      onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                      onMouseLeave={onSegmentLeave}
-                    >
-                      <span>{r.reason}</span>
-                    </div>
-                  );
-                }}
-              </For>
-            </div>
+            <Show
+              when={alignmentMode()}
+              fallback={
+                <>
+                  {/* Track: EDL Keep Ranges */}
+                  <div class="tl-track tl-track--edl">
+                    <For each={ranges()}>
+                      {(r) => {
+                        const tip = `KEEP  ${fmtTimePrecise(r.start)} → ${fmtTimePrecise(r.end)}\n${r.reason}`;
+                        return (
+                          <div
+                            class="tl-seg tl-seg--keep"
+                            style={{ left: `${toPx(r.start)}px`, width: `${Math.max(3, toPx(r.end) - toPx(r.start))}px` }}
+                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
+                            onMouseLeave={onSegmentLeave}
+                          >
+                            <span>{r.reason}</span>
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </div>
 
-            {/* Track: Labeled Words */}
-            <div class="tl-track tl-track--words" style={{ display: showWords() ? "block" : "none" }}>
-              <For each={spans()}>
-                {(s) => {
-                  const tip = `"${s.text}"  [${s.label}]\n${fmtTimePrecise(s.start)} → ${fmtTimePrecise(s.end)}`;
-                  return (
-                    <div
-                      class={`tl-seg tl-seg--word ${s.label}`}
-                      style={{ left: `${toPx(s.start)}px`, width: `${Math.max(3, toPx(s.end) - toPx(s.start))}px` }}
-                      onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                      onMouseLeave={onSegmentLeave}
-                    >
-                      <span>{s.text}</span>
-                    </div>
-                  );
-                }}
-              </For>
-            </div>
+                  {/* Track: Labeled Words */}
+                  <div class="tl-track tl-track--words" style={{ display: showWords() ? "block" : "none" }}>
+                    <For each={spans()}>
+                      {(s) => {
+                        const tip = `"${s.text}"  [${s.label}]\n${fmtTimePrecise(s.start)} → ${fmtTimePrecise(s.end)}`;
+                        return (
+                          <div
+                            class={`tl-seg tl-seg--word ${s.label}`}
+                            style={{ left: `${toPx(s.start)}px`, width: `${Math.max(3, toPx(s.end) - toPx(s.start))}px` }}
+                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
+                            onMouseLeave={onSegmentLeave}
+                          >
+                            <span>{s.text}</span>
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </div>
 
-            {/* Track: Caption Chunks */}
-            <div class="tl-track tl-track--captions" style={{ display: showCaptions() ? "block" : "none" }}>
-              <For each={captions()}>
-                {(c) => {
-                  const words = (c.display_words || []).join(" ");
-                  const tip = `Caption: "${words}"\n${fmtTimePrecise(c.start)} → ${fmtTimePrecise(c.end)}`;
-                  return (
-                    <div
-                      class="tl-seg tl-seg--caption"
-                      style={{ left: `${toPx(c.start)}px`, width: `${Math.max(3, toPx(c.end) - toPx(c.start))}px` }}
-                      onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                      onMouseLeave={onSegmentLeave}
-                    >
-                      <span>{words}</span>
-                    </div>
-                  );
-                }}
-              </For>
-            </div>
+                  {/* Track: Caption Chunks */}
+                  <div class="tl-track tl-track--captions" style={{ display: showCaptions() ? "block" : "none" }}>
+                    <For each={captions()}>
+                      {(c) => {
+                        const words = (c.display_words || []).join(" ");
+                        const tip = `Caption: "${words}"\n${fmtTimePrecise(c.start)} → ${fmtTimePrecise(c.end)}`;
+                        return (
+                          <div
+                            class="tl-seg tl-seg--caption"
+                            style={{ left: `${toPx(c.start)}px`, width: `${Math.max(3, toPx(c.end) - toPx(c.start))}px` }}
+                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
+                            onMouseLeave={onSegmentLeave}
+                          >
+                            <span>{words}</span>
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </div>
 
-            {/* Track: Soft Cuts */}
-            <div class="tl-track tl-track--cuts" style={{ display: showCuts() ? "block" : "none" }}>
-              <For each={cuts()}>
-                {(c) => (
-                  <div
-                    class="tl-cut"
-                    style={{ left: `${toPx(c.at)}px` }}
-                    onMouseEnter={(e) => onSegmentEnter(e, `Cut @ ${fmtTimePrecise(c.at)}\nfade: ${c.at}ms`)}
-                    onMouseLeave={onSegmentLeave}
-                  />
-                )}
-              </For>
-            </div>
+                  {/* Track: Soft Cuts */}
+                  <div class="tl-track tl-track--cuts" style={{ display: showCuts() ? "block" : "none" }}>
+                    <For each={cuts()}>
+                      {(c) => (
+                        <div
+                          class="tl-cut"
+                          style={{ left: `${toPx(c.at)}px` }}
+                          onMouseEnter={(e) => onSegmentEnter(e, `Cut @ ${fmtTimePrecise(c.at)}\nfade: ${c.at}ms`)}
+                          onMouseLeave={onSegmentLeave}
+                        />
+                      )}
+                    </For>
+                  </div>
+                </>
+              }
+            >
+              <>
+                <div class="tl-track tl-track--groups">
+                  <For each={alignmentSegments()}>
+                    {(segment, segIdx) => {
+                      const tip = `Group ${segIdx() + 1}\n${fmtTimePrecise(segment.start)} → ${fmtTimePrecise(segment.end)}\n${segment.text}`;
+                      return (
+                        <div
+                          class="tl-seg tl-seg--group"
+                          style={{
+                            left: `${toPx(segment.start)}px`,
+                            width: `${Math.max(4, toPx(segment.end) - toPx(segment.start))}px`,
+                          }}
+                          onMouseEnter={(e) => onSegmentEnter(e, tip)}
+                          onMouseLeave={onSegmentLeave}
+                        >
+                          <span>{segment.text}</span>
+                        </div>
+                      );
+                    }}
+                  </For>
+                </div>
+                <div class="tl-track tl-track--align-words">
+                  <For each={alignmentSegments()}>
+                    {(segment, segIdx) => (
+                      <For each={segment.words}>
+                        {(word, wordIdx) => {
+                          const isActive = () => {
+                            const active = activeAlignmentWord();
+                            return active?.seg === segIdx() && active.word === wordIdx();
+                          };
+                          const tip = `${word.text}\n${fmtTimePrecise(word.start)} → ${fmtTimePrecise(word.end)}`;
+                          return (
+                            <button
+                              type="button"
+                              class={`tl-seg tl-seg--align-word${isActive() ? " is-active" : ""}`}
+                              style={{
+                                left: `${toPx(word.start)}px`,
+                                width: `${Math.max(6, toPx(word.end) - toPx(word.start))}px`,
+                              }}
+                              onMouseEnter={(e) => onSegmentEnter(e, tip)}
+                              onMouseLeave={(e) => {
+                                (e.currentTarget as HTMLButtonElement).style.cursor = canEditAlignment() ? "pointer" : "default";
+                                onSegmentLeave();
+                              }}
+                              onPointerMove={(e) => {
+                                const edge = canEditAlignment() ? edgeFromPointer(e.currentTarget, e.clientX) : null;
+                                e.currentTarget.style.cursor = edge ? "ew-resize" : (canEditAlignment() ? "pointer" : "default");
+                              }}
+                              onPointerDown={(e) => {
+                                if (!canEditAlignment()) return;
+                                const edge = edgeFromPointer(e.currentTarget, e.clientX);
+                                if (edge) {
+                                  beginAlignmentResize(e, segIdx(), wordIdx(), edge);
+                                  return;
+                                }
+                                e.stopPropagation();
+                                setActiveAlignmentWord({ seg: segIdx(), word: wordIdx() });
+                                setSeekRequest(word.start);
+                              }}
+                              onDblClick={() => setSeekRequest(word.start)}
+                            >
+                              <span>{word.text}</span>
+                            </button>
+                          );
+                        }}
+                      </For>
+                    )}
+                  </For>
+                </div>
+              </>
+            </Show>
           </div>
         </div>
       </div>
@@ -723,7 +1042,7 @@ const TimelinePanel: Component = () => {
       {/* Minimap — shows entire timeline overview when zoomed in */}
       <div
         class="tl-minimap"
-        style={{ display: hasData() && viewFrac() < 0.99 ? "grid" : "none" }}
+        style={{ display: hasData() && !alignmentMode() && viewFrac() < 0.99 ? "grid" : "none" }}
       >
         <div class="tl-minimap-label" />
         <div
@@ -898,11 +1217,11 @@ const PreviewPanel: Component = () => {
   const previewPath = createMemo(() => {
     const id = jobId();
     if (!id) return null;
-    const p = getPreviewForJob(id);
-    if (p) return p;
     const j = data();
     if (!j) return null;
     const catalog = buildArtifactCatalog(j);
+    const p = getPreviewForJob(id);
+    if (p && catalog.some((item) => item.path === p)) return p;
     const preferred = [
       "06_edit_decision_list.json",
       "05_spans_labeled.json",

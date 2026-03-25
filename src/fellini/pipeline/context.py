@@ -49,14 +49,16 @@ class PipelineContext:
         self.subtitle_builder = AssSubtitleBuilder()
 
     def load_state(self) -> None:
+        snapshot_state = None
         if self.workspace.state_path.exists():
             payload = json.loads(self.workspace.state_path.read_text(encoding="utf-8"))
-            self.state = PipelineState.model_validate(payload)
-            return
-        self.hydrate_state()
+            snapshot_state = PipelineState.model_validate(payload)
+        self.hydrate_state(snapshot_state)
 
-    def hydrate_state(self) -> None:
-        state = PipelineState()
+    def hydrate_state(self, snapshot_state: PipelineState | None = None) -> None:
+        # Disk artifacts are the source of truth for reruns so manual/API edits
+        # are picked up even if the cached pipeline snapshot is stale.
+        state = snapshot_state.model_copy(deep=True) if snapshot_state else PipelineState()
         probe_artifact = self.workspace.artifact_path("01_media_probe.json")
         if probe_artifact.exists():
             payload = json.loads(probe_artifact.read_text(encoding="utf-8"))

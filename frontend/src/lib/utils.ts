@@ -85,9 +85,9 @@ export function getMonitorSources(
 
 export function canRunStep(job: JobSnapshot, stepName: string): boolean {
   if (job.status === "running") return false;
-  const idx = job.steps.findIndex((s) => s.name === stepName);
-  if (idx < 0) return false;
-  return job.steps.slice(0, idx).every((s) => s.status === "completed");
+  const step = job.steps.find((s) => s.name === stepName);
+  if (!step) return false;
+  return step.can_run;
 }
 
 export function getNextRunnableStep(job: JobSnapshot): StepName | null {

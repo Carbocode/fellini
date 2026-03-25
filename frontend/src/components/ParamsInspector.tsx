@@ -1,6 +1,6 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, Show, Switch, Match, type Component } from "solid-js";
+import { createEffect, createMemo, createSignal, Index, on, onCleanup, Show, Switch, Match, type Component } from "solid-js";
 import { useJobQuery, useUpdateRequestMutation, useRunStepMutation, useArtifactQuery, useUpdateTranscriptMutation } from "../api/queries";
-import { selectedJobId, selectedStep, editingWord, setEditingWord, setSeekRequest } from "../store";
+import { selectedJobId, selectedStep, editingWord, playheadTime, setEditingWord, setSeekRequest } from "../store";
 import { buildArtifactCatalog, canRunStep, capitalize, fmtTimePrecise } from "../lib/utils";
 import type { JobSnapshot } from "../types";
 
@@ -44,63 +44,89 @@ const ParamsInspector: Component = () => {
 
   const save = async () => {
     const j = data();
-    if (!j) return;
+    const s = step();
+    if (!j || !s) return;
     const req = j.request;
 
-    const payload = {
-      title: val("p_title", req.title),
-      profile: val("p_profile", req.profile),
-      execution_mode: req.execution_mode,
-      language: val("p_language", req.language),
-      editorial_notes: val("p_editorial_notes", req.editorial_notes),
-      toggles: {
-        use_whisperx: chk("p_use_whisperx"),
-        use_local_llm: chk("p_use_local_llm"),
-        render_clean: chk("p_render_clean"),
-        render_captioned: chk("p_render_captioned"),
-      },
-      transcription: {
-        model: val("p_tr_model", req.transcription.model),
-        beam_size: num("p_tr_beam_size", req.transcription.beam_size),
-        vad_filter: chk("p_tr_vad_filter"),
-        condition_on_prev_text: chk("p_tr_condition"),
-        word_timestamps: chk("p_tr_word_ts"),
-        compute_type: val("p_tr_compute", req.transcription.compute_type),
-        device: val("p_tr_device", req.transcription.device),
-      },
-      subtitle: {
-        chunk_words: num("p_sub_chunk", req.subtitle.chunk_words),
-        font_name: val("p_sub_font", req.subtitle.font_name),
-        font_size: num("p_sub_fontsize", req.subtitle.font_size),
-        text_color: val("p_sub_textcolor", req.subtitle.text_color),
-        active_color: val("p_sub_activecolor", req.subtitle.active_color),
-        outline_color: val("p_sub_outlinecolor", req.subtitle.outline_color),
-        bottom_margin: num("p_sub_margin", req.subtitle.bottom_margin),
-        pop_in_ms: num("p_sub_popin", req.subtitle.pop_in_ms),
-      },
-      render: {
-        width: (() => { const r = val("p_rn_resolution", ""); const p = r.split("x"); return p.length === 2 ? Number(p[0]) : req.render.width; })(),
-        height: (() => { const r = val("p_rn_resolution", ""); const p = r.split("x"); return p.length === 2 ? Number(p[1]) : req.render.height; })(),
-        video_codec: val("p_rn_vcodec", req.render.video_codec),
-        audio_codec: val("p_rn_acodec", req.render.audio_codec),
-        crf: num("p_rn_crf", req.render.crf),
-        preset: val("p_rn_preset", req.render.preset),
-        audio_bitrate: val("p_rn_abitrate", req.render.audio_bitrate),
-      },
-      decision: {
-        filler_words: val("p_dec_fillers", "").split(",").map((s) => s.trim()).filter(Boolean),
-        repetition_window_seconds: num("p_dec_repwin", req.decision.repetition_window_seconds),
-        soft_pause_threshold_seconds: num("p_dec_soft", req.decision.soft_pause_threshold_seconds),
-        hard_pause_threshold_seconds: num("p_dec_hard", req.decision.hard_pause_threshold_seconds),
-        leading_context_seconds: num("p_dec_lead", req.decision.leading_context_seconds),
-        trailing_context_seconds: num("p_dec_trail", req.decision.trailing_context_seconds),
-        retained_pause_seconds: num("p_dec_retained", req.decision.retained_pause_seconds),
-      },
-    };
+    const payload = (() => {
+      switch (s) {
+        case "ingest":
+          return {
+            title: val("p_title", req.title),
+            profile: val("p_profile", req.profile),
+            language: val("p_language", req.language),
+            editorial_notes: val("p_editorial_notes", req.editorial_notes),
+            toggles: {
+              use_whisperx: chk("p_use_whisperx"),
+              use_local_llm: chk("p_use_local_llm"),
+              render_clean: chk("p_render_clean"),
+              render_captioned: chk("p_render_captioned"),
+            },
+          };
+        case "transcription":
+          return {
+            transcription: {
+              model: val("p_tr_model", req.transcription.model),
+              beam_size: num("p_tr_beam_size", req.transcription.beam_size),
+              vad_filter: chk("p_tr_vad_filter"),
+              condition_on_prev_text: chk("p_tr_condition"),
+              word_timestamps: chk("p_tr_word_ts"),
+              compute_type: val("p_tr_compute", req.transcription.compute_type),
+              device: val("p_tr_device", req.transcription.device),
+            },
+          };
+        case "editorial":
+          return {
+            decision: {
+              filler_words: val("p_dec_fillers", "").split(",").map((item) => item.trim()).filter(Boolean),
+              repetition_window_seconds: num("p_dec_repwin", req.decision.repetition_window_seconds),
+              soft_pause_threshold_seconds: num("p_dec_soft", req.decision.soft_pause_threshold_seconds),
+              hard_pause_threshold_seconds: num("p_dec_hard", req.decision.hard_pause_threshold_seconds),
+              leading_context_seconds: num("p_dec_lead", req.decision.leading_context_seconds),
+              trailing_context_seconds: num("p_dec_trail", req.decision.trailing_context_seconds),
+              retained_pause_seconds: num("p_dec_retained", req.decision.retained_pause_seconds),
+            },
+          };
+        case "render":
+          return {
+            subtitle: {
+              chunk_words: num("p_sub_chunk", req.subtitle.chunk_words),
+              font_name: val("p_sub_font", req.subtitle.font_name),
+              font_size: num("p_sub_fontsize", req.subtitle.font_size),
+              text_color: val("p_sub_textcolor", req.subtitle.text_color),
+              active_color: val("p_sub_activecolor", req.subtitle.active_color),
+              outline_color: val("p_sub_outlinecolor", req.subtitle.outline_color),
+              bottom_margin: num("p_sub_margin", req.subtitle.bottom_margin),
+              pop_in_ms: num("p_sub_popin", req.subtitle.pop_in_ms),
+            },
+            render: {
+              width: (() => { const r = val("p_rn_resolution", ""); const p = r.split("x"); return p.length === 2 ? Number(p[0]) : req.render.width; })(),
+              height: (() => { const r = val("p_rn_resolution", ""); const p = r.split("x"); return p.length === 2 ? Number(p[1]) : req.render.height; })(),
+              video_codec: val("p_rn_vcodec", req.render.video_codec),
+              audio_codec: val("p_rn_acodec", req.render.audio_codec),
+              crf: num("p_rn_crf", req.render.crf),
+              preset: val("p_rn_preset", req.render.preset),
+              audio_bitrate: val("p_rn_abitrate", req.render.audio_bitrate),
+            },
+          };
+        default:
+          return {};
+      }
+    })();
+
+    if (Object.keys(payload).length === 0) {
+      setDirty(false);
+      subEditorSavedCb?.();
+      return;
+    }
 
     await updateReq.mutateAsync({ jobId: j.id, payload });
     setDirty(false);
+    subEditorSavedCb?.();
   };
+
+  // Callback to reset SubtitleLiveEditor dirty state after save
+  let subEditorSavedCb: (() => void) | undefined;
 
   const handleRunStep = async () => {
     const j = data();
@@ -187,11 +213,13 @@ const ParamsInspector: Component = () => {
                       {updateReq.isPending ? "Salvataggio..." : "Salva"}
                     </button>
                   </Show>
-                  <Show when={stepCanRun()}>
+                  <Show when={ss()}>
                     <button
                       type="button"
                       class="btn btn-primary btn-xs"
+                      disabled={!stepCanRun() || runStepMut.isPending}
                       onClick={handleRunStep}
+                      title={ss()?.blocked_reason || ""}
                     >
                       {ss()?.status === "completed" ? "Riesegui" : "Esegui"}
                     </button>
@@ -201,6 +229,9 @@ const ParamsInspector: Component = () => {
 
               <Show when={ss()?.message}>
                 <div class="step-message">{ss()!.message}</div>
+              </Show>
+              <Show when={!stepCanRun() && ss()?.blocked_reason && data()?.status !== "running"}>
+                <div class="step-message">{ss()!.blocked_reason}</div>
               </Show>
 
               {/* Step-specific content */}
@@ -239,11 +270,10 @@ const ParamsInspector: Component = () => {
                       <Check label="Prev text" name="p_tr_condition" checked={req().transcription.condition_on_prev_text} />
                       <Check label="Word timestamps" name="p_tr_word_ts" checked={req().transcription.word_timestamps} />
                     </div>
-                    <div class="full"><TranscriptEditor jobId={() => data()!.id} /></div>
-                  </Match>
-
-                  <Match when={step() === "alignment"}>
-                    <TranscriptEditor jobId={() => data()!.id} />
+                    <div class="step-empty-info">
+                      Dopo l'esecuzione puoi modificare le parole qui e regolare start/end nella timeline in basso.
+                    </div>
+                    <div class="full"><TranscriptEditor jobId={() => data()!.id} mode="transcription" /></div>
                   </Match>
 
                   <Match when={step() === "editorial"}>
@@ -267,7 +297,14 @@ const ParamsInspector: Component = () => {
                   </Match>
 
                   <Match when={step() === "render"}>
-                    <SubtitleLiveEditor req={req} onDirty={() => setDirty(true)} />
+                    <Show when={!req().toggles.render_clean || !req().toggles.render_captioned}>
+                      <div class="step-message">
+                        Output attivi:
+                        {` edited master${req().toggles.render_clean ? ", clean" : ""}${req().toggles.render_captioned ? ", captioned" : ""}. `}
+                        Modifica gli export nello step Ingest.
+                      </div>
+                    </Show>
+                    <SubtitleLiveEditor req={req} onDirty={() => setDirty(true)} onSavedRef={(cb) => { subEditorSavedCb = cb; }} />
                     <Select label="Risoluzione" name="p_rn_resolution" value={`${req().render.width}x${req().render.height}`} options={["1080x1920", "720x1280", "1080x1080", "1920x1080"]} />
                     <Select label="Video codec" name="p_rn_vcodec" value={req().render.video_codec} options={["libx264", "libx265", "libopenh264", "mpeg4"]} />
                     <Select label="Audio codec" name="p_rn_acodec" value={req().render.audio_codec} options={["aac", "libmp3lame", "opus", "pcm_s16le"]} />
@@ -319,7 +356,9 @@ interface TranscriptData {
   notes: string[];
 }
 
-const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
+const MIN_WORD_DURATION = 0.02;
+
+const TranscriptEditor: Component<{ jobId: () => string; mode: "transcription" | "alignment" }> = (props) => {
   const alignedPath = createMemo(() => `artifacts/04_transcript_aligned.json`);
   const rawPath = createMemo(() => `artifacts/03_transcript_raw.json`);
 
@@ -328,11 +367,13 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
 
   const updateMut = useUpdateTranscriptMutation();
 
-  // Use aligned if available, fall back to raw
+  const title = () => (props.mode === "alignment" ? "Allineamento" : "Trascrizione");
+
   const transcript = createMemo((): TranscriptData | null => {
     const a = alignedQ.data?.data as TranscriptData | undefined;
-    if (a?.segments?.length) return a;
     const r = rawQ.data?.data as TranscriptData | undefined;
+    if (props.mode === "transcription") return a?.segments?.length ? a : (r?.segments?.length ? r : null);
+    if (a?.segments?.length) return a;
     if (r?.segments?.length) return r;
     return null;
   });
@@ -351,9 +392,30 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
   );
 
   const ew = editingWord;
+  const timelineRefs: Array<HTMLDivElement | undefined> = [];
+  let dragCleanup: (() => void) | undefined;
 
   const startEdit = (segIdx: number, wordIdx: number) => {
     setEditingWord({ seg: segIdx, word: wordIdx });
+  };
+
+  const stopDragging = () => {
+    dragCleanup?.();
+    dragCleanup = undefined;
+  };
+
+  onCleanup(stopDragging);
+  createEffect(() => {
+    if (props.mode !== "alignment") stopDragging();
+  });
+
+  const syncSegment = (copy: TranscriptData, segIdx: number) => {
+    const segment = copy.segments[segIdx];
+    segment.text = segment.words.map((w) => w.text).join(" ");
+    if (segment.words.length > 0) {
+      segment.start = segment.words[0].start;
+      segment.end = segment.words[segment.words.length - 1].end;
+    }
   };
 
   const updateWord = (segIdx: number, wordIdx: number, newText: string) => {
@@ -361,8 +423,36 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
       if (!prev) return prev;
       const copy: TranscriptData = JSON.parse(JSON.stringify(prev));
       copy.segments[segIdx].words[wordIdx].text = newText;
-      // Update segment text
-      copy.segments[segIdx].text = copy.segments[segIdx].words.map((w) => w.text).join(" ");
+      syncSegment(copy, segIdx);
+      return copy;
+    });
+    setTranscriptDirty(true);
+  };
+
+  const updateWordTiming = (
+    segIdx: number,
+    wordIdx: number,
+    field: "start" | "end",
+    rawValue: string | number,
+  ) => {
+    const value = typeof rawValue === "number" ? rawValue : Number(rawValue);
+    if (!Number.isFinite(value)) return;
+    setLocalTranscript((prev) => {
+      if (!prev) return prev;
+      const copy: TranscriptData = JSON.parse(JSON.stringify(prev));
+      const words = copy.segments[segIdx].words;
+      const word = copy.segments[segIdx].words[wordIdx];
+      if (field === "start") {
+        const prevEnd = wordIdx > 0 ? words[wordIdx - 1].end : 0;
+        const maxStart = Math.max(prevEnd, word.end - MIN_WORD_DURATION);
+        word.start = Math.min(maxStart, Math.max(prevEnd, value));
+      } else {
+        const nextStart = wordIdx < words.length - 1 ? words[wordIdx + 1].start : Number.POSITIVE_INFINITY;
+        const minEnd = word.start + MIN_WORD_DURATION;
+        const maxEnd = Number.isFinite(nextStart) ? Math.max(minEnd, nextStart) : Number.POSITIVE_INFINITY;
+        word.end = Math.max(minEnd, Math.min(maxEnd, value));
+      }
+      syncSegment(copy, segIdx);
       return copy;
     });
     setTranscriptDirty(true);
@@ -373,7 +463,7 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
       if (!prev) return prev;
       const copy: TranscriptData = JSON.parse(JSON.stringify(prev));
       copy.segments[segIdx].words.splice(wordIdx, 1);
-      copy.segments[segIdx].text = copy.segments[segIdx].words.map((w) => w.text).join(" ");
+      syncSegment(copy, segIdx);
       return copy;
     });
     setEditingWord(null);
@@ -383,7 +473,11 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
   const saveTranscript = async () => {
     const t = localTranscript();
     if (!t) return;
-    await updateMut.mutateAsync({ jobId: props.jobId(), transcript: t });
+    await updateMut.mutateAsync({
+      jobId: props.jobId(),
+      transcript: t,
+      target: props.mode,
+    });
     setTranscriptDirty(false);
     setEditingWord(null);
   };
@@ -399,10 +493,84 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
     return "var(--red)";
   };
 
+  const segmentDomain = (segment: TranscriptSegment) => {
+    const duration = Math.max(0.2, segment.end - segment.start);
+    const padding = Math.max(0.18, duration * 0.2);
+    const start = Math.max(0, segment.start - padding);
+    const end = segment.end + padding;
+    return { start, end: end > start ? end : start + 0.5 };
+  };
+
+  const toSegmentPct = (segment: TranscriptSegment, sec: number) => {
+    const domain = segmentDomain(segment);
+    return ((sec - domain.start) / (domain.end - domain.start)) * 100;
+  };
+
+  const wordLeftPct = (segment: TranscriptSegment, word: TranscriptWord) =>
+    Math.max(0, Math.min(100, toSegmentPct(segment, word.start)));
+
+  const wordWidthPct = (segment: TranscriptSegment, word: TranscriptWord) =>
+    Math.max(2, Math.min(100, toSegmentPct(segment, word.end) - toSegmentPct(segment, word.start)));
+
+  const playheadPct = (segment: TranscriptSegment) => {
+    const domain = segmentDomain(segment);
+    const current = playheadTime();
+    if (current < domain.start || current > domain.end) return null;
+    return ((current - domain.start) / (domain.end - domain.start)) * 100;
+  };
+
+  const seekWithinSegment = (segIdx: number, clientX: number) => {
+    const timeline = timelineRefs[segIdx];
+    const segment = localTranscript()?.segments[segIdx];
+    if (!timeline || !segment) return;
+    const rect = timeline.getBoundingClientRect();
+    const domain = segmentDomain(segment);
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const time = domain.start + ratio * (domain.end - domain.start);
+    setSeekRequest(time);
+  };
+
+  const beginHandleDrag = (
+    event: PointerEvent,
+    segIdx: number,
+    wordIdx: number,
+    edge: "start" | "end",
+  ) => {
+    const timeline = timelineRefs[segIdx];
+    if (!timeline) return;
+    event.preventDefault();
+    event.stopPropagation();
+    startEdit(segIdx, wordIdx);
+
+    const applyFromClientX = (clientX: number) => {
+      const segment = localTranscript()?.segments[segIdx];
+      if (!segment) return;
+      const rect = timeline.getBoundingClientRect();
+      const domain = segmentDomain(segment);
+      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const time = domain.start + ratio * (domain.end - domain.start);
+      updateWordTiming(segIdx, wordIdx, edge, time);
+      setSeekRequest(time);
+    };
+
+    stopDragging();
+    applyFromClientX(event.clientX);
+
+    const onMove = (moveEvent: PointerEvent) => applyFromClientX(moveEvent.clientX);
+    const onUp = () => stopDragging();
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    dragCleanup = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+  };
+
   return (
     <div class="transcript-editor">
       <div class="transcript-editor-header">
-        <span class="transcript-editor-title">Trascrizione</span>
+        <span class="transcript-editor-title">{title()}</span>
         <Show when={transcriptDirty()}>
           <button
             type="button"
@@ -410,72 +578,154 @@ const TranscriptEditor: Component<{ jobId: () => string }> = (props) => {
             disabled={updateMut.isPending}
             onClick={saveTranscript}
           >
-            {updateMut.isPending ? "Salvataggio..." : "Salva trascrizione"}
+            {updateMut.isPending ? "Salvataggio..." : `Salva ${title().toLowerCase()}`}
           </button>
         </Show>
       </div>
-      <Show when={localTranscript()} fallback={<div class="step-empty-info">Nessun transcript disponibile. Esegui lo step di trascrizione.</div>}>
+      <Show
+        when={localTranscript()}
+        fallback={
+          <div class="step-empty-info">
+            {props.mode === "alignment"
+              ? "Nessun allineamento disponibile. Esegui transcription o alignment."
+              : "Nessun transcript disponibile. Esegui lo step di trascrizione."}
+          </div>
+        }
+      >
         {(t) => (
           <div class="transcript-segments">
-            <For each={t().segments}>
+            <Index each={t().segments}>
               {(seg, si) => (
                 <div class="transcript-segment">
-                  <div class="transcript-segment-time">{fmtTimePrecise(seg.start)}</div>
-                  <div class="transcript-words">
-                    <For each={seg.words}>
-                      {(word, wi) => {
-                        const isEditing = () => {
-                          const e = ew();
-                          return e !== null && e.seg === si() && e.word === wi();
-                        };
+                  <div class="transcript-segment-time">{fmtTimePrecise(seg().start)}</div>
+                  <Show
+                    when={props.mode === "alignment"}
+                    fallback={
+                      <div class="transcript-words">
+                        <Index each={seg().words}>
+                          {(word, wi) => {
+                            const isEditing = () => {
+                              const e = ew();
+                              return e !== null && e.seg === si && e.word === wi;
+                            };
 
-                        return (
-                          <Show
-                            when={isEditing()}
-                            fallback={
-                              <span
-                                class="transcript-word"
-                                style={{ color: confColor(word.confidence) }}
-                                title={`${word.text} [${fmtTimePrecise(word.start)}-${fmtTimePrecise(word.end)}] conf: ${Math.round(word.confidence * 100)}%`}
-                                onClick={() => startEdit(si(), wi())}
-                                onDblClick={() => seekToWord(word)}
+                            return (
+                              <Show
+                                when={isEditing()}
+                                fallback={
+                                  <span
+                                    class="transcript-word"
+                                    style={{ color: confColor(word().confidence) }}
+                                    title={`${word().text} [${fmtTimePrecise(word().start)}-${fmtTimePrecise(word().end)}] conf: ${Math.round(word().confidence * 100)}%`}
+                                    onClick={() => startEdit(si, wi)}
+                                    onDblClick={() => seekToWord(word())}
+                                  >
+                                    {word().text}
+                                  </span>
+                                }
                               >
-                                {word.text}
-                              </span>
-                            }
-                          >
-                            <span class="transcript-word-edit">
-                              <input
-                                type="text"
-                                class="transcript-word-input"
-                                value={word.text}
-                                autofocus
-                                onInput={(e) => updateWord(si(), wi(), e.currentTarget.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter") setEditingWord(null);
-                                  if (e.key === "Escape") setEditingWord(null);
-                                  if (e.key === "Delete" && e.shiftKey) deleteWord(si(), wi());
-                                  if (e.key === "Tab") {
-                                    e.preventDefault();
-                                    const nextWord = e.shiftKey ? wi() - 1 : wi() + 1;
-                                    if (nextWord >= 0 && nextWord < seg.words.length) {
-                                      setEditingWord({ seg: si(), word: nextWord });
-                                    } else {
+                                <span
+                                  class="transcript-word-edit"
+                                  onFocusOut={(e) => {
+                                    const next = e.relatedTarget;
+                                    if (!next || !(e.currentTarget as HTMLElement).contains(next as Node)) {
                                       setEditingWord(null);
                                     }
-                                  }
+                                  }}
+                                >
+                                  <input
+                                    type="text"
+                                    class="transcript-word-input"
+                                    value={word().text}
+                                    autofocus
+                                    onInput={(e) => updateWord(si, wi, e.currentTarget.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") setEditingWord(null);
+                                      if (e.key === "Escape") setEditingWord(null);
+                                      if (e.key === "Delete" && e.shiftKey) deleteWord(si, wi);
+                                      if (e.key === "Tab") {
+                                        e.preventDefault();
+                                        const nextWord = e.shiftKey ? wi - 1 : wi + 1;
+                                        if (nextWord >= 0 && nextWord < seg().words.length) {
+                                          setEditingWord({ seg: si, word: nextWord });
+                                        } else {
+                                          setEditingWord(null);
+                                        }
+                                      }
+                                    }}
+                                  />
+                                </span>
+                              </Show>
+                            );
+                          }}
+                        </Index>
+                      </div>
+                    }
+                  >
+                    <div class="alignment-editor">
+                      <div class="alignment-hint">Trascina i bordi laterali della parola selezionata per regolare start e end.</div>
+                      <div
+                        ref={(el) => {
+                          timelineRefs[si] = el;
+                        }}
+                        class="alignment-track"
+                        onPointerDown={(e) => {
+                          if (e.target === e.currentTarget) seekWithinSegment(si, e.clientX);
+                        }}
+                      >
+                        <Show when={playheadPct(seg()) !== null}>
+                          {(pct) => <div class="alignment-playhead" style={{ left: `${pct()}%` }} />}
+                        </Show>
+                        <Index each={seg().words}>
+                          {(word, wi) => {
+                            const isSelected = () => {
+                              const e = ew();
+                              return e !== null && e.seg === si && e.word === wi;
+                            };
+
+                            return (
+                              <button
+                                type="button"
+                                class={`alignment-word-bar${isSelected() ? " is-selected" : ""}`}
+                                style={{
+                                  left: `${wordLeftPct(seg(), word())}%`,
+                                  width: `${wordWidthPct(seg(), word())}%`,
+                                  color: confColor(word().confidence),
                                 }}
-                                onBlur={() => setEditingWord(null)}
-                              />
-                            </span>
-                          </Show>
-                        );
-                      }}
-                    </For>
-                  </div>
+                                title={`${word().text} [${fmtTimePrecise(word().start)}-${fmtTimePrecise(word().end)}]`}
+                                onClick={() => startEdit(si, wi)}
+                                onDblClick={() => seekToWord(word())}
+                              >
+                                <span class="alignment-word-label">{word().text}</span>
+                                <Show when={isSelected()}>
+                                  <>
+                                    <span
+                                      class="alignment-handle alignment-handle--start"
+                                      onPointerDown={(e) => beginHandleDrag(e, si, wi, "start")}
+                                    />
+                                    <span
+                                      class="alignment-handle alignment-handle--end"
+                                      onPointerDown={(e) => beginHandleDrag(e, si, wi, "end")}
+                                    />
+                                  </>
+                                </Show>
+                              </button>
+                            );
+                          }}
+                        </Index>
+                      </div>
+                      <Show when={ew()?.seg === si && seg().words[ew()!.word]}>
+                        <div class="alignment-selection">
+                          <span class="alignment-selection-word">{seg().words[ew()!.word].text}</span>
+                          <span>{fmtTimePrecise(seg().words[ew()!.word].start)}</span>
+                          <span>{fmtTimePrecise(seg().words[ew()!.word].end)}</span>
+                        </div>
+                      </Show>
+                    </div>
+                  </Show>
                 </div>
               )}
-            </For>
+            </Index>
           </div>
         )}
       </Show>
@@ -490,6 +740,7 @@ const SAMPLE_WORDS = ["Questo", "e'", "un", "esempio"];
 const SubtitleLiveEditor: Component<{
   req: () => JobSnapshot["request"];
   onDirty: () => void;
+  onSavedRef?: (cb: () => void) => void;
 }> = (props) => {
   const job = useJobQuery(selectedJobId);
   const jData = () => job.data as JobSnapshot | undefined;
@@ -503,12 +754,14 @@ const SubtitleLiveEditor: Component<{
   const [popInMs, setPopInMs] = createSignal(140);
   const [chunkWords, setChunkWords] = createSignal(3);
   const [activeIdx, setActiveIdx] = createSignal(0);
+  const [subDirty, setSubDirty] = createSignal(false);
 
+  // Only sync from server when the user hasn't made local edits
   createEffect(
     on(
       () => props.req().subtitle,
       (sub) => {
-        if (!sub) return;
+        if (!sub || subDirty()) return;
         setFontName(sub.font_name);
         setFontSize(sub.font_size);
         setTextColor(sub.text_color);
@@ -548,7 +801,10 @@ const SubtitleLiveEditor: Component<{
   });
   onCleanup(() => { if (animTimer) clearInterval(animTimer); });
 
-  const markDirty = () => props.onDirty();
+  // Register reset callback so parent save() can clear our dirty state
+  props.onSavedRef?.(() => setSubDirty(false));
+
+  const markDirty = () => { setSubDirty(true); props.onDirty(); };
   const hexToCss = (hex: string) => `#${hex}`;
   const setAndDirty = <T,>(setter: (v: T) => void) => (v: T) => { setter(v); markDirty(); };
 

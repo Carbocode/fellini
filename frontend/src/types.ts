@@ -1,6 +1,6 @@
 export type JobStatus = "pending" | "running" | "completed" | "failed";
 export type StepStatus = "pending" | "running" | "completed" | "failed";
-export type StepName = "ingest" | "transcription" | "alignment" | "editorial" | "render";
+export type StepName = "ingest" | "transcription" | "editorial" | "render";
 export type RunProfile = "fast" | "balanced" | "quality" | "custom";
 export type ExecutionMode = "automatic" | "step_by_step";
 
@@ -11,6 +11,8 @@ export interface StepSnapshot {
   started_at: string | null;
   finished_at: string | null;
   artifacts: string[];
+  can_run: boolean;
+  blocked_reason: string;
 }
 
 export interface InputAsset {
