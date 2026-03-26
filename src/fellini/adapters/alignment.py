@@ -9,6 +9,9 @@ from fellini.domain.models import (
     TranscriptSegment,
     WordTiming,
 )
+from fellini.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class TranscriptAligner:
@@ -23,16 +26,26 @@ class TranscriptAligner:
         language: str,
         use_whisperx: bool,
     ) -> TranscriptArtifact:
+        logger.info(
+            "alignment.start audio=%s transcript_segments=%s use_whisperx=%s language=%s",
+            audio_path,
+            len(transcript.segments),
+            use_whisperx,
+            language,
+        )
         if not transcript.segments:
+            logger.info("alignment.skip audio=%s reason=no_transcript_segments", audio_path)
             return transcript
 
         if use_whisperx and importlib.util.find_spec("whisperx") is not None:
+            logger.info("alignment.backend audio=%s backend=whisperx", audio_path)
             return self._whisperx_align(audio_path, transcript, config, language)
 
         if use_whisperx and not self.degraded_mode_when_missing:
             msg = "Missing dependency `whisperx`. Install `pip install -e .[asr]`."
             raise RuntimeError(msg)
 
+        logger.warning("alignment.backend audio=%s backend=heuristic", audio_path)
         return self._heuristic_align(transcript)
 
     def _whisperx_align(
@@ -45,6 +58,7 @@ class TranscriptAligner:
         import whisperx
 
         device = self._resolve_device(config.device)
+        logger.info("alignment.whisperx.load_model language=%s device=%s", language, device)
         model, metadata = whisperx.load_align_model(language_code=language, device=device)
         payload = {
             "segments": [segment.model_dump(exclude={"words"}) for segment in transcript.segments]
@@ -73,16 +87,19 @@ class TranscriptAligner:
                 )
             )
 
-        return TranscriptArtifact(
+        result = TranscriptArtifact(
             language=transcript.language,
             segments=segments,
             source="whisperx",
             notes=transcript.notes,
         )
+        logger.info("alignment.whisperx.done segments=%s", len(segments))
+        return result
 
     @staticmethod
     def _heuristic_align(transcript: TranscriptArtifact) -> TranscriptArtifact:
         if any(segment.words for segment in transcript.segments):
+            logger.info("alignment.heuristic.skip reason=existing_words")
             return transcript
 
         segments: list[TranscriptSegment] = []
@@ -104,12 +121,14 @@ class TranscriptAligner:
             ]
             segments.append(segment.model_copy(update={"words": words}))
 
-        return TranscriptArtifact(
+        result = TranscriptArtifact(
             language=transcript.language,
             segments=segments,
             source=f"{transcript.source}+heuristic",
             notes=transcript.notes,
         )
+        logger.info("alignment.heuristic.done segments=%s", len(segments))
+        return result
 
     @staticmethod
     def _resolve_device(device: str) -> str:

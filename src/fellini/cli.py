@@ -7,8 +7,11 @@ from pathlib import Path
 import uvicorn
 
 from fellini.domain.models import JobRequest, RunProfile
+from fellini.log import configure_logging, get_logger
 from fellini.services.job_manager import JobManager
 from fellini.settings import load_settings
+
+logger = get_logger(__name__)
 
 
 def main() -> None:
@@ -30,8 +33,20 @@ def main() -> None:
 
     args = parser.parse_args()
     settings = load_settings(args.config)
+    configure_logging(settings.log_level)
+    logger.info(
+        "cli.start command=%s config=%s workspace_root=%s",
+        args.command,
+        args.config,
+        settings.workspace_root,
+    )
 
     if args.command == "serve":
+        logger.info(
+            "cli.serve host=%s port=%s",
+            args.host or settings.host,
+            args.port or settings.port,
+        )
         uvicorn.run(
             "fellini.app:create_app",
             factory=True,
@@ -48,6 +63,19 @@ def main() -> None:
             profile=RunProfile(args.profile),
             language=args.language,
         )
+        logger.info(
+            "cli.run title=%s profile=%s language=%s inputs=%s",
+            args.title,
+            args.profile,
+            args.language,
+            [str(path.resolve()) for path in args.inputs],
+        )
         snapshot = manager.create_from_paths(request, [path.resolve() for path in args.inputs])
         result = manager.run_sync(snapshot.id)
+        logger.info(
+            "cli.run.completed job_id=%s status=%s outputs=%s",
+            result.id,
+            result.status.value,
+            result.outputs,
+        )
         print(json.dumps(result.model_dump(mode="json"), indent=2))

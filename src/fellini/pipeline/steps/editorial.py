@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from fellini.domain.models import StepName
+from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+
+logger = get_logger(__name__)
 
 
 class EditorialStep(PipelineStep):
@@ -18,6 +21,14 @@ class EditorialStep(PipelineStep):
                 "empty",
             )
         )
+        logger.info(
+            "step.editorial.start transcript_source=%s transcript_segments=%s duration=%.3f llm_refine=%s",
+            transcript.source,
+            len(transcript.segments),
+            context.state.duration_seconds,
+            context.request.toggles.use_local_llm,
+        )
+        context.report_progress(self.name, 10, "Analisi del transcript")
         bundle = context.decision_engine.build_editorial_bundle(
             transcript,
             context.state.duration_seconds,
@@ -25,12 +36,18 @@ class EditorialStep(PipelineStep):
             context.request.subtitle,
             context.request.decision,
         )
+        context.report_progress(
+            self.name,
+            40,
+            "Refine degli span con LLM" if context.request.toggles.use_local_llm else "Etichettatura degli span",
+        )
         spans = context.llm_refiner.refine(
             bundle.spans,
             enabled=context.request.toggles.use_local_llm,
             model_name=context.request.decision.local_model_name,
         )
         context.state.labeled_spans = spans
+        context.report_progress(self.name, 65, "Costruzione EDL e captions")
         context.state.edl = context.decision_engine.build_edl(
             spans,
             context.state.duration_seconds,
@@ -42,6 +59,7 @@ class EditorialStep(PipelineStep):
         )
         context.state.render_plan = bundle.render_plan
 
+        context.report_progress(self.name, 90, "Salvataggio artefatti editorial")
         spans_artifact = context.save_json_artifact(
             "05_spans_labeled.json",
             {"spans": [span.model_dump(mode="json") for span in spans]},
@@ -51,4 +69,11 @@ class EditorialStep(PipelineStep):
             "07_caption_display.json", context.state.captions
         )
         plan_artifact = context.save_json_artifact("09_render_plan.json", context.state.render_plan)
+        context.report_progress(self.name, 100, "Editorial completato")
+        logger.info(
+            "step.editorial.done spans=%s keep_ranges=%s captions=%s",
+            len(spans),
+            len(context.state.edl.keep_ranges) if context.state.edl else 0,
+            len(context.state.captions.chunks) if context.state.captions else 0,
+        )
         return [spans_artifact, edl_artifact, captions_artifact, plan_artifact]

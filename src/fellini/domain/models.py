@@ -262,6 +262,7 @@ class RenderPlan(BaseModel):
 class StepSnapshot(BaseModel):
     name: StepName
     status: StepStatus = StepStatus.pending
+    progress: int = 0
     message: str = ""
     started_at: datetime | None = None
     finished_at: datetime | None = None

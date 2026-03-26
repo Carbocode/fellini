@@ -23,6 +23,7 @@ import {
 import {
   baseName,
   buildArtifactCatalog,
+  capitalize,
   fmtTime,
   fmtTimePrecise,
   getMonitorSources,
@@ -34,9 +35,19 @@ import type { JobSnapshot } from "../types";
 import PipelineBar from "./PipelineBar";
 import ParamsInspector from "./ParamsInspector";
 
+const TIMELINE_SPLITTER_HEIGHT = 4;
+const PANEL_SPLITTER_WIDTH = 4;
+const MIN_TIMELINE_HEIGHT = 180;
+const MIN_TOP_WORKSPACE_HEIGHT = 220;
+const MIN_BROWSER_WIDTH = 220;
+const MAX_BROWSER_WIDTH = 440;
+
 const Workspace: Component = () => {
   const job = useJobQuery(selectedJobId);
   const hasJob = () => !!job.data;
+  const [timelineHeight, setTimelineHeight] = createSignal<number | null>(null);
+  const [browserWidth, setBrowserWidth] = createSignal(280);
+  let editorMainRef: HTMLDivElement | undefined;
 
   // Sync tab label with job title
   createEffect(
@@ -79,13 +90,109 @@ const Workspace: Component = () => {
 
   onCleanup(() => polling.stop());
 
+  const clampBrowserWidth = (width: number) =>
+    Math.max(MIN_BROWSER_WIDTH, Math.min(MAX_BROWSER_WIDTH, Math.round(width)));
+
+  const clampTimelineHeight = (height: number) => {
+    if (!editorMainRef) return Math.max(MIN_TIMELINE_HEIGHT, Math.round(height));
+    const totalHeight = editorMainRef.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
+    const maxHeight = Math.max(MIN_TIMELINE_HEIGHT, totalHeight - MIN_TOP_WORKSPACE_HEIGHT);
+    return Math.max(MIN_TIMELINE_HEIGHT, Math.min(maxHeight, Math.round(height)));
+  };
+
+  const editorShellColumns = () => `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`;
+
+  const editorMainRows = () =>
+    timelineHeight() === null
+      ? `minmax(0, 1fr) ${TIMELINE_SPLITTER_HEIGHT}px minmax(0, 1fr)`
+      : `minmax(0, 1fr) ${TIMELINE_SPLITTER_HEIGHT}px ${timelineHeight()}px`;
+
+  const onBrowserResizeStart = (e: PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = browserWidth();
+
+    const onMove = (ev: PointerEvent) => {
+      const delta = ev.clientX - startX;
+      setBrowserWidth(clampBrowserWidth(startWidth + delta));
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  const onTimelineResizeStart = (e: PointerEvent) => {
+    if (!editorMainRef) return;
+    e.preventDefault();
+    const totalHeight = editorMainRef.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
+    const startY = e.clientY;
+    const startHeight = timelineHeight() ?? Math.max(MIN_TIMELINE_HEIGHT, Math.round(totalHeight * 0.5));
+
+    const onMove = (ev: PointerEvent) => {
+      const delta = startY - ev.clientY;
+      setTimelineHeight(clampTimelineHeight(startHeight + delta));
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  createEffect(() => {
+    if (!editorMainRef) return;
+
+    const syncTimelineHeight = () => {
+      const totalHeight = editorMainRef!.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
+      const fallback = Math.max(MIN_TIMELINE_HEIGHT, Math.round(totalHeight * 0.5));
+      setTimelineHeight((current) => clampTimelineHeight(current ?? fallback));
+    };
+
+    syncTimelineHeight();
+    const observer = new ResizeObserver(syncTimelineHeight);
+    observer.observe(editorMainRef);
+    onCleanup(() => observer.disconnect());
+  });
+
   return (
     <main class="workspace">
       <Show when={hasJob()} fallback={<div class="empty-state"><div class="empty-content"><p>Caricamento progetto...</p></div></div>}>
         <div class="project-workspace">
-          <PipelineBar />
-          <WorkspaceGrid />
-          <TimelinePanel />
+          <div
+            class="editor-shell"
+            style={{ "grid-template-columns": editorShellColumns() }}
+          >
+            <div class="browser-col">
+              <ArtifactBrowserPanel />
+            </div>
+            <div class="browser-resize-handle" onPointerDown={onBrowserResizeStart} />
+            <div class="editor-main-wrap">
+              <PipelineBar />
+              <div
+                ref={editorMainRef}
+                class="editor-main"
+                style={{ "grid-template-rows": editorMainRows() }}
+              >
+                <WorkspaceGrid />
+                <div class="workspace-vsplit" onPointerDown={onTimelineResizeStart} />
+                <TimelinePanel />
+              </div>
+            </div>
+          </div>
         </div>
       </Show>
     </main>
@@ -99,6 +206,360 @@ function useJob() {
 }
 
 /* ---- Monitor ---- */
+
+/* Step display order & labels */
+const STEP_ORDER = ["ingest", "transcription", "editorial", "render", "output"] as const;
+const STEP_LABELS: Record<string, string> = {
+  ingest: "Ingest",
+  transcription: "Transcription",
+  editorial: "Editorial",
+  render: "Render",
+  output: "Output",
+};
+const STEP_ICONS: Record<string, string> = {
+  ingest: "M4 4h6v6H4zm10 0h6v6h-6zM4 14h6v6H4zm10 0h6v6h-6z",
+  transcription: "M12 3a9 9 0 110 18 9 9 0 010-18zm-1 5v5l4 2.5",
+  editorial: "M4 6h16M4 12h10M4 18h14",
+  render: "M5 3l14 9-14 9V3z",
+  output: "M12 2l8 4v8l-8 4-8-4V6l8-4z",
+};
+
+interface ArtifactGroup {
+  step: string;
+  label: string;
+  items: import("../types").ArtifactEntry[];
+}
+
+const FileTypeIcon: Component<{ type: string }> = (props) => {
+  const iconPaths: Record<string, string> = {
+    video: "M15 10l5-3v10l-5-3zM4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z",
+    audio: "M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z",
+    json: "M7 8l-4 4 4 4M17 8l4 4-4 4M14 4l-4 16",
+    text: "M4 6h16M4 10h16M4 14h10M4 18h12",
+    binary: "M10 4H4v6h6V4zm10 0h-6v6h6V4zm-10 10H4v6h6v-6zm10 0h-6v6h6v-6z",
+  };
+  return (
+    <svg class={`asset-type-icon asset-type-icon--${props.type}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d={iconPaths[props.type] || iconPaths.binary} />
+    </svg>
+  );
+};
+
+const ASSET_PREVIEW_MIN = 120;
+const ASSET_LIST_MIN = 140;
+
+type SidebarTab = "assets" | "logs";
+
+const ArtifactBrowserPanel: Component = () => {
+  const job = useJob();
+  const data = () => job.data as JobSnapshot | undefined;
+  const [filter, setFilter] = createSignal("");
+  const [collapsed, setCollapsed] = createSignal<Record<string, boolean>>({});
+  const [previewHeight, setPreviewHeight] = createSignal(220);
+  const [activeTab, setActiveTab] = createSignal<SidebarTab>("assets");
+  let containerRef: HTMLDivElement | undefined;
+
+  /* Logs data */
+  const logs = createMemo(() => (data())?.logs ?? []);
+  const error = () => data()?.error;
+
+  const catalog = createMemo(() => {
+    const j = data();
+    return j ? buildArtifactCatalog(j) : [];
+  });
+
+  const groups = createMemo<ArtifactGroup[]>(() => {
+    const items = catalog();
+    const f = filter().toLowerCase();
+    const byStep = new Map<string, import("../types").ArtifactEntry[]>();
+    for (const item of items) {
+      if (f && !baseName(item.path).toLowerCase().includes(f) && !item.step.toLowerCase().includes(f)) continue;
+      const arr = byStep.get(item.step) ?? [];
+      arr.push(item);
+      byStep.set(item.step, arr);
+    }
+    return STEP_ORDER
+      .filter((s) => byStep.has(s))
+      .map((s) => ({ step: s, label: STEP_LABELS[s] || capitalize(s), items: byStep.get(s)! }));
+  });
+
+  const totalCount = () => groups().reduce((n, g) => n + g.items.length, 0);
+
+  const jobId = () => data()?.id;
+  const currentPreview = () => {
+    const id = jobId();
+    return id ? getPreviewForJob(id) : undefined;
+  };
+  const itemTitle = (path: string) => {
+    const type = inferFileType(path);
+    return type === "video" || type === "audio" ? humanizeMediaName(path) : baseName(path);
+  };
+
+  const isActive = (path: string) => currentPreview() === path;
+
+  const openArtifact = (path: string) => {
+    const id = jobId();
+    if (!id) return;
+    setPreviewForJob(id, path);
+  };
+
+  const toggleGroup = (step: string) => {
+    setCollapsed((prev) => ({ ...prev, [step]: !prev[step] }));
+  };
+
+  /* ---- Preview pane data ---- */
+  const previewPath = createMemo(() => {
+    const id = jobId();
+    if (!id) return null;
+    const j = data();
+    if (!j) return null;
+    const cat = buildArtifactCatalog(j);
+    const p = getPreviewForJob(id);
+    if (p && cat.some((item) => item.path === p)) return p;
+    const preferred = [
+      "06_edit_decision_list.json",
+      "05_spans_labeled.json",
+      "07_caption_display.json",
+      "04_transcript_aligned.json",
+      "03_transcript_raw.json",
+      "01_media_probe.json",
+    ];
+    for (const suffix of preferred) {
+      const match = cat.find((i) => i.path.endsWith(suffix));
+      if (match) return match.path;
+    }
+    return null;
+  });
+
+  const shouldFetch = createMemo(() => {
+    const p = previewPath();
+    return p && isPreviewableText(p) ? p : null;
+  });
+
+  const artifact = useArtifactQuery(() => jobId() ?? null, shouldFetch);
+
+  const previewSrc = createMemo(() => {
+    const id = jobId();
+    const p = previewPath();
+    return id && p ? fileUrl(id, p) : null;
+  });
+
+  const previewName = createMemo(() => {
+    const p = previewPath();
+    return p ? baseName(p) : "";
+  });
+
+  const previewFileType = createMemo(() => {
+    const p = previewPath();
+    return p ? inferFileType(p) : null;
+  });
+
+  const content = createMemo(() => {
+    const entry = artifact.data;
+    if (!entry) return null;
+    return entry.type === "json" ? JSON.stringify(entry.data, null, 2) : entry.text;
+  });
+
+  /* ---- Vertical splitter between list and preview ---- */
+  const onPreviewResizeStart = (e: PointerEvent) => {
+    if (!containerRef) return;
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = previewHeight();
+    const totalH = containerRef.getBoundingClientRect().height;
+
+    const onMove = (ev: PointerEvent) => {
+      const delta = startY - ev.clientY;
+      const newH = Math.max(ASSET_PREVIEW_MIN, Math.min(totalH - ASSET_LIST_MIN, startH + delta));
+      setPreviewHeight(newH);
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  return (
+    <div class="panel asset-explorer" ref={containerRef}>
+      {/* Tab bar */}
+      <div class="sidebar-tabs">
+        <button
+          type="button"
+          class={`sidebar-tab${activeTab() === "assets" ? " active" : ""}`}
+          onClick={() => setActiveTab("assets")}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2v11z" />
+          </svg>
+          Assets
+          <span class="sidebar-tab-badge">{totalCount()}</span>
+        </button>
+        <button
+          type="button"
+          class={`sidebar-tab${activeTab() === "logs" ? " active" : ""}`}
+          onClick={() => setActiveTab("logs")}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
+          </svg>
+          Log
+          <Show when={logs().length > 0}>
+            <span class="sidebar-tab-badge">{logs().length}</span>
+          </Show>
+        </button>
+      </div>
+
+      {/* ===== ASSETS TAB ===== */}
+      <div class="sidebar-tab-body" style={{ display: activeTab() === "assets" ? "flex" : "none" }}>
+        {/* Search */}
+        <div class="asset-explorer-search">
+          <svg class="asset-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            type="text"
+            class="asset-search-input"
+            placeholder="Filtra artefatti..."
+            value={filter()}
+            onInput={(e) => setFilter(e.currentTarget.value)}
+          />
+          <Show when={filter().length > 0}>
+            <button type="button" class="asset-search-clear" onClick={() => setFilter("")}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+            </button>
+          </Show>
+        </div>
+
+        {/* Asset list */}
+        <div class="asset-explorer-content">
+          <Show when={totalCount() === 0}>
+            <div class="asset-explorer-empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z" />
+                <polyline points="13 2 13 9 20 9" />
+              </svg>
+              <span>{filter() ? "Nessun risultato" : "Nessun artefatto disponibile"}</span>
+            </div>
+          </Show>
+          <For each={groups()}>
+            {(group) => (
+              <div class="asset-group">
+                <button type="button" class="asset-group-header" onClick={() => toggleGroup(group.step)}>
+                  <svg class={`asset-group-chevron${collapsed()[group.step] ? " collapsed" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                  <svg class="asset-group-step-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d={STEP_ICONS[group.step] || STEP_ICONS.output} />
+                  </svg>
+                  <span class="asset-group-label">{group.label}</span>
+                  <span class="asset-group-count">{group.items.length}</span>
+                </button>
+                <Show when={!collapsed()[group.step]}>
+                  <div class="asset-group-items">
+                    <For each={group.items}>
+                      {(item) => {
+                        const ftype = () => inferFileType(item.path);
+                        return (
+                          <button
+                            type="button"
+                            class={`asset-item${isActive(item.path) ? " active" : ""}`}
+                            onClick={() => openArtifact(item.path)}
+                            title={item.path}
+                          >
+                            <FileTypeIcon type={ftype()} />
+                            <span class="asset-item-name">{itemTitle(item.path)}</span>
+                            <span class={`asset-item-badge asset-item-badge--${ftype()}`}>{ftype().toUpperCase()}</span>
+                          </button>
+                        );
+                      }}
+                    </For>
+                  </div>
+                </Show>
+              </div>
+            )}
+          </For>
+        </div>
+
+        {/* Splitter */}
+        <div class="asset-preview-splitter" onPointerDown={onPreviewResizeStart} />
+
+        {/* Inline preview pane */}
+        <div class="asset-preview-pane" style={{ height: `${previewHeight()}px` }}>
+          <div class="asset-preview-header">
+            <svg class="asset-preview-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <span class="asset-preview-title">
+              {previewName() || "Preview"}
+            </span>
+            <Show when={previewSrc()}>
+              <a class="asset-preview-open" href={previewSrc()!} target="_blank">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" />
+                  <polyline points="15 3 21 3 21 9" />
+                  <line x1="10" y1="14" x2="21" y2="3" />
+                </svg>
+              </a>
+            </Show>
+          </div>
+          <div class="asset-preview-body">
+            <Show when={!previewPath()}>
+              <div class="asset-preview-empty">Seleziona un artefatto</div>
+            </Show>
+            <Show when={previewPath()}>
+              {(() => {
+                const ft = previewFileType();
+                if (ft === "video") {
+                  return <video class="asset-preview-media" src={previewSrc()!} controls preload="metadata" />;
+                }
+                if (ft === "audio") {
+                  return <audio class="asset-preview-media asset-preview-audio" src={previewSrc()!} controls preload="metadata" />;
+                }
+                return (
+                  <Show when={content() !== null} fallback={
+                    <div class="asset-preview-empty">
+                      {artifact.isLoading ? "Caricamento..." : "Preview non disponibile"}
+                    </div>
+                  }>
+                    <pre class="asset-preview-code">{content()}</pre>
+                  </Show>
+                );
+              })()}
+            </Show>
+          </div>
+        </div>
+      </div>
+
+      {/* ===== LOGS TAB ===== */}
+      <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: activeTab() === "logs" ? "flex" : "none" }}>
+        <div class="sidebar-logs-content">
+          <Show when={logs().length === 0 && !error()}>
+            <div class="asset-explorer-empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
+              </svg>
+              <span>Nessun log disponibile</span>
+            </div>
+          </Show>
+          <Show when={error()}>
+            <div class="sidebar-log-line sidebar-log-error">{error()}</div>
+          </Show>
+          <For each={[...logs()].reverse()}>
+            {(line) => <div class="sidebar-log-line">{line}</div>}
+          </For>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 /* ---- Resizable workspace grid ---- */
 
@@ -135,14 +596,10 @@ const WorkspaceGrid: Component = () => {
     >
       <div class="monitor-col">
         <MonitorPanel />
-        <OutputsPanel />
       </div>
       <div class="resize-handle" onPointerDown={onResizeStart} />
       <div class="inspector-col">
         <ParamsInspector />
-        <ArtifactsPanel />
-        <PreviewPanel />
-        <LogsPanel />
       </div>
     </div>
   );
@@ -410,6 +867,14 @@ interface AlignmentTranscript {
   notes: string[];
 }
 
+type OverviewSegmentTone = "keep" | "group" | "cut" | "maybe" | "shorten";
+
+interface OverviewSegment {
+  start: number;
+  end: number;
+  tone: OverviewSegmentTone;
+}
+
 const ZOOM_STEPS = [0.5, 1, 2, 4, 8, 16];
 const MIN_PX_PER_SEC = 60; // at zoom 1x
 const MIN_ALIGNMENT_WORD_DURATION = 0.02;
@@ -585,21 +1050,39 @@ const TimelinePanel: Component = () => {
     return { segment, word };
   });
 
-  // Gaps between keep ranges (for minimap)
-  const gaps = createMemo(() => {
-    const r = ranges();
-    const d = duration();
-    if (!r.length || d <= 0) return [];
-    const result: { start: number; end: number }[] = [];
-    if (r[0].start > 0.01) result.push({ start: 0, end: r[0].start });
-    for (let i = 1; i < r.length; i++) {
-      if (r[i].start - r[i - 1].end > 0.01) {
-        result.push({ start: r[i - 1].end, end: r[i].start });
-      }
+  const overviewSegments = createMemo<OverviewSegment[]>(() => {
+    if (alignmentMode()) {
+      return alignmentSegments().map((segment) => ({
+        start: segment.start,
+        end: segment.end,
+        tone: "group",
+      }));
     }
-    if (r[r.length - 1].end < d - 0.01) result.push({ start: r[r.length - 1].end, end: d });
-    return result;
+
+    if (ranges().length > 0) {
+      return ranges().map((range) => ({
+        start: range.start,
+        end: range.end,
+        tone: "keep",
+      }));
+    }
+
+    return spans().map((span) => ({
+      start: span.start,
+      end: span.end,
+      tone:
+        span.label === "CUT"
+          ? "cut"
+          : span.label === "MAYBE"
+            ? "maybe"
+            : span.label === "SHORTEN"
+              ? "shorten"
+              : "keep",
+    }));
   });
+
+  const overviewCuts = createMemo(() => (alignmentMode() ? [] : cuts()));
+  const showOverview = createMemo(() => hasData() && duration() > 0);
 
   // Pixel math
   const totalWidth = () => Math.max(duration() * MIN_PX_PER_SEC * zoom(), 400);
@@ -703,6 +1186,12 @@ const TimelinePanel: Component = () => {
     setScrollFrac(viewportRef.scrollLeft / tw);
     setViewFrac(Math.min(1, viewportRef.clientWidth / tw));
   };
+
+  createEffect(() => {
+    showOverview();
+    totalWidth();
+    queueMicrotask(() => updateScrollFracs());
+  });
 
   // Tooltip state
   const [tooltip, setTooltip] = createSignal<{ text: string; x: number; y: number } | null>(null);
@@ -1042,9 +1531,9 @@ const TimelinePanel: Component = () => {
       {/* Minimap — shows entire timeline overview when zoomed in */}
       <div
         class="tl-minimap"
-        style={{ display: hasData() && !alignmentMode() && viewFrac() < 0.99 ? "grid" : "none" }}
+        style={{ display: showOverview() ? "grid" : "none" }}
       >
-        <div class="tl-minimap-label" />
+        <div class="tl-minimap-label">Overall</div>
         <div
           class="tl-minimap-content"
           onPointerDown={(e) => {
@@ -1066,19 +1555,18 @@ const TimelinePanel: Component = () => {
             document.addEventListener("pointerup", onUp);
           }}
         >
-          <div class="tl-mini-full" />
-          <For each={gaps()}>
-            {(gap) => (
+          <For each={overviewSegments()}>
+            {(segment) => (
               <div
-                class="tl-mini-seg tl-mini-gap"
+                class={`tl-mini-seg tl-mini-seg--${segment.tone}`}
                 style={{
-                  left: `${(gap.start / duration()) * 100}%`,
-                  width: `${Math.max(0.3, ((gap.end - gap.start) / duration()) * 100)}%`,
+                  left: `${(segment.start / duration()) * 100}%`,
+                  width: `${Math.max(0.3, ((segment.end - segment.start) / duration()) * 100)}%`,
                 }}
               />
             )}
           </For>
-          <For each={cuts()}>
+          <For each={overviewCuts()}>
             {(c) => (
               <div
                 class="tl-mini-cut"
@@ -1160,177 +1648,5 @@ const OutputsPanel: Component = () => {
   );
 };
 
-/* ---- Artifacts ---- */
-
-const ArtifactsPanel: Component = () => {
-  const job = useJob();
-  const data = () => job.data as JobSnapshot | undefined;
-  const catalog = createMemo(() => {
-    const j = data();
-    return j ? buildArtifactCatalog(j) : [];
-  });
-  const jobId = () => data()?.id;
-  const currentPreview = () => {
-    const id = jobId();
-    return id ? getPreviewForJob(id) : undefined;
-  };
-
-  return (
-    <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">Artefatti</span>
-      </div>
-      <div class="artifacts-rack">
-        <div
-          class="placeholder"
-          style={{ display: catalog().length > 0 ? "none" : "block" }}
-        >
-          Nessun artefatto
-        </div>
-        <For each={catalog()}>
-          {(item) => (
-            <button
-              type="button"
-              class={`artifact-row${currentPreview() === item.path ? " active" : ""}`}
-              onClick={() => {
-                const id = jobId();
-                if (id) setPreviewForJob(id, item.path);
-              }}
-            >
-              <span class="artifact-step">{item.step}</span>
-              <span class="artifact-name">{baseName(item.path)}</span>
-            </button>
-          )}
-        </For>
-      </div>
-    </div>
-  );
-};
-
-/* ---- Preview ---- */
-
-const PreviewPanel: Component = () => {
-  const job = useJob();
-  const data = () => job.data as JobSnapshot | undefined;
-  const jobId = () => data()?.id;
-
-  const previewPath = createMemo(() => {
-    const id = jobId();
-    if (!id) return null;
-    const j = data();
-    if (!j) return null;
-    const catalog = buildArtifactCatalog(j);
-    const p = getPreviewForJob(id);
-    if (p && catalog.some((item) => item.path === p)) return p;
-    const preferred = [
-      "06_edit_decision_list.json",
-      "05_spans_labeled.json",
-      "07_caption_display.json",
-      "04_transcript_aligned.json",
-      "03_transcript_raw.json",
-      "01_media_probe.json",
-    ];
-    for (const suffix of preferred) {
-      const match = catalog.find((i) => i.path.endsWith(suffix));
-      if (match) return match.path;
-    }
-    return null;
-  });
-
-  const shouldFetch = createMemo(() => {
-    const p = previewPath();
-    return p && isPreviewableText(p) ? p : null;
-  });
-
-  const artifact = useArtifactQuery(() => jobId() ?? null, shouldFetch);
-
-  const previewSrc = createMemo(() => {
-    const id = jobId();
-    const p = previewPath();
-    return id && p ? fileUrl(id, p) : null;
-  });
-
-  const previewName = createMemo(() => {
-    const p = previewPath();
-    return p ? baseName(p) : "";
-  });
-
-  const content = createMemo(() => {
-    const entry = artifact.data;
-    if (!entry) return null;
-    return entry.type === "json" ? JSON.stringify(entry.data, null, 2) : entry.text;
-  });
-
-  return (
-    <div class="panel preview-panel">
-      <div class="panel-header">
-        <span class="panel-title">Preview</span>
-      </div>
-      <div class="preview-content">
-        <div
-          class="placeholder"
-          style={{ display: previewPath() ? "none" : "block" }}
-        >
-          Seleziona un artefatto
-        </div>
-        <div style={{ display: previewPath() ? "block" : "none" }}>
-          <div class="preview-header">
-            <strong>{previewName()}</strong>
-            <a href={previewSrc() ?? "#"} target="_blank">
-              Apri
-            </a>
-          </div>
-          <div
-            style={{
-              display:
-                content() !== null || artifact.isLoading ? "block" : "none",
-            }}
-          >
-            {content() !== null ? (
-              <pre>{content()}</pre>
-            ) : (
-              <div class="placeholder">
-                {artifact.isLoading ? "Caricamento..." : "Preview non disponibile"}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-/* ---- Logs ---- */
-
-const LogsPanel: Component = () => {
-  const job = useJob();
-  const logs = createMemo(() => (job.data as JobSnapshot | undefined)?.logs ?? []);
-  const error = () => (job.data as JobSnapshot | undefined)?.error;
-
-  return (
-    <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">Log</span>
-      </div>
-      <div class="logs-content">
-        <div
-          class="placeholder"
-          style={{ display: logs().length > 0 || error() ? "none" : "block" }}
-        >
-          Nessun log
-        </div>
-        <For each={[...logs()].reverse()}>
-          {(line) => <div class="log-line">{line}</div>}
-        </For>
-        <div
-          class="log-line error-label"
-          style={{ display: error() ? "block" : "none" }}
-        >
-          {error()}
-        </div>
-      </div>
-    </div>
-  );
-};
 
 export default Workspace;

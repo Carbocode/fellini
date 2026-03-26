@@ -10,6 +10,9 @@ from fellini.domain.models import (
     TranscriptSegment,
     WordTiming,
 )
+from fellini.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class DependencyMissingError(RuntimeError):
@@ -23,8 +26,17 @@ class FasterWhisperTranscriber:
     def transcribe(
         self, audio_path: Path, config: TranscriptionConfig, language: str
     ) -> tuple[list[SpeechSegment], TranscriptArtifact]:
+        logger.info(
+            "asr.transcribe.start audio=%s model=%s device=%s compute_type=%s language=%s",
+            audio_path,
+            config.model,
+            config.device,
+            config.compute_type,
+            language,
+        )
         if importlib.util.find_spec("faster_whisper") is None:
             if self.degraded_mode_when_missing:
+                logger.warning("asr.transcribe.degraded_missing_dependency audio=%s", audio_path)
                 return [], self._empty_transcript(language, source="degraded-fallback")
             msg = "Missing dependency `faster-whisper`. Install `pip install -e .[asr]`."
             raise DependencyMissingError(msg)
@@ -72,6 +84,13 @@ class FasterWhisperTranscriber:
             language=getattr(info, "language", language) or language,
             segments=transcript_segments,
             source="faster-whisper",
+        )
+        logger.info(
+            "asr.transcribe.done audio=%s speech_segments=%s transcript_segments=%s language=%s",
+            audio_path,
+            len(speech_segments),
+            len(transcript_segments),
+            transcript.language,
         )
         return speech_segments, transcript
 

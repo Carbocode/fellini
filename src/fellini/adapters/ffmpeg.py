@@ -8,7 +8,10 @@ import subprocess
 from pathlib import Path
 
 from fellini.domain.models import EditDecisionList, ProbeInfo, RenderConfig
+from fellini.log import get_logger
 from fellini.settings import AppSettings
+
+logger = get_logger(__name__)
 
 
 class FFmpegError(RuntimeError):
@@ -23,16 +26,25 @@ class FFmpegAdapter:
         self._available_encoders_cache: set[str] | None = None
 
     def _run(self, args: list[str]) -> None:
+        logger.debug("ffmpeg.run command=%s", " ".join(shlex.quote(arg) for arg in args))
         completed = subprocess.run(args, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
             stderr = completed.stderr.strip()
             stdout = completed.stdout.strip()
+            logger.error(
+                "ffmpeg.run.failed code=%s stderr=%s stdout=%s",
+                completed.returncode,
+                stderr,
+                stdout,
+            )
             msg = (
                 f"Command failed: {' '.join(shlex.quote(arg) for arg in args)}\n{stderr or stdout}"
             )
             raise FFmpegError(msg)
+        logger.debug("ffmpeg.run.done code=%s", completed.returncode)
 
     def probe_media(self, source: Path) -> ProbeInfo:
+        logger.info("ffmpeg.probe source=%s", source)
         args = [
             self.settings.ffprobe_bin,
             "-v",
@@ -65,7 +77,7 @@ class FFmpegAdapter:
             video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "0/1"
         )
 
-        return ProbeInfo(
+        probe = ProbeInfo(
             path=str(source),
             duration_seconds=float(fmt.get("duration", 0.0) or 0.0),
             width=int(video_stream.get("width", 0) or 0),
@@ -77,8 +89,19 @@ class FFmpegAdapter:
             has_audio=audio_stream is not None,
             format_name=fmt.get("format_name"),
         )
+        logger.info(
+            "ffmpeg.probe.done source=%s duration=%.3f size=%sx%s fps=%.3f has_audio=%s",
+            source,
+            probe.duration_seconds,
+            probe.width,
+            probe.height,
+            probe.fps,
+            probe.has_audio,
+        )
+        return probe
 
     def create_mezzanine(self, sources: list[Path], target: Path, temp_dir: Path) -> None:
+        logger.info("ffmpeg.create_mezzanine sources=%s target=%s", [str(source) for source in sources], target)
         normalized_paths: list[Path] = []
         for index, source in enumerate(sources):
             normalized = temp_dir / f"normalized_{index:02d}.mp4"
@@ -87,6 +110,7 @@ class FFmpegAdapter:
 
         if len(normalized_paths) == 1:
             shutil.copyfile(normalized_paths[0], target)
+            logger.info("ffmpeg.create_mezzanine.done target=%s mode=copy_single", target)
             return
 
         concat_list = temp_dir / "concat.txt"
@@ -105,8 +129,10 @@ class FFmpegAdapter:
             str(target),
         ]
         self._run(args)
+        logger.info("ffmpeg.create_mezzanine.done target=%s mode=concat", target)
 
     def extract_audio(self, source: Path, target: Path) -> None:
+        logger.info("ffmpeg.extract_audio source=%s target=%s", source, target)
         args = [
             self.settings.ffmpeg_bin,
             "-y",
@@ -122,8 +148,15 @@ class FFmpegAdapter:
             str(target),
         ]
         self._run(args)
+        logger.info("ffmpeg.extract_audio.done target=%s", target)
 
     def render_from_edl(self, source: Path, edl: EditDecisionList, output_dir: Path) -> Path:
+        logger.info(
+            "ffmpeg.render_from_edl source=%s keep_ranges=%s output_dir=%s",
+            source,
+            len(edl.keep_ranges),
+            output_dir,
+        )
         segment_dir = output_dir / "segments"
         segment_dir.mkdir(parents=True, exist_ok=True)
         video_codec = self._resolve_video_encoder("libx264")
@@ -194,6 +227,7 @@ class FFmpegAdapter:
             str(edited_master),
         ]
         self._run(args)
+        logger.info("ffmpeg.render_from_edl.done edited_master=%s", edited_master)
         return edited_master
 
     def render_vertical(
@@ -203,6 +237,14 @@ class FFmpegAdapter:
         render_config: RenderConfig,
         subtitles_path: Path | None = None,
     ) -> None:
+        logger.info(
+            "ffmpeg.render_vertical source=%s target=%s resolution=%sx%s subtitles=%s",
+            source,
+            target,
+            render_config.width,
+            render_config.height,
+            subtitles_path,
+        )
         filters = [
             f"scale={render_config.width}:{render_config.height}:force_original_aspect_ratio=increase",
             f"crop={render_config.width}:{render_config.height}",
@@ -237,6 +279,7 @@ class FFmpegAdapter:
             ]
         )
         self._run(args)
+        logger.info("ffmpeg.render_vertical.done target=%s", target)
 
     def _normalize_clip(self, source: Path, target: Path) -> None:
         video_codec = self._resolve_video_encoder("libx264")

@@ -22,9 +22,12 @@ from fellini.domain.models import (
     StepName,
     TranscriptArtifact,
 )
+from fellini.log import get_logger
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+
+logger = get_logger(__name__)
 
 
 class PipelineContext:
@@ -49,6 +52,7 @@ class PipelineContext:
         self.subtitle_builder = AssSubtitleBuilder()
 
     def load_state(self) -> None:
+        logger.debug("pipeline_context.load_state workspace=%s", self.workspace.job_dir)
         snapshot_state = None
         if self.workspace.state_path.exists():
             payload = json.loads(self.workspace.state_path.read_text(encoding="utf-8"))
@@ -58,6 +62,11 @@ class PipelineContext:
     def hydrate_state(self, snapshot_state: PipelineState | None = None) -> None:
         # Disk artifacts are the source of truth for reruns so manual/API edits
         # are picked up even if the cached pipeline snapshot is stale.
+        logger.debug(
+            "pipeline_context.hydrate_state workspace=%s snapshot_state=%s",
+            self.workspace.job_dir,
+            snapshot_state is not None,
+        )
         state = snapshot_state.model_copy(deep=True) if snapshot_state else PipelineState()
         probe_artifact = self.workspace.artifact_path("01_media_probe.json")
         if probe_artifact.exists():
@@ -98,14 +107,34 @@ class PipelineContext:
             ]
 
         self.state = state
+        logger.debug(
+            "pipeline_context.hydrate_state.done workspace=%s duration=%.3f probe_sources=%s raw_segments=%s aligned_segments=%s",
+            self.workspace.job_dir,
+            self.state.duration_seconds,
+            len(self.state.probe_info),
+            len(self.state.raw_transcript.segments) if self.state.raw_transcript else 0,
+            len(self.state.aligned_transcript.segments) if self.state.aligned_transcript else 0,
+        )
 
     def save_state(self) -> None:
         self.workspace.state_path.write_text(
             self.state.model_dump_json(indent=2),
             encoding="utf-8",
         )
+        logger.debug("pipeline_context.save_state path=%s", self.workspace.state_path)
+
+    def report_progress(self, step_name: StepName, progress: int, message: str) -> None:
+        logger.info(
+            "pipeline_context.report_progress workspace=%s step=%s progress=%s message=%s",
+            self.workspace.job_dir,
+            step_name.value,
+            progress,
+            message,
+        )
+        self.store.update_step_progress(self.workspace.job_id, step_name, progress, message)
 
     def prune_from_step(self, step_name: StepName) -> None:
+        logger.info("pipeline_context.prune_from_step workspace=%s step=%s", self.workspace.job_dir, step_name.value)
         if step_name == StepName.ingest:
             self.state = PipelineState()
             return
@@ -147,11 +176,13 @@ class PipelineContext:
         else:
             serialized = payload
         target.write_text(json.dumps(serialized, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("pipeline_context.save_json_artifact path=%s", target)
         return self.workspace.relative(target)
 
     def save_text_artifact(self, filename: str, content: str) -> str:
         target = self.workspace.artifact_path(filename)
         target.write_text(content, encoding="utf-8")
+        logger.info("pipeline_context.save_text_artifact path=%s", target)
         return self.workspace.relative(target)
 
     def output_relative(self, path: Path) -> str:

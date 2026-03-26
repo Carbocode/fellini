@@ -201,6 +201,9 @@ const ParamsInspector: Component = () => {
                   <Show when={ss()?.status === "failed"}>
                     <span class="step-failed-label">fallito</span>
                   </Show>
+                  <Show when={(ss()?.status === "running" || ((ss()?.progress ?? 0) > 0 && (ss()?.progress ?? 0) < 100))}>
+                    <span class="step-progress-inline">{ss()?.progress ?? 0}%</span>
+                  </Show>
                 </div>
                 <div class="step-inspector-actions">
                   <Show when={dirty()}>
@@ -229,6 +232,20 @@ const ParamsInspector: Component = () => {
 
               <Show when={ss()?.message}>
                 <div class="step-message">{ss()!.message}</div>
+              </Show>
+              <Show when={ss()?.status === "running"}>
+                <div class="step-progress-panel">
+                  <div class="step-progress-meta">
+                    <span>Avanzamento step</span>
+                    <span>{ss()!.progress}%</span>
+                  </div>
+                  <div class="step-progress-bar">
+                    <div
+                      class="step-progress-fill"
+                      style={{ width: `${Math.max(0, Math.min(100, ss()!.progress))}%` }}
+                    />
+                  </div>
+                </div>
               </Show>
               <Show when={!stepCanRun() && ss()?.blocked_reason && data()?.status !== "running"}>
                 <div class="step-message">{ss()!.blocked_reason}</div>
@@ -304,8 +321,12 @@ const ParamsInspector: Component = () => {
                         Modifica gli export nello step Ingest.
                       </div>
                     </Show>
-                    <SubtitleLiveEditor req={req} onDirty={() => setDirty(true)} onSavedRef={(cb) => { subEditorSavedCb = cb; }} />
-                    <Select label="Risoluzione" name="p_rn_resolution" value={`${req().render.width}x${req().render.height}`} options={["1080x1920", "720x1280", "1080x1080", "1920x1080"]} />
+                    <div class="full">
+                      <SubtitleLiveEditor req={req} onDirty={() => setDirty(true)} onSavedRef={(cb) => { subEditorSavedCb = cb; }} />
+                    </div>
+                    <div class="full">
+                      <Select label="Risoluzione" name="p_rn_resolution" value={`${req().render.width}x${req().render.height}`} options={["1080x1920", "720x1280", "1080x1080", "1920x1080"]} />
+                    </div>
                     <Select label="Video codec" name="p_rn_vcodec" value={req().render.video_codec} options={["libx264", "libx265", "libopenh264", "mpeg4"]} />
                     <Select label="Audio codec" name="p_rn_acodec" value={req().render.audio_codec} options={["aac", "libmp3lame", "opus", "pcm_s16le"]} />
                     <Select label="Preset" name="p_rn_preset" value={req().render.preset} options={["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]} />

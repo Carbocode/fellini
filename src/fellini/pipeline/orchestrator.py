@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fellini.domain.models import JobSnapshot, StepName
+from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.editorial import EditorialStep
 from fellini.pipeline.steps.ingest import IngestStep
@@ -9,6 +10,8 @@ from fellini.pipeline.steps.transcription import TranscriptionStep
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+
+logger = get_logger(__name__)
 
 
 class PipelineOrchestrator:
@@ -49,6 +52,13 @@ class PipelineOrchestrator:
         stop_after: StepName | None,
         prepared: bool = False,
     ) -> JobSnapshot:
+        logger.info(
+            "pipeline.run job_id=%s start_at=%s stop_after=%s prepared=%s",
+            snapshot.id,
+            start_at.value,
+            stop_after.value if stop_after else None,
+            prepared,
+        )
         workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
         context = PipelineContext(
             settings=self.settings,
@@ -57,6 +67,11 @@ class PipelineOrchestrator:
             store=self.store,
         )
         steps_to_run = self._steps_for_run(start_at, stop_after)
+        logger.debug(
+            "pipeline.run.steps job_id=%s steps=%s",
+            snapshot.id,
+            [step.name.value for step in steps_to_run],
+        )
         context.load_state()
         if not prepared:
             context.prune_from_step(start_at)
@@ -75,6 +90,7 @@ class PipelineOrchestrator:
 
         try:
             for index, step in enumerate(steps_to_run):
+                logger.info("pipeline.step.start job_id=%s step=%s", snapshot.id, step.name.value)
                 if not (prepared and index == 0):
                     self.store.begin_step(snapshot.id, step.name, step.description)
                     self.store.append_log(snapshot.id, f"{step.name}: {step.description}")
@@ -86,13 +102,27 @@ class PipelineOrchestrator:
                     message=f"{step.description} completed.",
                     artifacts=artifacts,
                 )
+                logger.info(
+                    "pipeline.step.done job_id=%s step=%s artifacts=%s",
+                    snapshot.id,
+                    step.name.value,
+                    artifacts,
+                )
 
             latest = self.store.load(snapshot.id)
             if all(step.status.value == "completed" for step in latest.steps):
+                logger.info("pipeline.run.completed job_id=%s status=completed", snapshot.id)
                 return self.store.mark_completed(snapshot.id, self._collect_outputs(context))
+            logger.info("pipeline.run.completed job_id=%s status=pending", snapshot.id)
             return self.store.mark_pending(snapshot.id)
         except Exception as exc:
             failed_step = self.store.load(snapshot.id).current_step or start_at
+            logger.exception(
+                "pipeline.run.failed job_id=%s step=%s error=%s",
+                snapshot.id,
+                failed_step.value,
+                exc,
+            )
             self.store.fail_step(snapshot.id, failed_step, str(exc))
             self.store.append_log(snapshot.id, f"failed: {exc}")
             return self.store.mark_failed(snapshot.id, str(exc))
@@ -104,6 +134,12 @@ class PipelineOrchestrator:
         start_at: StepName,
         stop_after: StepName | None,
     ) -> JobSnapshot:
+        logger.info(
+            "pipeline.prepare job_id=%s start_at=%s stop_after=%s",
+            snapshot.id,
+            start_at.value,
+            stop_after.value if stop_after else None,
+        )
         workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
         context = PipelineContext(
             settings=self.settings,
@@ -129,6 +165,11 @@ class PipelineOrchestrator:
         first_step = self._steps_for_run(start_at, stop_after)[0]
         self.store.begin_step(snapshot.id, first_step.name, first_step.description)
         self.store.append_log(snapshot.id, f"{first_step.name}: {first_step.description}")
+        logger.info(
+            "pipeline.prepare.ready job_id=%s first_step=%s",
+            snapshot.id,
+            first_step.name.value,
+        )
         return self.store.load(snapshot.id)
 
     def _steps_for_run(

@@ -1,5 +1,6 @@
 app_name: Fellini
 workspace_root: workspace
+log_level: INFO
 host: 127.0.0.1
 port: 8123
 ffmpeg_bin: ffmpeg

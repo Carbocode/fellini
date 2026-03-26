@@ -164,7 +164,13 @@ function jobFingerprint(job: JobSnapshot): string {
     status: job.status,
     current_step: job.current_step,
     error: job.error,
-    steps: job.steps.map((s) => ({ name: s.name, status: s.status, artifacts: s.artifacts })),
+    steps: job.steps.map((s) => ({
+      name: s.name,
+      status: s.status,
+      progress: s.progress,
+      message: s.message,
+      artifacts: s.artifacts,
+    })),
     outputs: job.outputs,
     logCount: job.logs.length,
   });

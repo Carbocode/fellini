@@ -1,4 +1,4 @@
-import { createEffect, For, on, type Component } from "solid-js";
+import { createEffect, For, on, Show, type Component } from "solid-js";
 import { useJobQuery, useRunStepMutation } from "../api/queries";
 import { selectedJobId, selectedStep, setSelectedStep } from "../store";
 import { capitalize, canRunStep } from "../lib/utils";
@@ -39,6 +39,8 @@ const PipelineBar: Component = () => {
     return !!j && !!step && canRunStep(j, step.name);
   };
 
+  const stepProgress = (progress: number) => Math.max(0, Math.min(100, progress || 0));
+
   const handleRunCurrent = () => {
     const j = data();
     const step = currentStep();
@@ -59,14 +61,28 @@ const PipelineBar: Component = () => {
                 onClick={() => setSelectedStep(step.name)}
                 title={step.blocked_reason || step.message || step.name}
               >
+                <span class="pipeline-step-progress-track" aria-hidden="true">
+                  <span
+                    class="pipeline-step-progress-fill"
+                    style={{ width: `${stepProgress(step.progress)}%` }}
+                  />
+                </span>
                 <span class="step-dot" />
                 <span>{capitalize(step.name)}</span>
+                <Show when={step.status === "running" || (step.progress > 0 && step.progress < 100)}>
+                  <span class="pipeline-step-percent">{stepProgress(step.progress)}%</span>
+                </Show>
               </button>
             </>
           )}
         </For>
       </div>
       <div class="pipeline-actions">
+        <Show when={data()?.status === "running" && currentStep()}>
+          <span class="pipeline-current-progress">
+            {stepProgress(currentStep()!.progress)}%
+          </span>
+        </Show>
         <button
           type="button"
           class="btn btn-primary btn-sm"

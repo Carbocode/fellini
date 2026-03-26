@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 class AppSettings(BaseModel):
     app_name: str = "Fellini"
     workspace_root: Path = Field(default_factory=lambda: Path("workspace"))
+    log_level: str = "INFO"
     ffmpeg_bin: str = "ffmpeg"
     ffprobe_bin: str = "ffprobe"
     host: str = "127.0.0.1"

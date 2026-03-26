@@ -7,6 +7,7 @@ export type ExecutionMode = "automatic" | "step_by_step";
 export interface StepSnapshot {
   name: StepName;
   status: StepStatus;
+  progress: number;
   message: string;
   started_at: string | null;
   finished_at: string | null;

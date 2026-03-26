@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Literal
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,11 +19,14 @@ from fellini.domain.models import (
     StepName,
     StepStatus,
 )
+from fellini.log import configure_logging, get_logger
 from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings, load_settings
 from fellini.pipeline.context import PipelineContext
+
+logger = get_logger(__name__)
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -65,11 +69,17 @@ def _require_job(store: JobStore, job_id: str):
     try:
         return store.load(job_id)
     except FileNotFoundError as exc:
+        logger.warning("job.not_found job_id=%s", job_id)
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
 
 def _validate_step_run(snapshot, step_name: StepName) -> None:
     if snapshot.status == JobStatus.running:
+        logger.warning(
+            "step.run.denied job_id=%s step=%s reason=job_running",
+            snapshot.id,
+            step_name.value,
+        )
         raise HTTPException(status_code=409, detail="A run is already in progress for this job.")
 
     try:
@@ -81,6 +91,12 @@ def _validate_step_run(snapshot, step_name: StepName) -> None:
         ) from exc
     if not step.can_run:
         detail = step.blocked_reason or f"Dependencies for {step_name.value} are not ready."
+        logger.warning(
+            "step.run.denied job_id=%s step=%s reason=%s",
+            snapshot.id,
+            step_name.value,
+            detail,
+        )
         raise HTTPException(status_code=409, detail=detail)
 
 
@@ -93,15 +109,58 @@ def _resolve_frontend_dist() -> Path | None:
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
     app_settings = settings or load_settings()
+    configure_logging(app_settings.log_level)
     store = JobStore(app_settings)
     manager = JobManager(app_settings, store=store)
+    logger.info(
+        "app.create settings workspace_root=%s jobs_root=%s host=%s port=%s log_level=%s",
+        app_settings.workspace_root,
+        app_settings.jobs_root,
+        app_settings.host,
+        app_settings.port,
+        app_settings.log_level,
+    )
 
     app = FastAPI(title=app_settings.app_name)
     app.state.settings = app_settings
     app.state.store = store
     app.state.manager = manager
 
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        started_at = perf_counter()
+        client_host = request.client.host if request.client else "-"
+        logger.info(
+            "http.request.start method=%s path=%s client=%s",
+            request.method,
+            request.url.path,
+            client_host,
+        )
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = (perf_counter() - started_at) * 1000
+            logger.exception(
+                "http.request.error method=%s path=%s client=%s duration_ms=%.1f",
+                request.method,
+                request.url.path,
+                client_host,
+                duration_ms,
+            )
+            raise
+
+        duration_ms = (perf_counter() - started_at) * 1000
+        logger.info(
+            "http.request.done method=%s path=%s status=%s duration_ms=%.1f",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
+
     def build_context(snapshot: JobSnapshot) -> PipelineContext:
+        logger.debug("context.build job_id=%s", snapshot.id)
         workspace = JobWorkspace(app_settings.jobs_root, snapshot.id)
         context = PipelineContext(
             settings=app_settings,
@@ -218,6 +277,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         for step in snapshot.steps:
             recovered = existing_artifacts(context, artifact_map.get(step.name, ()))
             if recovered:
+                logger.debug(
+                    "job.artifacts.recovered job_id=%s step=%s artifacts=%s",
+                    snapshot.id,
+                    step.name.value,
+                    recovered,
+                )
                 step.artifacts = list(dict.fromkeys(step.artifacts + recovered))
 
         output_paths = render_outputs_ready(snapshot, context)
@@ -256,7 +321,13 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if step.status == StepStatus.failed:
                 continue
             if step.status == StepStatus.pending and recovered_completion.get(step.name, False):
+                logger.info(
+                    "job.step.recovered job_id=%s step=%s source=workspace_artifacts",
+                    snapshot.id,
+                    step.name.value,
+                )
                 step.status = StepStatus.completed
+                step.progress = 100
 
         if all(step.status.value == "completed" for step in snapshot.steps):
             snapshot.status = JobStatus.completed
@@ -291,17 +362,21 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     @app.get("/api/jobs")
     async def list_jobs():
+        logger.debug("api.jobs.list")
         return [enrich_snapshot(snapshot) for snapshot in store.list_jobs()]
 
     @app.get("/api/jobs/{job_id}")
     async def get_job(job_id: str):
+        logger.debug("api.jobs.get job_id=%s", job_id)
         return enrich_snapshot(_require_job(store, job_id))
 
     @app.delete("/api/jobs/{job_id}")
     async def delete_job(job_id: str):
         snapshot = _require_job(store, job_id)
         if snapshot.status == JobStatus.running:
+            logger.warning("api.jobs.delete.denied job_id=%s reason=job_running", job_id)
             raise HTTPException(status_code=409, detail="Cannot delete a running job.")
+        logger.info("api.jobs.delete job_id=%s title=%s", job_id, snapshot.title)
         store.delete(job_id)
         return {"deleted": True, "job_id": job_id}
 
@@ -318,9 +393,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid job payload.") from exc
 
-        request_model = _build_request_model(payload)
-
         payloads = [(upload.filename or "input.bin", await upload.read()) for upload in files]
+        request_model = _build_request_model(payload)
+        logger.info(
+            "api.jobs.create title=%s profile=%s execution_mode=%s files=%s",
+            request_model.title,
+            request_model.profile.value,
+            request_model.execution_mode.value,
+            [name for name, _payload in payloads],
+        )
         snapshot = manager.create_from_uploads(request_model, payloads)
         if request_model.execution_mode == ExecutionMode.automatic:
             return enrich_snapshot(manager.start(snapshot.id))
@@ -331,12 +412,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         snapshot = _require_job(store, job_id)
         snapshot = enrich_snapshot(snapshot)
         if snapshot.status == JobStatus.running:
+            logger.warning("api.jobs.request.update.denied job_id=%s reason=job_running", job_id)
             raise HTTPException(
                 status_code=409,
                 detail="Stop the current run before changing the job configuration.",
             )
 
         request_model = _build_request_model(payload, existing_request=snapshot.request)
+        logger.info(
+            "api.jobs.request.update job_id=%s title=%s",
+            job_id,
+            request_model.title,
+        )
         updated = manager.update_request(job_id, request_model)
         return enrich_snapshot(updated)
 
@@ -348,6 +435,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     ):
         snapshot = _require_job(store, job_id)
         if snapshot.status == JobStatus.running:
+            logger.warning(
+                "api.jobs.transcript.update.denied job_id=%s target=%s reason=job_running",
+                job_id,
+                target,
+            )
             raise HTTPException(
                 status_code=409,
                 detail="Cannot edit transcript while a run is in progress.",
@@ -358,9 +450,22 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         try:
             transcript = TranscriptArtifact.model_validate(payload)
         except Exception as exc:
+            logger.warning(
+                "api.jobs.transcript.update.invalid job_id=%s target=%s error=%s",
+                job_id,
+                target,
+                exc,
+            )
             raise HTTPException(status_code=400, detail=f"Invalid transcript: {exc}") from exc
 
         workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        logger.info(
+            "api.jobs.transcript.update job_id=%s target=%s segments=%s source=%s",
+            job_id,
+            target,
+            len(transcript.segments),
+            transcript.source,
+        )
         if target == "transcription":
             payload_json = transcript.model_dump_json(indent=2)
             workspace.artifact_path("03_transcript_raw.json").write_text(
@@ -379,6 +484,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     async def run_job_step(job_id: str, step_name: StepName):
         snapshot = enrich_snapshot(_require_job(store, job_id))
         _validate_step_run(snapshot, step_name)
+        logger.info("api.jobs.step.run job_id=%s step=%s", job_id, step_name.value)
         prepared = manager.start_step(job_id, step_name)
         return enrich_snapshot(prepared)
 
@@ -388,9 +494,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         try:
             target = workspace.resolve_relative(relative_path)
         except ValueError as exc:
+            logger.warning(
+                "api.jobs.file.invalid_path job_id=%s path=%s",
+                job_id,
+                relative_path,
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not target.exists():
+            logger.warning(
+                "api.jobs.file.not_found job_id=%s path=%s",
+                job_id,
+                relative_path,
+            )
             raise HTTPException(status_code=404, detail="File not found")
+        logger.debug("api.jobs.file.get job_id=%s path=%s", job_id, relative_path)
         return FileResponse(target)
 
     if frontend_dist:
