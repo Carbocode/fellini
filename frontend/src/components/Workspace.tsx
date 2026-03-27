@@ -47,6 +47,7 @@ const Workspace: Component = () => {
   const hasJob = () => !!job.data;
   const [timelineHeight, setTimelineHeight] = createSignal<number | null>(null);
   const [browserWidth, setBrowserWidth] = createSignal(280);
+  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
   let editorMainRef: HTMLDivElement | undefined;
 
   // Sync tab label with job title
@@ -100,7 +101,10 @@ const Workspace: Component = () => {
     return Math.max(MIN_TIMELINE_HEIGHT, Math.min(maxHeight, Math.round(height)));
   };
 
-  const editorShellColumns = () => `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`;
+  const editorShellColumns = () =>
+    sidebarCollapsed()
+      ? `0px 0px minmax(0, 1fr)`
+      : `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`;
 
   const editorMainRows = () =>
     timelineHeight() === null
@@ -176,12 +180,29 @@ const Workspace: Component = () => {
             class="editor-shell"
             style={{ "grid-template-columns": editorShellColumns() }}
           >
-            <div class="browser-col">
+            <div class="browser-col" style={{ overflow: "hidden" }}>
               <ArtifactBrowserPanel />
             </div>
-            <div class="browser-resize-handle" onPointerDown={onBrowserResizeStart} />
+            <div
+              class="browser-resize-handle"
+              style={{ visibility: sidebarCollapsed() ? "hidden" : "visible" }}
+              onPointerDown={onBrowserResizeStart}
+            />
             <div class="editor-main-wrap">
-              <PipelineBar />
+              <div class="pipeline-bar-row">
+                <button
+                  type="button"
+                  class="sidebar-toggle-btn"
+                  title={sidebarCollapsed() ? "Mostra sidebar" : "Nascondi sidebar"}
+                  onClick={() => setSidebarCollapsed((v) => !v)}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" />
+                    <line x1="9" y1="3" x2="9" y2="21" />
+                  </svg>
+                </button>
+                <PipelineBar />
+              </div>
               <div
                 ref={editorMainRef}
                 class="editor-main"
@@ -1603,50 +1624,6 @@ const TimelinePanel: Component = () => {
   );
 };
 
-/* ---- Outputs ---- */
-
-const OutputsPanel: Component = () => {
-  const job = useJob();
-  const outputs = createMemo(() => (job.data as JobSnapshot | undefined)?.outputs ?? []);
-  const jobId = () => (job.data as JobSnapshot | undefined)?.id;
-
-  return (
-    <div class="panel">
-      <div class="panel-header">
-        <span class="panel-title">Output</span>
-      </div>
-      <div class="outputs-rack">
-        <div
-          class="placeholder"
-          style={{ display: outputs().length > 0 ? "none" : "block" }}
-        >
-          Nessun output disponibile
-        </div>
-        <For each={outputs()}>
-          {(path) => (
-            <button
-              type="button"
-              class="output-card"
-              onClick={() => {
-                const id = jobId();
-                if (!id) return;
-                const type = inferFileType(path);
-                if (type === "video" || type === "audio") {
-                  setMonitorForJob(id, path);
-                } else {
-                  setPreviewForJob(id, path);
-                }
-              }}
-            >
-              <span class="output-label">{humanizeMediaName(path)}</span>
-              <span>{baseName(path)}</span>
-            </button>
-          )}
-        </For>
-      </div>
-    </div>
-  );
-};
 
 
 export default Workspace;

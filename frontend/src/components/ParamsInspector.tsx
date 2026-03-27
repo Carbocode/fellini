@@ -336,17 +336,6 @@ const ParamsInspector: Component = () => {
                 </Switch>
               </div>
 
-              {/* Artifacts produced by this step */}
-              <Show when={(ss()?.artifacts?.length ?? 0) > 0}>
-                <div class="step-artifacts">
-                  <div class="step-artifacts-title">Artifacts</div>
-                  <div class="step-artifacts-list">
-                    {ss()!.artifacts.map((a) => (
-                      <span class="step-artifact-tag">{a.split("/").pop()}</span>
-                    ))}
-                  </div>
-                </div>
-              </Show>
             </div>
           );
         }}
@@ -845,7 +834,7 @@ const SubtitleLiveEditor: Component<{
         style={{
           background: "linear-gradient(180deg, #111 0%, #1a1a2e 50%, #0a0a15 100%)",
           "aspect-ratio": "9 / 16",
-          "max-height": "300px",
+          "max-height": "180px",
         }}
       >
         <div
