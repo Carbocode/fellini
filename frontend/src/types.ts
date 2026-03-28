@@ -117,3 +117,148 @@ export interface PreviewData {
   text: string;
   data?: unknown;
 }
+
+export type ProjectAssetKind = "video" | "audio";
+export type TimelineTrackKind = "video" | "audio" | "subtitle";
+export type AudioTrackRole = "story" | "support";
+export type ClipOrigin = "generated" | "manual";
+export type LaneTranscriptionStatus = "idle" | "running" | "completed" | "failed";
+
+export interface ClipCrop {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+export interface ClipTransform {
+  x: number;
+  y: number;
+  scale: number;
+  rotation: number;
+  opacity: number;
+  crop: ClipCrop;
+}
+
+export interface ClipAudio {
+  gain: number;
+  muted: boolean;
+  fade_in_ms: number;
+  fade_out_ms: number;
+}
+
+export interface ProjectAsset {
+  id: string;
+  origin: string;
+  kind: ProjectAssetKind;
+  label: string;
+  path: string;
+  duration: number;
+  width: number;
+  height: number;
+  fps: number;
+  sample_rate: number | null;
+  has_audio: boolean;
+  transcript_ref: string | null;
+}
+
+export interface TimelineTrack {
+  id: string;
+  kind: TimelineTrackKind;
+  name: string;
+  order: number;
+  visible: boolean;
+  muted: boolean;
+  locked: boolean;
+  auto_generated: boolean;
+  role: AudioTrackRole | null;
+}
+
+export interface TimelineClip {
+  id: string;
+  asset_id: string;
+  track_id: string;
+  linked_group_id: string | null;
+  start: number;
+  source_in: number;
+  source_out: number;
+  z_index: number;
+  enabled: boolean;
+  origin: ClipOrigin;
+  transform: ClipTransform;
+  audio: ClipAudio;
+  captions_enabled: boolean;
+}
+
+export interface SourceWordRef {
+  segment_id: string;
+  word_index: number;
+}
+
+export interface SubtitleBlock {
+  id: string;
+  track_id: string;
+  source_lane_id: string;
+  start: number;
+  end: number;
+  text: string;
+  origin: ClipOrigin;
+  source_word_refs: SourceWordRef[];
+}
+
+export interface WordTiming {
+  text: string;
+  start: number;
+  end: number;
+  confidence: number;
+}
+
+export interface TranscriptSegment {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  words: WordTiming[];
+}
+
+export interface LaneTranscription {
+  lane_id: string;
+  status: LaneTranscriptionStatus;
+  language: string;
+  segments: TranscriptSegment[];
+  source_audio_path: string | null;
+  updated_at: string;
+  error: string | null;
+}
+
+export interface ProjectSequence {
+  width: number;
+  height: number;
+  fps: number;
+  sample_rate: number;
+  background: string;
+}
+
+export interface ProjectSelection {
+  track_id: string | null;
+  clip_id: string | null;
+  subtitle_block_id: string | null;
+}
+
+export interface EditorialProject {
+  version: number;
+  revision: number;
+  sequence: ProjectSequence;
+  assets: ProjectAsset[];
+  tracks: TimelineTrack[];
+  clips: TimelineClip[];
+  captions: SubtitleBlock[];
+  lane_transcriptions: LaneTranscription[];
+  selection: ProjectSelection;
+  updated_at: string;
+}
+
+export interface LaneTranscriptionResponse {
+  job: JobSnapshot;
+  project: EditorialProject;
+}

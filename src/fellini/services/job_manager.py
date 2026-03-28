@@ -78,6 +78,27 @@ class JobManager:
         self.store.save(snapshot, workspace)
         return snapshot
 
+    def save_upload_to_workspace(
+        self,
+        workspace: JobWorkspace,
+        *,
+        original_name: str,
+        payload: bytes,
+    ) -> InputAsset:
+        suffix = Path(original_name).suffix or ".bin"
+        stored_name = f"{uuid4().hex[:8]}{suffix}"
+        target = workspace.upload_path(stored_name)
+        target.write_bytes(payload)
+        asset = InputAsset(original_name=original_name, stored_name=stored_name)
+        logger.info(
+            "job_manager.save_project_upload workspace=%s original_name=%s stored_name=%s size=%s",
+            workspace.job_dir,
+            original_name,
+            stored_name,
+            len(payload),
+        )
+        return asset
+
     def start(self, job_id: str) -> JobSnapshot:
         logger.info("job_manager.start job_id=%s", job_id)
         prepared = self.orchestrator.prepare_run(self.store.load(job_id))

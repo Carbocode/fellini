@@ -23,6 +23,7 @@ from fellini.domain.models import (
     TranscriptArtifact,
 )
 from fellini.log import get_logger
+from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
@@ -50,6 +51,7 @@ class PipelineContext:
         self.decision_engine = RuleBasedDecisionEngine()
         self.llm_refiner = LocalLLMRefiner()
         self.subtitle_builder = AssSubtitleBuilder()
+        self.editorial_projects = EditorialProjectStore(settings)
 
     def load_state(self) -> None:
         logger.debug("pipeline_context.load_state workspace=%s", self.workspace.job_dir)

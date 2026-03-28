@@ -7,7 +7,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from fellini.domain.models import EditDecisionList, ProbeInfo, RenderConfig
+from fellini.domain.models import (
+    EditDecisionList,
+    EditorialProject,
+    ProbeInfo,
+    RenderConfig,
+    TimelineClip,
+    TimelineTrack,
+    TimelineTrackKind,
+)
 from fellini.log import get_logger
 from fellini.settings import AppSettings
 
@@ -281,6 +289,221 @@ class FFmpegAdapter:
         self._run(args)
         logger.info("ffmpeg.render_vertical.done target=%s", target)
 
+    def mix_audio_lane(
+        self,
+        *,
+        workspace_root: Path,
+        project: EditorialProject,
+        track_id: str,
+        target: Path,
+        sample_rate: int = 16000,
+    ) -> None:
+        track = next((item for item in project.tracks if item.id == track_id), None)
+        if not track or track.kind != TimelineTrackKind.audio:
+            msg = f"Track {track_id} is not an audio lane."
+            raise FFmpegError(msg)
+
+        clips = self._sorted_track_clips(project, track)
+        if not clips:
+            msg = f"Audio lane {track_id} is empty."
+            raise FFmpegError(msg)
+
+        inputs, input_indexes = self._project_inputs(workspace_root, project, start_index=0)
+        filters: list[str] = []
+        audio_labels: list[str] = []
+        for clip_index, clip in enumerate(clips):
+            label = f"a{clip_index}"
+            asset_index = input_indexes[clip.asset_id]
+            delay_ms = max(0, round(clip.start * 1000))
+            duration = max(0.02, clip.source_out - clip.source_in)
+            chain = [
+                f"[{asset_index}:a]atrim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            if clip.audio.gain != 1.0:
+                chain.append(f"volume={clip.audio.gain:.4f}")
+            if clip.audio.fade_in_ms > 0:
+                chain.append(f"afade=t=in:st=0:d={clip.audio.fade_in_ms / 1000:.3f}")
+            if clip.audio.fade_out_ms > 0:
+                fade_out_start = max(0.0, duration - (clip.audio.fade_out_ms / 1000))
+                chain.append(
+                    f"afade=t=out:st={fade_out_start:.3f}:d={clip.audio.fade_out_ms / 1000:.3f}"
+                )
+            chain.append(f"adelay={delay_ms}|{delay_ms}")
+            filters.append(",".join(chain) + f"[{label}]")
+            audio_labels.append(f"[{label}]")
+
+        if len(audio_labels) == 1:
+            filters.append(f"{audio_labels[0]}anull[mixout]")
+        else:
+            filters.append(
+                "".join(audio_labels) + f"amix=inputs={len(audio_labels)}:dropout_transition=0:normalize=0[mixout]"
+            )
+
+        args = [self.settings.ffmpeg_bin, "-y"]
+        for path in inputs:
+            args.extend(["-i", str(path)])
+        args.extend(
+            [
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[mixout]",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-c:a",
+                "pcm_s16le",
+                str(target),
+            ]
+        )
+        self._run(args)
+        logger.info("ffmpeg.mix_audio_lane.done track=%s target=%s", track_id, target)
+
+    def render_project_master(
+        self,
+        *,
+        workspace_root: Path,
+        project: EditorialProject,
+        render_config: RenderConfig,
+        target: Path,
+    ) -> None:
+        inputs, input_indexes = self._project_inputs(workspace_root, project, start_index=1)
+        video_tracks = sorted(
+            [track for track in project.tracks if track.kind == TimelineTrackKind.video and track.visible],
+            key=lambda item: item.order,
+        )
+        audio_tracks = sorted(
+            [track for track in project.tracks if track.kind == TimelineTrackKind.audio and not track.muted],
+            key=lambda item: item.order,
+        )
+        duration = self._project_duration(project)
+        if duration <= 0:
+            msg = "Editorial project has no timeline duration."
+            raise FFmpegError(msg)
+
+        filters: list[str] = []
+        overlay_inputs: list[str] = []
+        audio_labels: list[str] = []
+
+        for track in video_tracks:
+            for clip in self._sorted_track_clips(project, track):
+                asset_index = input_indexes[clip.asset_id]
+                label = f"v{len(overlay_inputs)}"
+                filters.append(
+                    ",".join(
+                        [
+                            f"[{asset_index}:v]trim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                            f"setpts=PTS-STARTPTS+{clip.start:.3f}/TB",
+                            f"scale={render_config.width}:{render_config.height}:force_original_aspect_ratio=decrease",
+                            "setsar=1",
+                        ]
+                    )
+                    + f"[{label}]"
+                )
+                overlay_inputs.append(f"[{label}]")
+
+        for track in audio_tracks:
+            for clip in self._sorted_track_clips(project, track):
+                asset_index = input_indexes[clip.asset_id]
+                label = f"a{len(audio_labels)}"
+                delay_ms = max(0, round(clip.start * 1000))
+                duration_clip = max(0.02, clip.source_out - clip.source_in)
+                chain = [
+                    f"[{asset_index}:a]atrim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                    "asetpts=PTS-STARTPTS",
+                ]
+                if clip.audio.gain != 1.0:
+                    chain.append(f"volume={clip.audio.gain:.4f}")
+                if clip.audio.fade_in_ms > 0:
+                    chain.append(f"afade=t=in:st=0:d={clip.audio.fade_in_ms / 1000:.3f}")
+                if clip.audio.fade_out_ms > 0:
+                    fade_out_start = max(0.0, duration_clip - (clip.audio.fade_out_ms / 1000))
+                    chain.append(
+                        f"afade=t=out:st={fade_out_start:.3f}:d={clip.audio.fade_out_ms / 1000:.3f}"
+                    )
+                chain.append(f"adelay={delay_ms}|{delay_ms}")
+                filters.append(",".join(chain) + f"[{label}]")
+                audio_labels.append(f"[{label}]")
+
+        args = [
+            self.settings.ffmpeg_bin,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            (
+                f"color=c=black:s={render_config.width}x{render_config.height}:"
+                f"r={max(1, round(project.sequence.fps or 30.0))}:d={duration:.3f}"
+            ),
+        ]
+        for path in inputs:
+            args.extend(["-i", str(path)])
+        args.extend(
+            [
+                "-f",
+                "lavfi",
+                "-i",
+                f"anullsrc=channel_layout=stereo:sample_rate={project.sequence.sample_rate}:d={duration:.3f}",
+            ]
+        )
+
+        base_label = "[0:v]"
+        for overlay_index, overlay_label in enumerate(overlay_inputs):
+            next_label = f"[vcomp{overlay_index}]"
+            filters.append(
+                (
+                    f"{base_label}{overlay_label}"
+                    f"overlay=x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2:eof_action=pass"
+                    f"{next_label}"
+                )
+            )
+            base_label = next_label
+
+        final_video = base_label
+        anull_index = len(inputs) + 1
+        if audio_labels:
+            audio_inputs = "".join(audio_labels) + f"[{anull_index}:a]"
+            filters.append(
+                f"{audio_inputs}amix=inputs={len(audio_labels) + 1}:dropout_transition=0:normalize=0[aout]"
+            )
+        else:
+            filters.append(f"[{anull_index}:a]anull[aout]")
+
+        video_codec = self._resolve_video_encoder(render_config.video_codec)
+        args.extend(
+            [
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                final_video,
+                "-map",
+                "[aout]",
+            ]
+        )
+        args.extend(
+            self._video_encode_args(
+                video_codec,
+                preset=render_config.preset,
+                crf=render_config.crf,
+                fallback_bitrate=self._fallback_bitrate(render_config.width, render_config.height),
+            )
+        )
+        args.extend(
+            [
+                "-c:a",
+                render_config.audio_codec,
+                "-b:a",
+                render_config.audio_bitrate,
+                "-t",
+                f"{duration:.3f}",
+                str(target),
+            ]
+        )
+        self._run(args)
+        logger.info("ffmpeg.render_project_master.done target=%s", target)
+
     def _normalize_clip(self, source: Path, target: Path) -> None:
         video_codec = self._resolve_video_encoder("libx264")
         args = [
@@ -339,6 +562,41 @@ class FFmpegAdapter:
             "".join(f"file '{path.resolve().as_posix()}'\n" for path in paths),
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _project_duration(project: EditorialProject) -> float:
+        max_end = 0.0
+        for clip in project.clips:
+            if clip.enabled:
+                max_end = max(max_end, clip.end)
+        return max_end
+
+    @staticmethod
+    def _sorted_track_clips(
+        project: EditorialProject, track: TimelineTrack
+    ) -> list[TimelineClip]:
+        return sorted(
+            [
+                clip
+                for clip in project.clips
+                if clip.track_id == track.id
+                and clip.enabled
+                and (track.kind != TimelineTrackKind.audio or not clip.audio.muted)
+            ],
+            key=lambda item: (item.start, item.z_index, item.id),
+        )
+
+    @staticmethod
+    def _project_inputs(
+        workspace_root: Path, project: EditorialProject, *, start_index: int
+    ) -> tuple[list[Path], dict[str, int]]:
+        inputs: list[Path] = []
+        input_indexes: dict[str, int] = {}
+        for asset in project.assets:
+            target = workspace_root / asset.path
+            input_indexes[asset.id] = len(inputs) + start_index
+            inputs.append(target)
+        return inputs, input_indexes
 
     def _resolve_video_encoder(self, preferred: str) -> str:
         available = self._available_encoders()

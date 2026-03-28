@@ -1,101 +1,140 @@
-import { createEffect, For, on, Show, type Component } from "solid-js";
-import { useJobQuery, useRunStepMutation } from "../api/queries";
-import { selectedJobId, selectedStep, setSelectedStep } from "../store";
-import { capitalize, canRunStep } from "../lib/utils";
-import type { JobSnapshot } from "../types";
+import { For, Show, createMemo, type Component } from "solid-js";
+import {
+  useEditorialProjectQuery,
+  useJobQuery,
+  useRunStepMutation,
+  useTranscribeLaneMutation,
+} from "../api/queries";
+import { selectedJobId, selectedTrackId } from "../store";
+import { getTrack, isAudioTrack } from "../lib/editorial";
+import { canRunStep, capitalize } from "../lib/utils";
+
+type ToolStep = "transcription" | "editorial" | "render";
+
+const TOOL_CONFIG: Array<{ step: ToolStep; label: string; hint: string }> = [
+  {
+    step: "transcription",
+    label: "Sottotitoli",
+    hint: "Genera blocchi testo dalla lane audio selezionata",
+  },
+  {
+    step: "editorial",
+    label: "Editorial",
+    hint: "Aggiorna il montaggio automatico dalla story lane",
+  },
+  {
+    step: "render",
+    label: "Render",
+    hint: "Esporta il montaggio finale del progetto",
+  },
+];
 
 const PipelineBar: Component = () => {
   const job = useJobQuery(selectedJobId);
+  const project = useEditorialProjectQuery(selectedJobId);
   const runStepMut = useRunStepMutation();
+  const transcribeLaneMut = useTranscribeLaneMutation();
 
-  const data = () => job.data as JobSnapshot | undefined;
+  const selectedAudioLane = createMemo(() => {
+    const currentProject = project.data ?? null;
+    if (!currentProject) return null;
+    const lane = getTrack(currentProject, selectedTrackId());
+    return isAudioTrack(lane) ? lane : null;
+  });
 
-  // Auto-select the current/first-incomplete step when job loads or changes
-  createEffect(
-    on(
-      () => data()?.id,
-      () => {
-        const j = data();
-        if (!j) return;
-        // If no step selected yet, or the selected step doesn't belong to this job
-        if (!selectedStep() || !j.steps.some((s) => s.name === selectedStep())) {
-          const next = j.steps.find((s) => s.status !== "completed");
-          setSelectedStep(next ? next.name : j.steps[j.steps.length - 1]?.name ?? null);
-        }
-      },
-    ),
+  const stepSnapshot = (name: ToolStep) =>
+    (job.data?.steps ?? []).find((step) => step.name === name) ?? null;
+
+  const runningStep = createMemo(
+    () => (job.data?.steps ?? []).find((step) => step.status === "running") ?? null,
   );
 
-  const currentStep = () => {
-    const j = data();
-    const stepName = selectedStep();
-    if (!j || !stepName) return null;
-    return j.steps.find((step) => step.name === stepName) ?? null;
+  const canUseTool = (name: ToolStep) => {
+    if (!job.data || job.data.status === "running") return false;
+    if (name === "transcription") {
+      return !!selectedAudioLane() && canRunStep(job.data, name);
+    }
+    return canRunStep(job.data, name);
   };
 
-  const canRunCurrentStep = () => {
-    const j = data();
-    const step = currentStep();
-    return !!j && !!step && canRunStep(j, step.name);
+  const toolMeta = (name: ToolStep) => {
+    if (name === "transcription") {
+      return selectedAudioLane()?.name ?? "Seleziona una lane audio";
+    }
+    if (name === "editorial") {
+      const storyLane = project.data?.tracks.find(
+        (track) => track.kind === "audio" && track.role === "story",
+      );
+      return storyLane ? `Story lane: ${storyLane.name}` : "Seleziona una story lane";
+    }
+    return "Export finale del progetto";
   };
 
-  const stepProgress = (progress: number) => Math.max(0, Math.min(100, progress || 0));
+  const triggerTool = (name: ToolStep) => {
+    const currentJob = job.data;
+    if (!currentJob || !canUseTool(name)) return;
+    if (name === "transcription") {
+      const laneId = selectedAudioLane()?.id;
+      if (!laneId) return;
+      transcribeLaneMut.mutate({ jobId: currentJob.id, laneId });
+      return;
+    }
+    runStepMut.mutate({ jobId: currentJob.id, stepName: name });
+  };
 
-  const handleRunCurrent = () => {
-    const j = data();
-    const step = currentStep();
-    if (!j || !step || !canRunStep(j, step.name)) return;
-    runStepMut.mutate({ jobId: j.id, stepName: step.name });
+  const buttonLabel = (name: ToolStep) => {
+    if (name === "transcription" && transcribeLaneMut.isPending) return "Trascrizione...";
+    if (runStepMut.isPending && runningStep()?.name === name) return "In esecuzione...";
+    return TOOL_CONFIG.find((tool) => tool.step === name)?.label ?? capitalize(name);
   };
 
   return (
     <div class="pipeline-bar">
-      <div class="pipeline-steps">
-        <For each={data()?.steps ?? []}>
-          {(step, i) => (
-            <>
-              {i() > 0 && <span class="step-connector" />}
+      <div class="pipeline-tools">
+        <For each={TOOL_CONFIG}>
+          {(tool) => {
+            const snapshot = () => stepSnapshot(tool.step);
+            return (
               <button
                 type="button"
-                class={`pipeline-step ${step.status}${selectedStep() === step.name ? " selected" : ""}`}
-                onClick={() => setSelectedStep(step.name)}
-                title={step.blocked_reason || step.message || step.name}
+                class={`pipeline-tool ${snapshot()?.status ?? "pending"}`}
+                disabled={!canUseTool(tool.step)}
+                title={snapshot()?.blocked_reason || tool.hint}
+                onClick={() => triggerTool(tool.step)}
               >
-                <span class="pipeline-step-progress-track" aria-hidden="true">
-                  <span
-                    class="pipeline-step-progress-fill"
-                    style={{ width: `${stepProgress(step.progress)}%` }}
-                  />
+                <span class="pipeline-tool-dot" />
+                <span class="pipeline-tool-copy">
+                  <span class="pipeline-tool-label">{buttonLabel(tool.step)}</span>
+                  <span class="pipeline-tool-meta">{toolMeta(tool.step)}</span>
                 </span>
-                <span class="step-dot" />
-                <span>{capitalize(step.name)}</span>
-                <Show when={step.status === "running" || (step.progress > 0 && step.progress < 100)}>
-                  <span class="pipeline-step-percent">{stepProgress(step.progress)}%</span>
+                <Show when={snapshot()?.progress && snapshot()!.progress > 0 && snapshot()!.progress < 100}>
+                  <span class="pipeline-tool-progress">{Math.round(snapshot()!.progress)}%</span>
                 </Show>
               </button>
-            </>
-          )}
+            );
+          }}
         </For>
       </div>
-      <div class="pipeline-actions">
-        <Show when={data()?.status === "running" && currentStep()}>
-          <span class="pipeline-current-progress">
-            {stepProgress(currentStep()!.progress)}%
-          </span>
-        </Show>
-        <button
-          type="button"
-          class="btn btn-primary btn-sm"
-          disabled={!canRunCurrentStep() || data()?.status === "running"}
-          onClick={handleRunCurrent}
-          title={currentStep()?.blocked_reason || ""}
+      <div class="pipeline-status">
+        <Show
+          when={runningStep()}
+          fallback={
+            <span class="pipeline-status-text">
+              {selectedAudioLane()
+                ? `Lane attiva: ${selectedAudioLane()!.name}`
+                : "Aggiungi asset e seleziona una lane per usare i tool"}
+            </span>
+          }
         >
-          {data()?.status === "running"
-            ? "In esecuzione..."
-            : currentStep()
-              ? `${currentStep()!.status === "completed" ? "Riesegui" : "Esegui"} ${capitalize(currentStep()!.name)}`
-              : "Seleziona step"}
-        </button>
+          {(step) => (
+            <span class="pipeline-status-text">
+              {capitalize(step().name)} in esecuzione
+              <Show when={step().progress > 0}>
+                <> {Math.round(step().progress)}%</>
+              </Show>
+            </span>
+          )}
+        </Show>
       </div>
     </div>
   );

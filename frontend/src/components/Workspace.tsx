@@ -1,37 +1,73 @@
-import { createEffect, createMemo, createSignal, For, on, onCleanup, Show, type Component } from "solid-js";
-import { useJobQuery, useArtifactQuery, useJobPolling, useUpdateTranscriptMutation } from "../api/queries";
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  on,
+  onCleanup,
+  type Accessor,
+  type Component,
+} from "solid-js";
+import {
+  useEditorialProjectQuery,
+  useJobPolling,
+  useJobQuery,
+  useUpdateEditorialProjectMutation,
+  useUploadEditorialAssetMutation,
+} from "../api/queries";
 import { fileUrl } from "../api/client";
 import {
-  selectedJobId,
-  selectedStep,
-  updateTabLabel,
-  getPreviewForJob,
-  getMonitorForJob,
-  setPreviewForJob,
-  setMonitorForJob,
-  playheadTime,
-  setPlayheadTime,
-  seekRequest,
-  setSeekRequest,
-  playPauseRequest,
-  setPlayPauseRequest,
   autoFollow,
-  setAutoFollow,
   frameStepRequest,
+  playPauseRequest,
+  playheadTime,
+  seekRequest,
+  selectedClipId,
+  selectedJobId,
+  selectedSubtitleId,
+  selectedTrackId,
+  setAutoFollow,
   setFrameStepRequest,
+  setPlayheadTime,
+  setPlayPauseRequest,
+  setPreviewForJob,
+  setSeekRequest,
+  setSelectedClipId,
+  setSelectedSubtitleId,
+  setSelectedTrackId,
+  updateTabLabel,
 } from "../store";
+import type {
+  EditorialProject,
+  JobSnapshot,
+  ProjectAsset,
+  TimelineClip,
+} from "../types";
+import {
+  assetById,
+  compatibleTrack,
+  createClipsForAssetDrop,
+  getClip,
+  getTrack,
+  linkedClips,
+  projectDuration,
+  resolveClipGroupStart,
+  resolveClipGroupTrimEndDelta,
+  resolveClipGroupTrimStartDelta,
+  sortedTracks,
+  splitClip,
+  trackClips,
+  trackHeight,
+  trackSubtitles,
+  upsertClips,
+} from "../lib/editorial";
 import {
   baseName,
-  buildArtifactCatalog,
-  capitalize,
   fmtTime,
   fmtTimePrecise,
-  getMonitorSources,
   humanizeMediaName,
-  inferFileType,
-  isPreviewableText,
 } from "../lib/utils";
-import type { JobSnapshot } from "../types";
 import PipelineBar from "./PipelineBar";
 import ParamsInspector from "./ParamsInspector";
 
@@ -41,71 +77,161 @@ const MIN_TIMELINE_HEIGHT = 180;
 const MIN_TOP_WORKSPACE_HEIGHT = 220;
 const MIN_BROWSER_WIDTH = 220;
 const MAX_BROWSER_WIDTH = 440;
+const MIN_PX_PER_SEC = 60;
+const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 12, 16];
+const ZOOM_WHEEL_THRESHOLD = 18;
+const TIMELINE_TAIL_RATIO = 0.5;
+const TIMELINE_TAIL_MIN_SECONDS = 60;
+const TIMELINE_TAIL_MAX_SECONDS = 600;
+const RULER_MINOR_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+const RULER_MINOR_TARGET_PX = 18;
+const RULER_LABEL_EVERY_N_TICKS = 4;
+
+type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement
+    && (target.isContentEditable
+      || target.tagName === "INPUT"
+      || target.tagName === "TEXTAREA"
+      || target.tagName === "SELECT");
+}
+
+function containScale(
+  sourceWidth: number,
+  sourceHeight: number,
+  targetWidth: number,
+  targetHeight: number,
+): [number, number] {
+  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+    return [1, 1];
+  }
+  const sourceAspect = sourceWidth / sourceHeight;
+  const targetAspect = targetWidth / targetHeight;
+  if (sourceAspect > targetAspect) {
+    return [1, targetAspect / sourceAspect];
+  }
+  return [sourceAspect / targetAspect, 1];
+}
+
+function formatRulerLabel(seconds: number, labelStep: number): string {
+  if (labelStep < 1) return fmtTimePrecise(seconds);
+  return fmtTime(seconds);
+}
 
 const Workspace: Component = () => {
   const job = useJobQuery(selectedJobId);
-  const hasJob = () => !!job.data;
+  const projectQuery = useEditorialProjectQuery(selectedJobId);
+  const saveProject = useUpdateEditorialProjectMutation();
+  const data = () => job.data as JobSnapshot | undefined;
+  const [draftProject, setDraftProject] = createSignal<EditorialProject | null>(null);
   const [timelineHeight, setTimelineHeight] = createSignal<number | null>(null);
   const [browserWidth, setBrowserWidth] = createSignal(280);
   const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
   let editorMainRef: HTMLDivElement | undefined;
+  let saveHandle: ReturnType<typeof setTimeout> | undefined;
 
-  // Sync tab label with job title
+  const polling = useJobPolling(selectedJobId);
   createEffect(
     on(
-      () => (job.data as JobSnapshot | undefined)?.title,
+      () => data()?.title,
       (title) => {
         const id = selectedJobId();
         if (id && title) updateTabLabel(id, title);
       },
     ),
   );
-
-  // Poll only while a backend worker is actually running.
-  const polling = useJobPolling(selectedJobId);
+  createEffect(
+    on(
+      () => data()?.status,
+      (status) => {
+        if (status === "running") polling.start();
+        else polling.stop();
+      },
+    ),
+  );
+  onCleanup(() => polling.stop());
 
   createEffect(
     on(
-      () => (job.data as JobSnapshot | undefined)?.status,
-      (status) => {
-        if (status === "running") {
-          polling.start();
-        } else {
-          polling.stop();
+      () => projectQuery.data?.revision,
+      () => {
+        if (!projectQuery.data) {
+          setDraftProject(null);
+          return;
         }
+        setDraftProject(JSON.parse(JSON.stringify(projectQuery.data)) as EditorialProject);
       },
     ),
   );
 
-  // Also restart polling when selected job changes
   createEffect(
-    on(selectedJobId, () => {
-      const status = (job.data as JobSnapshot | undefined)?.status;
-      if (status === "running") {
-        polling.start();
-      } else {
-        polling.stop();
-      }
-    }),
+    on(
+      () => data()?.id,
+      () => {
+        setSelectedTrackId(null);
+        setSelectedClipId(null);
+        setSelectedSubtitleId(null);
+      },
+    ),
   );
 
-  onCleanup(() => polling.stop());
+  createEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!draftProject() || isTypingTarget(event.target)) return;
+      if (event.code === "Space") {
+        event.preventDefault();
+        setPlayPauseRequest((value) => value + 1);
+        return;
+      }
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setFrameStepRequest(-1);
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setFrameStepRequest(1);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    onCleanup(() => window.removeEventListener("keydown", onKeyDown));
+  });
+
+  const persistProject = (project: EditorialProject) => {
+    const jobId = selectedJobId();
+    if (!jobId) return;
+    clearTimeout(saveHandle);
+    saveHandle = setTimeout(() => {
+      saveProject.mutate({ jobId, project });
+    }, 220);
+  };
+  onCleanup(() => clearTimeout(saveHandle));
+
+  const updateProject = (next: ProjectUpdater) => {
+    const current = draftProject();
+    if (!current) return;
+    const updated =
+      typeof next === "function"
+        ? (next as (project: EditorialProject) => EditorialProject)(current)
+        : next;
+    setDraftProject(updated);
+    persistProject(updated);
+  };
 
   const clampBrowserWidth = (width: number) =>
     Math.max(MIN_BROWSER_WIDTH, Math.min(MAX_BROWSER_WIDTH, Math.round(width)));
-
   const clampTimelineHeight = (height: number) => {
     if (!editorMainRef) return Math.max(MIN_TIMELINE_HEIGHT, Math.round(height));
     const totalHeight = editorMainRef.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
     const maxHeight = Math.max(MIN_TIMELINE_HEIGHT, totalHeight - MIN_TOP_WORKSPACE_HEIGHT);
     return Math.max(MIN_TIMELINE_HEIGHT, Math.min(maxHeight, Math.round(height)));
   };
-
   const editorShellColumns = () =>
     sidebarCollapsed()
       ? `0px 0px minmax(0, 1fr)`
       : `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`;
-
   const editorMainRows = () =>
     timelineHeight() === null
       ? `minmax(0, 1fr) ${TIMELINE_SPLITTER_HEIGHT}px minmax(0, 1fr)`
@@ -115,18 +241,13 @@ const Workspace: Component = () => {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = browserWidth();
-
-    const onMove = (ev: PointerEvent) => {
-      const delta = ev.clientX - startX;
-      setBrowserWidth(clampBrowserWidth(startWidth + delta));
-    };
+    const onMove = (ev: PointerEvent) => setBrowserWidth(clampBrowserWidth(startWidth + ev.clientX - startX));
     const onUp = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("pointermove", onMove);
@@ -139,18 +260,13 @@ const Workspace: Component = () => {
     const totalHeight = editorMainRef.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
     const startY = e.clientY;
     const startHeight = timelineHeight() ?? Math.max(MIN_TIMELINE_HEIGHT, Math.round(totalHeight * 0.5));
-
-    const onMove = (ev: PointerEvent) => {
-      const delta = startY - ev.clientY;
-      setTimelineHeight(clampTimelineHeight(startHeight + delta));
-    };
+    const onMove = (ev: PointerEvent) => setTimelineHeight(clampTimelineHeight(startHeight + (startY - ev.clientY)));
     const onUp = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
-
     document.body.style.cursor = "row-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("pointermove", onMove);
@@ -159,13 +275,11 @@ const Workspace: Component = () => {
 
   createEffect(() => {
     if (!editorMainRef) return;
-
     const syncTimelineHeight = () => {
       const totalHeight = editorMainRef!.getBoundingClientRect().height - TIMELINE_SPLITTER_HEIGHT;
       const fallback = Math.max(MIN_TIMELINE_HEIGHT, Math.round(totalHeight * 0.5));
       setTimelineHeight((current) => clampTimelineHeight(current ?? fallback));
     };
-
     syncTimelineHeight();
     const observer = new ResizeObserver(syncTimelineHeight);
     observer.observe(editorMainRef);
@@ -174,14 +288,11 @@ const Workspace: Component = () => {
 
   return (
     <main class="workspace">
-      <Show when={hasJob()} fallback={<div class="empty-state"><div class="empty-content"><p>Caricamento progetto...</p></div></div>}>
+      <Show when={data()} fallback={<div class="empty-state"><div class="empty-content"><p>Caricamento progetto...</p></div></div>}>
         <div class="project-workspace">
-          <div
-            class="editor-shell"
-            style={{ "grid-template-columns": editorShellColumns() }}
-          >
+          <div class="editor-shell" style={{ "grid-template-columns": editorShellColumns() }}>
             <div class="browser-col" style={{ overflow: "hidden" }}>
-              <ArtifactBrowserPanel />
+              <AssetBrowserPanel project={draftProject} />
             </div>
             <div
               class="browser-resize-handle"
@@ -194,7 +305,7 @@ const Workspace: Component = () => {
                   type="button"
                   class="sidebar-toggle-btn"
                   title={sidebarCollapsed() ? "Mostra sidebar" : "Nascondi sidebar"}
-                  onClick={() => setSidebarCollapsed((v) => !v)}
+                  onClick={() => setSidebarCollapsed((value) => !value)}
                 >
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="3" y="3" width="18" height="18" rx="2" />
@@ -203,14 +314,10 @@ const Workspace: Component = () => {
                 </button>
                 <PipelineBar />
               </div>
-              <div
-                ref={editorMainRef}
-                class="editor-main"
-                style={{ "grid-template-rows": editorMainRows() }}
-              >
-                <WorkspaceGrid />
+              <div ref={editorMainRef} class="editor-main" style={{ "grid-template-rows": editorMainRows() }}>
+                <WorkspaceGrid project={draftProject} updateProject={updateProject} />
                 <div class="workspace-vsplit" onPointerDown={onTimelineResizeStart} />
-                <TimelinePanel />
+                <TimelinePanel project={draftProject} updateProject={updateProject} />
               </div>
             </div>
           </div>
@@ -220,383 +327,16 @@ const Workspace: Component = () => {
   );
 };
 
-/* ---- Helpers ---- */
-
-function useJob() {
-  return useJobQuery(selectedJobId);
-}
-
-/* ---- Monitor ---- */
-
-/* Step display order & labels */
-const STEP_ORDER = ["ingest", "transcription", "editorial", "render", "output"] as const;
-const STEP_LABELS: Record<string, string> = {
-  ingest: "Ingest",
-  transcription: "Transcription",
-  editorial: "Editorial",
-  render: "Render",
-  output: "Output",
-};
-const STEP_ICONS: Record<string, string> = {
-  ingest: "M4 4h6v6H4zm10 0h6v6h-6zM4 14h6v6H4zm10 0h6v6h-6z",
-  transcription: "M12 3a9 9 0 110 18 9 9 0 010-18zm-1 5v5l4 2.5",
-  editorial: "M4 6h16M4 12h10M4 18h14",
-  render: "M5 3l14 9-14 9V3z",
-  output: "M12 2l8 4v8l-8 4-8-4V6l8-4z",
-};
-
-interface ArtifactGroup {
-  step: string;
-  label: string;
-  items: import("../types").ArtifactEntry[];
-}
-
-const FileTypeIcon: Component<{ type: string }> = (props) => {
-  const iconPaths: Record<string, string> = {
-    video: "M15 10l5-3v10l-5-3zM4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z",
-    audio: "M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z",
-    json: "M7 8l-4 4 4 4M17 8l4 4-4 4M14 4l-4 16",
-    text: "M4 6h16M4 10h16M4 14h10M4 18h12",
-    binary: "M10 4H4v6h6V4zm10 0h-6v6h6V4zm-10 10H4v6h6v-6zm10 0h-6v6h6v-6z",
-  };
-  return (
-    <svg class={`asset-type-icon asset-type-icon--${props.type}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-      <path d={iconPaths[props.type] || iconPaths.binary} />
-    </svg>
-  );
-};
-
-const ASSET_PREVIEW_MIN = 120;
-const ASSET_LIST_MIN = 140;
-
-type SidebarTab = "assets" | "logs";
-
-const ArtifactBrowserPanel: Component = () => {
-  const job = useJob();
-  const data = () => job.data as JobSnapshot | undefined;
-  const [filter, setFilter] = createSignal("");
-  const [collapsed, setCollapsed] = createSignal<Record<string, boolean>>({});
-  const [previewHeight, setPreviewHeight] = createSignal(220);
-  const [activeTab, setActiveTab] = createSignal<SidebarTab>("assets");
-  let containerRef: HTMLDivElement | undefined;
-
-  /* Logs data */
-  const logs = createMemo(() => (data())?.logs ?? []);
-  const error = () => data()?.error;
-
-  const catalog = createMemo(() => {
-    const j = data();
-    return j ? buildArtifactCatalog(j) : [];
-  });
-
-  const groups = createMemo<ArtifactGroup[]>(() => {
-    const items = catalog();
-    const f = filter().toLowerCase();
-    const byStep = new Map<string, import("../types").ArtifactEntry[]>();
-    for (const item of items) {
-      if (f && !baseName(item.path).toLowerCase().includes(f) && !item.step.toLowerCase().includes(f)) continue;
-      const arr = byStep.get(item.step) ?? [];
-      arr.push(item);
-      byStep.set(item.step, arr);
-    }
-    return STEP_ORDER
-      .filter((s) => byStep.has(s))
-      .map((s) => ({ step: s, label: STEP_LABELS[s] || capitalize(s), items: byStep.get(s)! }));
-  });
-
-  const totalCount = () => groups().reduce((n, g) => n + g.items.length, 0);
-
-  const jobId = () => data()?.id;
-  const currentPreview = () => {
-    const id = jobId();
-    return id ? getPreviewForJob(id) : undefined;
-  };
-  const itemTitle = (path: string) => {
-    const type = inferFileType(path);
-    return type === "video" || type === "audio" ? humanizeMediaName(path) : baseName(path);
-  };
-
-  const isActive = (path: string) => currentPreview() === path;
-
-  const openArtifact = (path: string) => {
-    const id = jobId();
-    if (!id) return;
-    setPreviewForJob(id, path);
-  };
-
-  const toggleGroup = (step: string) => {
-    setCollapsed((prev) => ({ ...prev, [step]: !prev[step] }));
-  };
-
-  /* ---- Preview pane data ---- */
-  const previewPath = createMemo(() => {
-    const id = jobId();
-    if (!id) return null;
-    const j = data();
-    if (!j) return null;
-    const cat = buildArtifactCatalog(j);
-    const p = getPreviewForJob(id);
-    if (p && cat.some((item) => item.path === p)) return p;
-    const preferred = [
-      "06_edit_decision_list.json",
-      "05_spans_labeled.json",
-      "07_caption_display.json",
-      "04_transcript_aligned.json",
-      "03_transcript_raw.json",
-      "01_media_probe.json",
-    ];
-    for (const suffix of preferred) {
-      const match = cat.find((i) => i.path.endsWith(suffix));
-      if (match) return match.path;
-    }
-    return null;
-  });
-
-  const shouldFetch = createMemo(() => {
-    const p = previewPath();
-    return p && isPreviewableText(p) ? p : null;
-  });
-
-  const artifact = useArtifactQuery(() => jobId() ?? null, shouldFetch);
-
-  const previewSrc = createMemo(() => {
-    const id = jobId();
-    const p = previewPath();
-    return id && p ? fileUrl(id, p) : null;
-  });
-
-  const previewName = createMemo(() => {
-    const p = previewPath();
-    return p ? baseName(p) : "";
-  });
-
-  const previewFileType = createMemo(() => {
-    const p = previewPath();
-    return p ? inferFileType(p) : null;
-  });
-
-  const content = createMemo(() => {
-    const entry = artifact.data;
-    if (!entry) return null;
-    return entry.type === "json" ? JSON.stringify(entry.data, null, 2) : entry.text;
-  });
-
-  /* ---- Vertical splitter between list and preview ---- */
-  const onPreviewResizeStart = (e: PointerEvent) => {
-    if (!containerRef) return;
-    e.preventDefault();
-    const startY = e.clientY;
-    const startH = previewHeight();
-    const totalH = containerRef.getBoundingClientRect().height;
-
-    const onMove = (ev: PointerEvent) => {
-      const delta = startY - ev.clientY;
-      const newH = Math.max(ASSET_PREVIEW_MIN, Math.min(totalH - ASSET_LIST_MIN, startH + delta));
-      setPreviewHeight(newH);
-    };
-    const onUp = () => {
-      document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", onUp);
-  };
-
-  return (
-    <div class="panel asset-explorer" ref={containerRef}>
-      {/* Tab bar */}
-      <div class="sidebar-tabs">
-        <button
-          type="button"
-          class={`sidebar-tab${activeTab() === "assets" ? " active" : ""}`}
-          onClick={() => setActiveTab("assets")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2v11z" />
-          </svg>
-          Assets
-          <span class="sidebar-tab-badge">{totalCount()}</span>
-        </button>
-        <button
-          type="button"
-          class={`sidebar-tab${activeTab() === "logs" ? " active" : ""}`}
-          onClick={() => setActiveTab("logs")}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
-          </svg>
-          Log
-          <Show when={logs().length > 0}>
-            <span class="sidebar-tab-badge">{logs().length}</span>
-          </Show>
-        </button>
-      </div>
-
-      {/* ===== ASSETS TAB ===== */}
-      <div class="sidebar-tab-body" style={{ display: activeTab() === "assets" ? "flex" : "none" }}>
-        {/* Search */}
-        <div class="asset-explorer-search">
-          <svg class="asset-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-          <input
-            type="text"
-            class="asset-search-input"
-            placeholder="Filtra artefatti..."
-            value={filter()}
-            onInput={(e) => setFilter(e.currentTarget.value)}
-          />
-          <Show when={filter().length > 0}>
-            <button type="button" class="asset-search-clear" onClick={() => setFilter("")}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-            </button>
-          </Show>
-        </div>
-
-        {/* Asset list */}
-        <div class="asset-explorer-content">
-          <Show when={totalCount() === 0}>
-            <div class="asset-explorer-empty">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z" />
-                <polyline points="13 2 13 9 20 9" />
-              </svg>
-              <span>{filter() ? "Nessun risultato" : "Nessun artefatto disponibile"}</span>
-            </div>
-          </Show>
-          <For each={groups()}>
-            {(group) => (
-              <div class="asset-group">
-                <button type="button" class="asset-group-header" onClick={() => toggleGroup(group.step)}>
-                  <svg class={`asset-group-chevron${collapsed()[group.step] ? " collapsed" : ""}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="6 9 12 15 18 9" />
-                  </svg>
-                  <svg class="asset-group-step-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d={STEP_ICONS[group.step] || STEP_ICONS.output} />
-                  </svg>
-                  <span class="asset-group-label">{group.label}</span>
-                  <span class="asset-group-count">{group.items.length}</span>
-                </button>
-                <Show when={!collapsed()[group.step]}>
-                  <div class="asset-group-items">
-                    <For each={group.items}>
-                      {(item) => {
-                        const ftype = () => inferFileType(item.path);
-                        return (
-                          <button
-                            type="button"
-                            class={`asset-item${isActive(item.path) ? " active" : ""}`}
-                            onClick={() => openArtifact(item.path)}
-                            title={item.path}
-                          >
-                            <FileTypeIcon type={ftype()} />
-                            <span class="asset-item-name">{itemTitle(item.path)}</span>
-                            <span class={`asset-item-badge asset-item-badge--${ftype()}`}>{ftype().toUpperCase()}</span>
-                          </button>
-                        );
-                      }}
-                    </For>
-                  </div>
-                </Show>
-              </div>
-            )}
-          </For>
-        </div>
-
-        {/* Splitter */}
-        <div class="asset-preview-splitter" onPointerDown={onPreviewResizeStart} />
-
-        {/* Inline preview pane */}
-        <div class="asset-preview-pane" style={{ height: `${previewHeight()}px` }}>
-          <div class="asset-preview-header">
-            <svg class="asset-preview-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-            <span class="asset-preview-title">
-              {previewName() || "Preview"}
-            </span>
-            <Show when={previewSrc()}>
-              <a class="asset-preview-open" href={previewSrc()!} target="_blank">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6" />
-                  <polyline points="15 3 21 3 21 9" />
-                  <line x1="10" y1="14" x2="21" y2="3" />
-                </svg>
-              </a>
-            </Show>
-          </div>
-          <div class="asset-preview-body">
-            <Show when={!previewPath()}>
-              <div class="asset-preview-empty">Seleziona un artefatto</div>
-            </Show>
-            <Show when={previewPath()}>
-              {(() => {
-                const ft = previewFileType();
-                if (ft === "video") {
-                  return <video class="asset-preview-media" src={previewSrc()!} controls preload="metadata" />;
-                }
-                if (ft === "audio") {
-                  return <audio class="asset-preview-media asset-preview-audio" src={previewSrc()!} controls preload="metadata" />;
-                }
-                return (
-                  <Show when={content() !== null} fallback={
-                    <div class="asset-preview-empty">
-                      {artifact.isLoading ? "Caricamento..." : "Preview non disponibile"}
-                    </div>
-                  }>
-                    <pre class="asset-preview-code">{content()}</pre>
-                  </Show>
-                );
-              })()}
-            </Show>
-          </div>
-        </div>
-      </div>
-
-      {/* ===== LOGS TAB ===== */}
-      <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: activeTab() === "logs" ? "flex" : "none" }}>
-        <div class="sidebar-logs-content">
-          <Show when={logs().length === 0 && !error()}>
-            <div class="asset-explorer-empty">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
-              </svg>
-              <span>Nessun log disponibile</span>
-            </div>
-          </Show>
-          <Show when={error()}>
-            <div class="sidebar-log-line sidebar-log-error">{error()}</div>
-          </Show>
-          <For each={[...logs()].reverse()}>
-            {(line) => <div class="sidebar-log-line">{line}</div>}
-          </For>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-/* ---- Resizable workspace grid ---- */
-
-const WorkspaceGrid: Component = () => {
+const WorkspaceGrid: Component<{
+  project: Accessor<EditorialProject | null>;
+  updateProject: (next: ProjectUpdater) => void;
+}> = (props) => {
   const [inspectorWidth, setInspectorWidth] = createSignal(340);
-  let gridRef: HTMLDivElement | undefined;
-
   const onResizeStart = (e: PointerEvent) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = inspectorWidth();
-
-    const onMove = (ev: PointerEvent) => {
-      const delta = startX - ev.clientX;
-      setInspectorWidth(Math.max(240, Math.min(600, startW + delta)));
-    };
+    const onMove = (ev: PointerEvent) => setInspectorWidth(Math.max(240, Math.min(600, startW + (startX - ev.clientX))));
     const onUp = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
@@ -610,572 +350,816 @@ const WorkspaceGrid: Component = () => {
   };
 
   return (
-    <div
-      ref={gridRef}
-      class="workspace-grid"
-      style={{ "grid-template-columns": `1fr 4px ${inspectorWidth()}px` }}
-    >
+    <div class="workspace-grid" style={{ "grid-template-columns": `1fr 4px ${inspectorWidth()}px` }}>
       <div class="monitor-col">
-        <MonitorPanel />
+        <MonitorPanel project={props.project} />
       </div>
       <div class="resize-handle" onPointerDown={onResizeStart} />
       <div class="inspector-col">
-        <ParamsInspector />
+        <ParamsInspector project={props.project} updateProject={props.updateProject} />
       </div>
     </div>
   );
 };
 
-/* ---- Monitor ---- */
+const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
+  const job = useJobQuery(selectedJobId);
+  const uploadAsset = useUploadEditorialAssetMutation();
+  const [filter, setFilter] = createSignal("");
+  const [previewAssetId, setPreviewAssetId] = createSignal<string | null>(null);
+  const [draggingAssetId, setDraggingAssetId] = createSignal<string | null>(null);
+  const [activeTab, setActiveTab] = createSignal<"assets" | "logs">("assets");
+  let inputRef: HTMLInputElement | undefined;
 
-/**
- * The video/audio element is kept alive via refs and imperative src updates.
- * We never use ternaries or <Show> around media elements — this prevents
- * Solid from destroying/recreating them on reactive updates.
- */
-const MonitorPanel: Component = () => {
-  const job = useJob();
-  const data = () => job.data as JobSnapshot | undefined;
-
-  const sources = createMemo(() => {
-    const j = data();
-    return j ? getMonitorSources(j) : [];
+  const project = () => props.project();
+  const assets = createMemo(() => {
+    const items = project()?.assets ?? [];
+    const f = filter().trim().toLowerCase();
+    return items.filter((item) => !f || item.label.toLowerCase().includes(f) || baseName(item.path).toLowerCase().includes(f));
   });
-
-  const jobId = () => data()?.id;
-
-  const activePath = createMemo(() => {
-    const id = jobId();
-    if (!id) return null;
-    const s = sources();
-    const c = getMonitorForJob(id);
-    if (c && s.some((source) => source.path === c)) return c;
-    if (s.length) {
-      setMonitorForJob(id, s[0].path);
-      return s[0].path;
-    }
-    return null;
+  const previewAsset = createMemo(() => {
+    const current = project();
+    if (!current) return null;
+    return assetById(current, previewAssetId() ?? assets()[0]?.id ?? "") ?? null;
   });
-
-  const mediaSrc = createMemo(() => {
-    const id = jobId();
-    const p = activePath();
-    if (!id || !p) return null;
-    // Cache buster: append updated_at so browser reloads after re-render
-    const ts = data()?.updated_at ?? "";
-    return `${fileUrl(id, p)}?t=${encodeURIComponent(ts)}`;
+  const previewSrc = createMemo(() => {
+    const current = previewAsset();
+    const jobId = selectedJobId();
+    return current && jobId ? fileUrl(jobId, current.path) : null;
   });
+  const logs = createMemo(() => (job.data as JobSnapshot | undefined)?.logs ?? []);
 
-  const mediaType = createMemo(() => {
-    const p = activePath();
-    return p ? inferFileType(p) : null;
-  });
+  const openAsset = (asset: ProjectAsset) => {
+    setPreviewAssetId(asset.id);
+    const jobId = selectedJobId();
+    if (jobId) setPreviewForJob(jobId, asset.path);
+  };
 
-  // Imperative: keep refs, update src without remounting
+  const onFiles = (files: FileList | null) => {
+    const jobId = selectedJobId();
+    if (!jobId || !files?.length) return;
+    Array.from(files).forEach((file) => uploadAsset.mutate({ jobId, file }));
+    if (inputRef) inputRef.value = "";
+  };
+
+  return (
+    <div class="panel asset-explorer">
+      <div class="sidebar-tabs">
+        <button type="button" class={`sidebar-tab${activeTab() === "assets" ? " active" : ""}`} onClick={() => setActiveTab("assets")}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2v11z" />
+          </svg>
+          Assets
+          <span class="sidebar-tab-badge">{assets().length}</span>
+        </button>
+        <button type="button" class={`sidebar-tab${activeTab() === "logs" ? " active" : ""}`} onClick={() => setActiveTab("logs")}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
+          </svg>
+          Log
+        </button>
+      </div>
+
+      <div class="sidebar-tab-body" style={{ display: activeTab() === "assets" ? "flex" : "none" }}>
+        <div class="asset-browser-actions">
+          <button type="button" class="btn btn-primary btn-xs" onClick={() => inputRef?.click()}>
+            Aggiungi asset
+          </button>
+          <input
+            ref={inputRef}
+            type="file"
+            class="asset-upload-input"
+            accept="video/*,audio/*"
+            multiple
+            onChange={(e) => onFiles(e.currentTarget.files)}
+          />
+        </div>
+        <div class="asset-explorer-search">
+          <svg class="asset-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            type="text"
+            class="asset-search-input"
+            placeholder="Filtra asset..."
+            value={filter()}
+            onInput={(e) => setFilter(e.currentTarget.value)}
+          />
+        </div>
+        <div class="asset-explorer-content">
+          <Show when={assets().length > 0} fallback={<div class="asset-explorer-empty"><span>Nessun asset disponibile</span></div>}>
+            <For each={assets()}>
+              {(asset) => (
+                <button
+                  type="button"
+                  class={`asset-item${previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
+                  draggable={true}
+                  onDragStart={(e) => {
+                    openAsset(asset);
+                    setDraggingAssetId(asset.id);
+                    if (!e.dataTransfer) return;
+                    e.dataTransfer.setData("application/x-fellini-asset", asset.id);
+                    e.dataTransfer.effectAllowed = "copy";
+                    e.dataTransfer.setDragImage(e.currentTarget, 18, 12);
+                  }}
+                  onDragEnd={() => {
+                    setDraggingAssetId(null);
+                    window.dispatchEvent(new CustomEvent("fellini:asset-drag-end"));
+                  }}
+                  onClick={() => openAsset(asset)}
+                >
+                  <FileTypeIcon type={asset.kind} />
+                  <span class="asset-item-name">{asset.label || humanizeMediaName(asset.path)}</span>
+                  <span class={`asset-item-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
+                </button>
+              )}
+            </For>
+          </Show>
+        </div>
+        <div class="asset-preview-pane asset-preview-pane--fixed">
+          <div class="asset-preview-header">
+            <span class="asset-preview-title">{previewAsset()?.label || "Preview"}</span>
+          </div>
+          <div class="asset-preview-body">
+            <Show when={previewSrc()} fallback={<div class="asset-preview-empty">Seleziona un asset</div>}>
+              {(() => {
+                const src = previewSrc();
+                const asset = previewAsset();
+                if (!src || !asset) return null;
+                if (asset.kind === "video") return <video class="asset-preview-media" src={src} controls preload="metadata" />;
+                return <audio class="asset-preview-media asset-preview-audio" src={src} controls preload="metadata" />;
+              })()}
+            </Show>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: activeTab() === "logs" ? "flex" : "none" }}>
+        <div class="sidebar-logs-content">
+          <For each={[...logs()].reverse()}>
+            {(line) => <div class="sidebar-log-line">{line}</div>}
+          </For>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const FileTypeIcon: Component<{ type: "video" | "audio" }> = (props) => (
+  <svg class={`asset-type-icon asset-type-icon--${props.type}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d={props.type === "video"
+      ? "M15 10l5-3v10l-5-3zM4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"
+      : "M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z"} />
+  </svg>
+);
+
+const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
+  const [gpuStatus, setGpuStatus] = createSignal<"ready" | "fallback" | "unsupported">("unsupported");
+  const [codecStatus, setCodecStatus] = createSignal<"ready" | "unsupported">("unsupported");
+  const [stageSize, setStageSize] = createSignal({ width: 0, height: 0 });
+  const [transportPlaying, setTransportPlaying] = createSignal(false);
+  let stageRef: HTMLDivElement | undefined;
+  let canvasRef: HTMLCanvasElement | undefined;
   let videoRef: HTMLVideoElement | undefined;
   let audioRef: HTMLAudioElement | undefined;
+  let gpuContext: any;
+  let gpuDevice: any;
+  let gpuPipeline: any;
+  let sampler: any;
+  let layoutBuffer: any;
+  let raf = 0;
+  let transportStartAt = 0;
+  let transportStartTime = 0;
 
-  const getActiveEl = () => (mediaType() === "video" ? videoRef : audioRef) ?? null;
-
-  // Smooth playhead via requestAnimationFrame
-  let rafHandle = 0;
-  const tick = () => {
-    const el = getActiveEl();
-    if (el && !el.paused && Number.isFinite(el.currentTime)) {
-      setPlayheadTime(el.currentTime);
+  const project = () => props.project();
+  const frameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
+  const contentDuration = createMemo(() => (project() ? projectDuration(project()!) : 0));
+  const sequenceWidth = createMemo(() => Math.max(1, Math.round(project()?.sequence.width ?? 1080)));
+  const sequenceHeight = createMemo(() => Math.max(1, Math.round(project()?.sequence.height ?? 1920)));
+  const displayFrame = createMemo(() => {
+    const width = stageSize().width;
+    const height = stageSize().height;
+    if (width <= 0 || height <= 0) {
+      return { width: sequenceWidth(), height: sequenceHeight() };
     }
-    rafHandle = requestAnimationFrame(tick);
+    const scale = Math.min(width / sequenceWidth(), height / sequenceHeight());
+    return {
+      width: Math.max(1, Math.floor(sequenceWidth() * scale)),
+      height: Math.max(1, Math.floor(sequenceHeight() * scale)),
+    };
+  });
+  const activeVideoClip = createMemo(() => {
+    const current = project();
+    if (!current) return null;
+    const at = playheadTime();
+    return [...current.clips]
+      .filter((clip) => {
+        const track = getTrack(current, clip.track_id);
+        return track?.kind === "video" && clip.start <= at && (clip.start + (clip.source_out - clip.source_in)) >= at;
+      })
+      .sort((a, b) => b.z_index - a.z_index)[0] ?? null;
+  });
+  const activeVideoAsset = createMemo(() => {
+    const current = project();
+    const clip = activeVideoClip();
+    if (!current || !clip) return null;
+    return assetById(current, clip.asset_id) ?? null;
+  });
+  const activeAudioClip = createMemo(() => {
+    const current = project();
+    if (!current) return null;
+    const at = playheadTime();
+    const story = current.tracks.find((track) => track.kind === "audio" && track.role === "story");
+    return current.clips.find((clip) => clip.track_id === story?.id && clip.start <= at && (clip.start + (clip.source_out - clip.source_in)) >= at) ?? null;
+  });
+  const mediaSource = (clip: TimelineClip | null) => {
+    const current = project();
+    const jobId = selectedJobId();
+    if (!current || !jobId || !clip) return null;
+    const asset = assetById(current, clip.asset_id);
+    return asset ? fileUrl(jobId, asset.path) : null;
   };
-  rafHandle = requestAnimationFrame(tick);
-  onCleanup(() => cancelAnimationFrame(rafHandle));
+  const syncClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
+    if (!clip || !element) return;
+    const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
+    if (element.readyState < 1) return;
+    try {
+      if (Math.abs(element.currentTime - localTime) > 0.12) element.currentTime = localTime;
+    } catch {
+      // Media can reject seeks before metadata is fully ready; tick will retry.
+    }
+  };
+  const pausePlayback = () => {
+    transportStartTime = playheadTime();
+    setTransportPlaying(false);
+    videoRef?.pause();
+    audioRef?.pause();
+  };
+  const playMediaElement = (element: HTMLMediaElement | undefined) => {
+    if (!element || element.readyState < 2 || !element.paused) return;
+    void element.play().catch(() => {});
+  };
+  const syncTransportClock = (time: number) => {
+    transportStartAt = performance.now();
+    transportStartTime = time;
+  };
+  const togglePlayback = () => {
+    if (transportPlaying()) {
+      pausePlayback();
+      return;
+    }
+    const duration = contentDuration();
+    const startTime = Math.max(0, Math.min(playheadTime(), duration));
+    setPlayheadTime(startTime);
+    syncTransportClock(startTime);
+    setTransportPlaying(true);
+    syncClipTime(activeVideoClip(), videoRef);
+    syncClipTime(activeAudioClip(), audioRef);
+    playMediaElement(videoRef);
+    playMediaElement(audioRef);
+  };
+
+  const initGpu = async () => {
+    const gpu = (navigator as Navigator & { gpu?: any }).gpu;
+    if (!canvasRef || !gpu) {
+      setGpuStatus("unsupported");
+      return;
+    }
+    try {
+      const adapter = await gpu.requestAdapter();
+      if (!adapter) {
+        setGpuStatus("unsupported");
+        return;
+      }
+      gpuDevice = await adapter.requestDevice();
+      gpuContext = canvasRef.getContext("webgpu") ?? undefined;
+      if (!gpuContext || !gpuDevice) {
+        setGpuStatus("fallback");
+        return;
+      }
+      gpuContext.configure({
+        device: gpuDevice,
+        format: gpu.getPreferredCanvasFormat(),
+        alphaMode: "opaque",
+      });
+      sampler = gpuDevice.createSampler({ magFilter: "linear", minFilter: "linear" });
+      const bufferUsage = (globalThis as { GPUBufferUsage?: { UNIFORM: number; COPY_DST: number } }).GPUBufferUsage;
+      if (!bufferUsage) {
+        setGpuStatus("fallback");
+        return;
+      }
+      layoutBuffer = gpuDevice.createBuffer({
+        size: 16,
+        usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST,
+      });
+      gpuPipeline = gpuDevice.createRenderPipeline({
+        layout: "auto",
+        vertex: {
+          module: gpuDevice.createShaderModule({
+            code: `
+              struct Layout {
+                scale: vec2f,
+                pad: vec2f,
+              };
+              struct Out {
+                @builtin(position) pos: vec4f,
+                @location(0) uv: vec2f,
+              };
+              @group(0) @binding(0) var<uniform> layout: Layout;
+              @vertex
+              fn main(@builtin(vertex_index) i: u32) -> Out {
+                var pos = array<vec2f, 6>(
+                  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                  vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0)
+                );
+                var uv = array<vec2f, 6>(
+                  vec2f(0.0, 1.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0),
+                  vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0)
+                );
+                var out: Out;
+                out.pos = vec4f(pos[i] * layout.scale, 0.0, 1.0);
+                out.uv = uv[i];
+                return out;
+              }
+            `,
+          }),
+          entryPoint: "main",
+        },
+        fragment: {
+          module: gpuDevice.createShaderModule({
+            code: `
+              @group(0) @binding(1) var frameSampler: sampler;
+              @group(0) @binding(2) var frameTex: texture_external;
+              @fragment
+              fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
+                return textureSampleBaseClampToEdge(frameTex, frameSampler, uv);
+              }
+            `,
+          }),
+          entryPoint: "main",
+          targets: [{ format: gpu.getPreferredCanvasFormat() }],
+        },
+        primitive: { topology: "triangle-list" },
+      });
+      setGpuStatus("ready");
+    } catch {
+      setGpuStatus("fallback");
+    }
+  };
+
+  const drawFrame = () => {
+    const video = videoRef;
+    if (
+      !canvasRef
+      || !video
+      || !gpuDevice
+      || !gpuContext
+      || !gpuPipeline
+      || !sampler
+      || !layoutBuffer
+      || video.readyState < 2
+    ) return;
+    try {
+      const asset = activeVideoAsset();
+      const [scaleX, scaleY] = containScale(
+        video.videoWidth || asset?.width || sequenceWidth(),
+        video.videoHeight || asset?.height || sequenceHeight(),
+        sequenceWidth(),
+        sequenceHeight(),
+      );
+      gpuDevice.queue.writeBuffer(layoutBuffer, 0, new Float32Array([scaleX, scaleY, 0, 0]));
+      const texture = gpuDevice.importExternalTexture({ source: video });
+      const bindGroup = gpuDevice.createBindGroup({
+        layout: gpuPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: layoutBuffer } },
+          { binding: 1, resource: sampler },
+          { binding: 2, resource: texture },
+        ],
+      });
+      const encoder = gpuDevice.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: gpuContext.getCurrentTexture().createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: "clear",
+          storeOp: "store",
+        }],
+      });
+      pass.setPipeline(gpuPipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.draw(6);
+      pass.end();
+      gpuDevice.queue.submit([encoder.finish()]);
+    } catch {
+      setGpuStatus("fallback");
+    }
+  };
+
+  const tick = () => {
+    if (transportPlaying()) {
+      const duration = contentDuration();
+      const elapsed = (performance.now() - transportStartAt) / 1000;
+      const nextTime = transportStartTime + elapsed;
+      if (nextTime >= duration) {
+        setPlayheadTime(duration);
+        pausePlayback();
+      } else {
+        setPlayheadTime(nextTime);
+      }
+    }
+    const clip = activeVideoClip();
+    if (clip) syncClipTime(clip, videoRef);
+    else videoRef?.pause();
+    const audioClip = activeAudioClip();
+    syncClipTime(audioClip, audioRef);
+    if (!audioClip) audioRef?.pause();
+    if (transportPlaying()) {
+      if (clip) playMediaElement(videoRef);
+      if (audioClip) playMediaElement(audioRef);
+    }
+    if (gpuStatus() === "ready") drawFrame();
+    raf = requestAnimationFrame(tick);
+  };
+
+  createEffect(() => {
+    sequenceWidth();
+    sequenceHeight();
+    if (canvasRef) {
+      canvasRef.width = sequenceWidth();
+      canvasRef.height = sequenceHeight();
+    }
+    const gpu = (navigator as Navigator & { gpu?: any }).gpu;
+    if (gpuContext && gpuDevice && gpu) {
+      gpuContext.configure({
+        device: gpuDevice,
+        format: gpu.getPreferredCanvasFormat(),
+        alphaMode: "opaque",
+      });
+    }
+  });
+
+  createEffect(() => {
+    if (!stageRef) return;
+    const syncStageSize = () => {
+      if (!stageRef) return;
+      setStageSize({
+        width: stageRef.clientWidth,
+        height: stageRef.clientHeight,
+      });
+    };
+    syncStageSize();
+    const observer = new ResizeObserver(syncStageSize);
+    observer.observe(stageRef);
+    onCleanup(() => observer.disconnect());
+  });
+
+  createEffect(() => {
+    void initGpu();
+    setCodecStatus("VideoDecoder" in window && "VideoEncoder" in window ? "ready" : "unsupported");
+    raf = requestAnimationFrame(tick);
+    onCleanup(() => cancelAnimationFrame(raf));
+  });
+
+  createEffect(() => {
+    const src = mediaSource(activeVideoClip());
+    if (videoRef && src && videoRef.getAttribute("src") !== src) {
+      videoRef.src = src;
+      videoRef.load();
+    }
+  });
+  createEffect(() => {
+    const src = mediaSource(activeAudioClip());
+    if (audioRef && src && audioRef.getAttribute("src") !== src) {
+      audioRef.src = src;
+      audioRef.load();
+    }
+  });
 
   createEffect(
-    on(mediaSrc, (src) => {
-      if (videoRef && src && mediaType() === "video") {
-        if (videoRef.getAttribute("src") !== src) {
-          videoRef.src = src;
-          videoRef.load();
-        }
-      }
-      if (audioRef && src && mediaType() === "audio") {
-        if (audioRef.getAttribute("src") !== src) {
-          audioRef.src = src;
-          audioRef.load();
-        }
-      }
-    }),
-  );
-
-  // Respond to seek requests from the timeline
-  createEffect(
-    on(seekRequest, (t) => {
-      if (t === null) return;
-      const el = getActiveEl();
-      if (el && Number.isFinite(t)) {
-        el.currentTime = t;
-        setPlayheadTime(t);
-      }
+    on(seekRequest, (time) => {
+      if (time === null) return;
+      setPlayheadTime(time);
+      if (transportPlaying()) syncTransportClock(time);
+      syncClipTime(activeVideoClip(), videoRef);
+      syncClipTime(activeAudioClip(), audioRef);
       setSeekRequest(null);
     }),
   );
-
-  // Respond to play/pause toggle (spacebar)
   createEffect(
     on(playPauseRequest, () => {
-      const el = getActiveEl();
-      if (!el) return;
-      if (el.paused) el.play();
-      else el.pause();
+      togglePlayback();
     }, { defer: true }),
   );
-
-  // Frame step: pause video, advance by 1/fps
   createEffect(
     on(frameStepRequest, (dir) => {
-      if (dir === 0) return;
-      const el = getActiveEl();
-      if (!el) return;
-      // Pause first so we can scrub frame by frame
-      if (!el.paused) el.pause();
-      // Use the video's fps from probe, fallback to 30
-      const fps = (videoRef as any)?._fellini_fps || 30;
-      const frameDur = 1 / fps;
-      const newTime = Math.max(0, el.currentTime + dir * frameDur);
-      el.currentTime = newTime;
-      setPlayheadTime(newTime);
+      if (!dir) return;
+      pausePlayback();
+      const next = Math.max(0, playheadTime() + dir / frameRate());
+      setSeekRequest(next);
       setFrameStepRequest(0);
     }),
   );
-
-  // Store fps from probe on the video element
-  createEffect(
-    on(
-      () => data()?.id,
-      () => {
-        const j = data();
-        if (!j || !videoRef) return;
-        const probeArt = buildArtifactCatalog(j).find((a) => a.path.endsWith("01_media_probe.json"));
-        if (!probeArt) return;
-        fetch(fileUrl(j.id, probeArt.path))
-          .then((r) => r.json())
-          .then((p: { sources?: { fps?: number }[] }) => {
-            const fps = p?.sources?.[0]?.fps;
-            if (fps && videoRef) (videoRef as any)._fellini_fps = fps;
-          })
-          .catch(() => {});
-      },
-    ),
-  );
-
-  // Global keyboard handler: Space=play/pause, Left/Right=frame step, J/L=5s skip
-  const onKeyDown = (e: KeyboardEvent) => {
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-
-    switch (e.code) {
-      case "Space":
-        e.preventDefault();
-        setPlayPauseRequest((n) => n + 1);
-        break;
-      case "ArrowLeft":
-        e.preventDefault();
-        if (e.shiftKey) {
-          // Shift+Left: skip back 5s
-          setSeekRequest(Math.max(0, playheadTime() - 5));
-        } else {
-          setFrameStepRequest(-1);
-        }
-        break;
-      case "ArrowRight":
-        e.preventDefault();
-        if (e.shiftKey) {
-          // Shift+Right: skip forward 5s
-          setSeekRequest(playheadTime() + 5);
-        } else {
-          setFrameStepRequest(1);
-        }
-        break;
-      case "KeyJ":
-        e.preventDefault();
-        setSeekRequest(Math.max(0, playheadTime() - 5));
-        break;
-      case "KeyL":
-        e.preventDefault();
-        setSeekRequest(playheadTime() + 5);
-        break;
-      case "KeyK":
-        e.preventDefault();
-        setPlayPauseRequest((n) => n + 1);
-        break;
-    }
-  };
-  document.addEventListener("keydown", onKeyDown);
-  onCleanup(() => document.removeEventListener("keydown", onKeyDown));
 
   return (
     <div class="panel monitor-panel">
       <div class="panel-header">
         <span class="panel-title">Monitor</span>
-        <div class="monitor-switches">
-          <For each={sources()}>
-            {(s) => (
-              <button
-                type="button"
-                class={`monitor-btn${activePath() === s.path ? " active" : ""}`}
-                onClick={() => {
-                  const id = jobId();
-                  if (id) setMonitorForJob(id, s.path);
-                }}
-              >
-                {s.label}
-              </button>
-            )}
-          </For>
+        <div class="monitor-capabilities">
+          <span class={`monitor-capability monitor-capability--${gpuStatus()}`}>WebGPU {gpuStatus()}</span>
+          <span class={`monitor-capability monitor-capability--${codecStatus()}`}>WebCodecs {codecStatus()}</span>
         </div>
       </div>
-      <div class="monitor-stage">
-        <video
-          ref={videoRef}
-          controls
-          preload="metadata"
+      <div ref={stageRef} class="monitor-stage">
+        <div
+          class="monitor-frame"
           style={{
-            display: mediaSrc() && mediaType() === "video" ? "block" : "none",
+            width: `${displayFrame().width}px`,
+            height: `${displayFrame().height}px`,
           }}
-        />
+        >
+          <canvas
+            ref={canvasRef}
+            class={`monitor-canvas${gpuStatus() === "ready" ? " active" : ""}`}
+            width={sequenceWidth()}
+            height={sequenceHeight()}
+          />
+          <video
+            ref={videoRef}
+            controls
+            preload="metadata"
+            muted
+            playsinline
+            class={`monitor-fallback-video${gpuStatus() === "ready" ? " hidden" : ""}`}
+            style={{ display: mediaSource(activeVideoClip()) ? "block" : "none" }}
+            onLoadedData={() => {
+              syncClipTime(activeVideoClip(), videoRef);
+              if (transportPlaying()) playMediaElement(videoRef);
+            }}
+          />
+        </div>
         <audio
           ref={audioRef}
           controls
           preload="metadata"
-          style={{
-            display: mediaSrc() && mediaType() === "audio" ? "block" : "none",
-            padding: "12px",
+          class={`monitor-audio${activeVideoClip() ? " hidden" : " active"}`}
+          style={{ display: mediaSource(activeAudioClip()) ? "block" : "none" }}
+          onLoadedData={() => {
+            syncClipTime(activeAudioClip(), audioRef);
+            if (transportPlaying()) playMediaElement(audioRef);
           }}
         />
-        <div
-          class="placeholder"
-          style={{
-            display: !mediaSrc() ? "block" : "none",
-          }}
-        >
-          Nessun media disponibile
-        </div>
       </div>
     </div>
   );
 };
 
-/* ---- Timeline ---- */
-
-interface AlignmentWord {
-  text: string;
-  start: number;
-  end: number;
-  confidence: number;
-}
-
-interface AlignmentSegment {
-  id: string;
-  start: number;
-  end: number;
-  text: string;
-  words: AlignmentWord[];
-}
-
-interface AlignmentTranscript {
-  language: string;
-  segments: AlignmentSegment[];
-  source: string;
-  notes: string[];
-}
-
-type OverviewSegmentTone = "keep" | "group" | "cut" | "maybe" | "shorten";
-
-interface OverviewSegment {
-  start: number;
-  end: number;
-  tone: OverviewSegmentTone;
-}
-
-const ZOOM_STEPS = [0.5, 1, 2, 4, 8, 16];
-const MIN_PX_PER_SEC = 60; // at zoom 1x
-const MIN_ALIGNMENT_WORD_DURATION = 0.02;
-
-const TimelinePanel: Component = () => {
-  const job = useJob();
-  const data = () => job.data as JobSnapshot | undefined;
-  const [zoomIdx, setZoomIdx] = createSignal(1); // index into ZOOM_STEPS, start at 1x
+const TimelinePanel: Component<{
+  project: Accessor<EditorialProject | null>;
+  updateProject: (next: ProjectUpdater) => void;
+}> = (props) => {
+  const [dragPreview, setDragPreview] = createSignal<{
+    assetId: string;
+    start: number;
+    label: string;
+    duration: number;
+    trackIds: string[];
+  } | null>(null);
+  const project = () => props.project();
+  const [zoomIdx, setZoomIdx] = createSignal(1);
   const zoom = () => ZOOM_STEPS[zoomIdx()];
-  const alignmentMode = createMemo(() => selectedStep() === "transcription");
-  const updateAlignmentMut = useUpdateTranscriptMutation();
-  const [localAlignment, setLocalAlignment] = createSignal<AlignmentTranscript | null>(null);
-  const [alignmentDirty, setAlignmentDirty] = createSignal(false);
-  const [activeAlignmentWord, setActiveAlignmentWord] = createSignal<{ seg: number; word: number } | null>(null);
-  let alignmentDragCleanup: (() => void) | undefined;
-
-  // Artifact paths
-  const artifactPath = (suffix: string) =>
-    createMemo(() => {
-      const j = data();
-      return j ? (buildArtifactCatalog(j).find((i) => i.path.endsWith(suffix))?.path ?? null) : null;
-    });
-
-  const edlPath = artifactPath("06_edit_decision_list.json");
-  const probePath = artifactPath("01_media_probe.json");
-  const spansPath = artifactPath("05_spans_labeled.json");
-  const captionsPath = artifactPath("07_caption_display.json");
-  const rawTranscriptPath = artifactPath("03_transcript_raw.json");
-  const alignedTranscriptPath = artifactPath("04_transcript_aligned.json");
-
-  const jobIdAccessor = () => data()?.id ?? null;
-  const edl = useArtifactQuery(jobIdAccessor, edlPath);
-  const probe = useArtifactQuery(jobIdAccessor, probePath);
-  const spansQ = useArtifactQuery(jobIdAccessor, spansPath);
-  const captionsQ = useArtifactQuery(jobIdAccessor, captionsPath);
-  const rawTranscriptQ = useArtifactQuery(jobIdAccessor, rawTranscriptPath);
-  const alignedTranscriptQ = useArtifactQuery(jobIdAccessor, alignedTranscriptPath);
-
-  // Derived data
-  const duration = createMemo(() => {
-    const d = probe.data?.data as { sources?: { duration_seconds: number }[] } | undefined;
-    return d?.sources?.reduce((s, i) => s + (i.duration_seconds || 0), 0) ?? 0;
-  });
-
-  const ranges = createMemo(() => {
-    const d = edl.data?.data as { keep_ranges?: { start: number; end: number; reason: string }[] } | undefined;
-    return d?.keep_ranges ?? [];
-  });
-
-  const cuts = createMemo(() => {
-    const d = edl.data?.data as { soft_cuts?: { at: number }[] } | undefined;
-    return d?.soft_cuts ?? [];
-  });
-
-  const spans = createMemo(() => {
-    const d = spansQ.data?.data as { spans?: { text: string; start: number; end: number; label: string }[] } | undefined;
-    return d?.spans ?? [];
-  });
-
-  const captions = createMemo(() => {
-    const d = captionsQ.data?.data as { chunks?: { start: number; end: number; display_words: string[] }[] } | undefined;
-    return d?.chunks ?? [];
-  });
-
-  const transcript = createMemo((): AlignmentTranscript | null => {
-    const aligned = alignedTranscriptQ.data?.data as AlignmentTranscript | undefined;
-    const raw = rawTranscriptQ.data?.data as AlignmentTranscript | undefined;
-    if (aligned?.segments?.length) return aligned;
-    if (raw?.segments?.length) return raw;
-    return null;
-  });
-
-  createEffect(
-    on(transcript, (value) => {
-      if (!alignmentDirty()) {
-        setLocalAlignment(value ? JSON.parse(JSON.stringify(value)) : null);
-      }
-    }),
+  const pxPerSecond = () => MIN_PX_PER_SEC * zoom();
+  const [viewportLeft, setViewportLeft] = createSignal(0);
+  const [viewportWidth, setViewportWidth] = createSignal(1);
+  let zoomWheelAccumulator = 0;
+  let zoomWheelResetHandle: ReturnType<typeof setTimeout> | undefined;
+  let viewportRef: HTMLDivElement | undefined;
+  let innerRef: HTMLDivElement | undefined;
+  const actualDuration = createMemo(() => (project() ? projectDuration(project()!) : 0));
+  const tailDuration = createMemo(() =>
+    Math.min(
+      TIMELINE_TAIL_MAX_SECONDS,
+      Math.max(TIMELINE_TAIL_MIN_SECONDS, actualDuration() * TIMELINE_TAIL_RATIO),
+    )
   );
-
-  const stopAlignmentDrag = () => {
-    alignmentDragCleanup?.();
-    alignmentDragCleanup = undefined;
-  };
-
-  onCleanup(stopAlignmentDrag);
-
-  createEffect(
-    on(jobIdAccessor, () => {
-      stopAlignmentDrag();
-      setAlignmentDirty(false);
-      setActiveAlignmentWord(null);
-    }),
-  );
-
-  createEffect(
-    on(alignmentMode, (active) => {
-      if (!active) {
-        stopAlignmentDrag();
-        setActiveAlignmentWord(null);
-      }
-    }),
-  );
-
-  const alignmentSegments = createMemo(() => localAlignment()?.segments ?? []);
-  const canEditAlignment = () => alignmentMode() && data()?.status !== "running";
-  const hasEditorialData = createMemo(() => duration() > 0 && (ranges().length > 0 || spans().length > 0));
-  const hasAlignmentData = createMemo(() => duration() > 0 && alignmentSegments().length > 0);
-  const hasData = createMemo(() => (alignmentMode() ? hasAlignmentData() : hasEditorialData()));
-
-  const syncAlignmentSegment = (copy: AlignmentTranscript, segIdx: number) => {
-    const segment = copy.segments[segIdx];
-    segment.text = segment.words.map((word) => word.text).join(" ");
-    if (segment.words.length > 0) {
-      segment.start = segment.words[0].start;
-      segment.end = segment.words[segment.words.length - 1].end;
-    }
-  };
-
-  const previousWordEnd = (copy: AlignmentTranscript, segIdx: number, wordIdx: number) => {
-    if (wordIdx > 0) return copy.segments[segIdx].words[wordIdx - 1].end;
-    for (let prevSeg = segIdx - 1; prevSeg >= 0; prevSeg -= 1) {
-      const words = copy.segments[prevSeg].words;
-      if (words.length > 0) return words[words.length - 1].end;
-    }
-    return 0;
-  };
-
-  const nextWordStart = (copy: AlignmentTranscript, segIdx: number, wordIdx: number) => {
-    const words = copy.segments[segIdx].words;
-    if (wordIdx < words.length - 1) return words[wordIdx + 1].start;
-    for (let nextSeg = segIdx + 1; nextSeg < copy.segments.length; nextSeg += 1) {
-      const nextWords = copy.segments[nextSeg].words;
-      if (nextWords.length > 0) return nextWords[0].start;
-    }
-    return duration() > 0 ? duration() : Number.POSITIVE_INFINITY;
-  };
-
-  const updateAlignmentWordEdge = (
-    segIdx: number,
-    wordIdx: number,
-    edge: "start" | "end",
-    nextTime: number,
-  ) => {
-    setLocalAlignment((prev) => {
-      if (!prev) return prev;
-      const copy: AlignmentTranscript = JSON.parse(JSON.stringify(prev));
-      const word = copy.segments[segIdx]?.words[wordIdx];
-      if (!word) return prev;
-
-      if (edge === "start") {
-        const minStart = previousWordEnd(copy, segIdx, wordIdx);
-        const maxStart = word.end - MIN_ALIGNMENT_WORD_DURATION;
-        word.start = Math.max(minStart, Math.min(maxStart, nextTime));
-      } else {
-        const minEnd = word.start + MIN_ALIGNMENT_WORD_DURATION;
-        const maxEnd = nextWordStart(copy, segIdx, wordIdx);
-        word.end = Math.max(minEnd, Math.min(maxEnd, nextTime));
-      }
-
-      syncAlignmentSegment(copy, segIdx);
-      return copy;
-    });
-    setAlignmentDirty(true);
-  };
-
-  const activeAlignmentWordData = createMemo(() => {
-    const active = activeAlignmentWord();
-    if (!active) return null;
-    const segment = alignmentSegments()[active.seg];
-    const word = segment?.words?.[active.word];
-    if (!segment || !word) return null;
-    return { segment, word };
+  const duration = createMemo(() => Math.max(TIMELINE_TAIL_MIN_SECONDS, actualDuration() + tailDuration()));
+  const timelineWidth = () => Math.max(400, duration() * pxPerSecond());
+  const contentWidth = () => Math.max(timelineWidth(), viewportWidth());
+  const toPx = (seconds: number) => seconds * pxPerSecond();
+  const pxToSec = (px: number) => Math.max(0, Math.min(duration(), px / pxPerSecond()));
+  const tracks = createMemo(() => (project() ? sortedTracks(project()!) : []));
+  const viewportFrac = createMemo(() => {
+    const visible = Math.min(viewportWidth(), contentWidth());
+    return Math.max(visible / Math.max(contentWidth(), 1), 0);
   });
-
-  const overviewSegments = createMemo<OverviewSegment[]>(() => {
-    if (alignmentMode()) {
-      return alignmentSegments().map((segment) => ({
-        start: segment.start,
-        end: segment.end,
-        tone: "group",
-      }));
-    }
-
-    if (ranges().length > 0) {
-      return ranges().map((range) => ({
-        start: range.start,
-        end: range.end,
-        tone: "keep",
-      }));
-    }
-
-    return spans().map((span) => ({
-      start: span.start,
-      end: span.end,
-      tone:
-        span.label === "CUT"
-          ? "cut"
-          : span.label === "MAYBE"
-            ? "maybe"
-            : span.label === "SHORTEN"
-              ? "shorten"
-              : "keep",
-    }));
+  const scrollFrac = createMemo(() => {
+    const maxScroll = Math.max(contentWidth() - viewportWidth(), 0);
+    return maxScroll > 0 ? viewportLeft() / maxScroll : 0;
   });
-
-  const overviewCuts = createMemo(() => (alignmentMode() ? [] : cuts()));
-  const showOverview = createMemo(() => hasData() && duration() > 0);
-
-  // Pixel math
-  const totalWidth = () => Math.max(duration() * MIN_PX_PER_SEC * zoom(), 400);
-  const toPx = (sec: number) => (sec / duration()) * totalWidth();
-
-  // Ruler ticks
+  const minimapViewportFrac = createMemo(() => Math.min(viewportFrac(), 1));
+  const minimapViewportLeftFrac = createMemo(() => scrollFrac() * Math.max(1 - minimapViewportFrac(), 0));
+  const rulerScale = createMemo(() => {
+    const minorStep = RULER_MINOR_STEPS.find((step) => step * pxPerSecond() >= RULER_MINOR_TARGET_PX)
+      ?? RULER_MINOR_STEPS[RULER_MINOR_STEPS.length - 1];
+    return {
+      minorStep,
+      labelStep: minorStep * RULER_LABEL_EVERY_N_TICKS,
+    };
+  });
   const rulerTicks = createMemo(() => {
-    const d = duration();
-    if (d <= 0) return [];
-    const z = zoom();
-    // Decide tick interval based on zoom: more zoom = finer ticks
-    let interval = 1;
-    if (z <= 1) interval = Math.max(1, Math.ceil(d / 20));
-    else if (z <= 4) interval = 0.5;
-    else interval = 0.25;
-
-    const ticks: { sec: number; major: boolean }[] = [];
-    for (let t = 0; t <= d; t += interval) {
-      const major = Number.isInteger(t) || t % 1 < 0.001;
-      ticks.push({ sec: t, major });
+    const ticks: Array<{ time: number; labeled: boolean; label: string | null }> = [];
+    const { minorStep, labelStep } = rulerScale();
+    const count = Math.ceil(duration() / minorStep);
+    for (let index = 0; index <= count; index += 1) {
+      const time = Number((index * minorStep).toFixed(4));
+      const labeled = index % RULER_LABEL_EVERY_N_TICKS === 0;
+      ticks.push({
+        time,
+        labeled,
+        label: labeled ? formatRulerLabel(time, labelStep) : null,
+      });
     }
     return ticks;
   });
+  const selectedClip = createMemo(() => project() ? getClip(project()!, selectedClipId()) : null);
+  const selectedLinkedGroupId = createMemo(() => selectedClip()?.linked_group_id ?? null);
+  const selectedSubtitle = createMemo(() =>
+    project() ? project()!.captions.find((caption) => caption.id === selectedSubtitleId()) ?? null : null
+  );
+  const syncViewportMetrics = () => {
+    if (!viewportRef) return;
+    setViewportLeft(viewportRef.scrollLeft);
+    setViewportWidth(viewportRef.clientWidth);
+  };
 
-  // Zoom controls
-  const zoomIn = () => setZoomIdx((i) => Math.min(i + 1, ZOOM_STEPS.length - 1));
-  const zoomOut = () => setZoomIdx((i) => Math.max(i - 1, 0));
-
-  // Wheel zoom on viewport — accumulate pinch delta to reduce sensitivity
-  let viewportRef: HTMLDivElement | undefined;
-  let innerRef: HTMLDivElement | undefined;
-  let zoomAccum = 0;
-  const ZOOM_THRESHOLD = 50; // accumulated pixels before changing zoom step
-  const onWheel = (e: WheelEvent) => {
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      zoomAccum += e.deltaY;
-      if (Math.abs(zoomAccum) >= ZOOM_THRESHOLD) {
-        if (zoomAccum < 0) zoomIn();
-        else zoomOut();
-        zoomAccum = 0;
-      }
+  const getTimeFromPointer = (clientX: number) => {
+    const rect = innerRef?.getBoundingClientRect();
+    if (!rect) return 0;
+    return pxToSec(clientX - rect.left);
+  };
+  const clearDragPreview = () => setDragPreview(null);
+  const updateDragPreview = (assetId: string, trackId: string, clientX: number) => {
+    const current = project();
+    if (!current) return;
+    const asset = assetById(current, assetId);
+    const track = getTrack(current, trackId);
+    if (!asset || !track || !compatibleTrack(asset, track)) {
+      clearDragPreview();
+      return;
     }
+    const start = getTimeFromPointer(clientX);
+    const { clips } = createClipsForAssetDrop(current, asset, track, start);
+    if (!clips.length) {
+      clearDragPreview();
+      return;
+    }
+    setDragPreview({
+      assetId,
+      start: Math.min(...clips.map((clip) => clip.start)),
+      label: asset.label || "Clip",
+      duration: Math.max(...clips.map((clip) => Math.max(0.02, clip.source_out - clip.source_in))),
+      trackIds: [...new Set(clips.map((clip) => clip.track_id))],
+    });
+  };
+  const setZoomIndex = (nextIdx: number, anchorClientX?: number) => {
+    const clamped = Math.max(0, Math.min(ZOOM_STEPS.length - 1, nextIdx));
+    if (clamped === zoomIdx()) return;
+    const viewport = viewportRef;
+    const nextPxPerSecond = MIN_PX_PER_SEC * ZOOM_STEPS[clamped];
+    const anchorOffset = viewport && anchorClientX !== undefined
+      ? anchorClientX - viewport.getBoundingClientRect().left
+      : null;
+    const anchorTime = viewport && anchorOffset !== null
+      ? pxToSec(viewport.scrollLeft + anchorOffset)
+      : null;
+    setZoomIdx(clamped);
+    requestAnimationFrame(() => {
+      if (!viewportRef || anchorOffset === null || anchorTime === null) {
+        syncViewportMetrics();
+        return;
+      }
+      const nextTimelineWidth = Math.max(400, duration() * nextPxPerSecond);
+      const nextContentWidth = Math.max(nextTimelineWidth, viewportRef.clientWidth);
+      const maxScroll = Math.max(nextContentWidth - viewportRef.clientWidth, 0);
+      const nextLeft = (anchorTime * nextPxPerSecond) - anchorOffset;
+      viewportRef.scrollLeft = Math.max(0, Math.min(maxScroll, nextLeft));
+      syncViewportMetrics();
+    });
+  };
+  const centerViewportAtTime = (time: number) => {
+    if (!viewportRef) return;
+    const maxScroll = Math.max(contentWidth() - viewportRef.clientWidth, 0);
+    const nextLeft = toPx(time) - (viewportRef.clientWidth / 2);
+    viewportRef.scrollLeft = Math.max(0, Math.min(maxScroll, nextLeft));
+    syncViewportMetrics();
+  };
+  const onTimelineWheel = (event: WheelEvent) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    const multiplier = event.deltaMode === 1 ? 18 : event.deltaMode === 2 ? 120 : 1;
+    zoomWheelAccumulator += (-event.deltaY * multiplier);
+    clearTimeout(zoomWheelResetHandle);
+    zoomWheelResetHandle = setTimeout(() => {
+      zoomWheelAccumulator = 0;
+    }, 220);
+    if (Math.abs(zoomWheelAccumulator) < ZOOM_WHEEL_THRESHOLD) return;
+    const direction = zoomWheelAccumulator > 0 ? 1 : -1;
+    const stepCount = Math.max(1, Math.floor(Math.abs(zoomWheelAccumulator) / ZOOM_WHEEL_THRESHOLD));
+    zoomWheelAccumulator -= direction * stepCount * ZOOM_WHEEL_THRESHOLD;
+    setZoomIndex(zoomIdx() + (direction * stepCount), event.clientX);
+  };
+  const onMinimapPointerDown = (event: PointerEvent) => {
+    if (!viewportRef) return;
+    const target = event.currentTarget as HTMLDivElement | null;
+    if (!target) return;
+    const rect = target.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    const nextTime = duration() * frac;
+    centerViewportAtTime(nextTime);
+  };
+  const beginMinimapViewportDrag = (event: PointerEvent) => {
+    if (!viewportRef) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const viewportEl = event.currentTarget as HTMLDivElement | null;
+    const contentEl = viewportEl?.parentElement as HTMLDivElement | null;
+    if (!viewportEl || !contentEl) return;
+
+    const contentRect = contentEl.getBoundingClientRect();
+    const viewportRect = viewportEl.getBoundingClientRect();
+    const grabRatio = viewportRect.width > 0
+      ? (event.clientX - viewportRect.left) / viewportRect.width
+      : 0.5;
+    const clickTime = duration() * Math.max(0, Math.min(1, (event.clientX - contentRect.left) / contentRect.width));
+    const startX = event.clientX;
+    let didDrag = false;
+
+    const updateFromClientX = (clientX: number) => {
+      if (!viewportRef) return;
+      const pointerFrac = Math.max(0, Math.min(1, (clientX - contentRect.left) / contentRect.width));
+      const visibleFrac = Math.min(viewportFrac(), 1);
+      const maxViewportLeft = Math.max(1 - visibleFrac, 0);
+      const viewportLeftFrac = Math.max(
+        0,
+        Math.min(maxViewportLeft, pointerFrac - (grabRatio * visibleFrac)),
+      );
+      const normalizedScroll = maxViewportLeft > 0 ? viewportLeftFrac / maxViewportLeft : 0;
+      const maxScroll = Math.max(contentWidth() - viewportRef.clientWidth, 0);
+      viewportRef.scrollLeft = normalizedScroll * maxScroll;
+      syncViewportMetrics();
+    };
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (Math.abs(moveEvent.clientX - startX) > 2) didDrag = true;
+      updateFromClientX(moveEvent.clientX);
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      if (!didDrag) centerViewportAtTime(clickTime);
+    };
+
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
   };
 
-  // Playhead: px position derived from playheadTime signal
-  const playheadPx = () => toPx(playheadTime());
-
-  // Click anywhere on the timeline to seek
-  const pxToSec = (px: number) => {
-    const tw = totalWidth();
-    if (tw <= 0) return 0;
-    return Math.max(0, Math.min(duration(), (px / tw) * duration()));
-  };
-
-  const getTimeFromMouseEvent = (e: MouseEvent): number => {
-    if (!innerRef) return 0;
-    const rect = innerRef.getBoundingClientRect();
-    return pxToSec(e.clientX - rect.left);
-  };
-
-  const onPointerDown = (e: PointerEvent) => {
-    // Only left button
-    if (e.button !== 0) return;
-    e.preventDefault();
-    const t = getTimeFromMouseEvent(e);
-    setSeekRequest(t);
-
-    // Start drag
-    const onMove = (ev: PointerEvent) => {
-      const t2 = getTimeFromMouseEvent(ev);
-      setSeekRequest(t2);
+  const beginClipDrag = (event: PointerEvent, clip: TimelineClip) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const linked = linkedClips(project()!, clip.id);
+    const anchorStart = Math.min(...linked.map((item) => item.start));
+    const origins = new Map(
+      linked.map((item) => [item.id, { start: item.start, trackId: item.track_id }]),
+    );
+    const onMove = (moveEvent: PointerEvent) => {
+      const deltaSec = (moveEvent.clientX - startX) / pxPerSecond();
+      const desiredStart = Math.max(0, anchorStart + deltaSec);
+      props.updateProject((current) => {
+        const resolvedStart = resolveClipGroupStart(
+          current,
+          linked,
+          desiredStart,
+          linked.map((item) => item.id),
+        );
+        const resolvedDelta = resolvedStart - anchorStart;
+        const updates = linked.flatMap((item) => {
+          const currentClip = getClip(current, item.id);
+          const origin = origins.get(item.id);
+          if (!currentClip || !origin) return [];
+          return [{
+            ...currentClip,
+            start: Math.max(0, origin.start + resolvedDelta),
+            track_id: origin.trackId,
+          }];
+        });
+        return upsertClips(current, updates);
+      });
     };
     const onUp = () => {
       document.removeEventListener("pointermove", onMove);
@@ -1185,445 +1169,401 @@ const TimelinePanel: Component = () => {
     document.addEventListener("pointerup", onUp);
   };
 
-  // Auto-follow: scroll viewport to keep playhead visible
-  createEffect(() => {
-    if (!autoFollow() || !viewportRef) return;
-    const px = playheadPx();
-    const vw = viewportRef.clientWidth;
-    const scrollLeft = viewportRef.scrollLeft;
-    // If playhead is outside the visible area, scroll to center it
-    if (px < scrollLeft + 40 || px > scrollLeft + vw - 40) {
-      viewportRef.scrollLeft = Math.max(0, px - vw / 3);
-    }
-  });
-
-  // Track scroll position for minimap viewport indicator
-  const [scrollFrac, setScrollFrac] = createSignal(0);
-  const [viewFrac, setViewFrac] = createSignal(1);
-  const updateScrollFracs = () => {
-    if (!viewportRef) return;
-    const tw = totalWidth();
-    if (tw <= 0) return;
-    setScrollFrac(viewportRef.scrollLeft / tw);
-    setViewFrac(Math.min(1, viewportRef.clientWidth / tw));
-  };
-
-  createEffect(() => {
-    showOverview();
-    totalWidth();
-    queueMicrotask(() => updateScrollFracs());
-  });
-
-  // Tooltip state
-  const [tooltip, setTooltip] = createSignal<{ text: string; x: number; y: number } | null>(null);
-
-  const onSegmentEnter = (e: MouseEvent, text: string) => {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    setTooltip({ text, x: rect.left + rect.width / 2, y: rect.top });
-  };
-  const onSegmentLeave = () => setTooltip(null);
-
-  const edgeHitZone = (el: HTMLElement) => {
-    const rect = el.getBoundingClientRect();
-    return Math.min(10, Math.max(4, rect.width * 0.25));
-  };
-
-  const edgeFromPointer = (el: HTMLElement, clientX: number): "start" | "end" | null => {
-    const rect = el.getBoundingClientRect();
-    const zone = edgeHitZone(el);
-    if (clientX - rect.left <= zone) return "start";
-    if (rect.right - clientX <= zone) return "end";
-    return null;
-  };
-
-  const beginAlignmentResize = (
-    event: PointerEvent,
-    segIdx: number,
-    wordIdx: number,
-    edge: "start" | "end",
-  ) => {
-    if (!innerRef || !canEditAlignment()) return;
+  const beginTrim = (event: PointerEvent, clip: TimelineClip, edge: "start" | "end") => {
     event.preventDefault();
     event.stopPropagation();
-    setActiveAlignmentWord({ seg: segIdx, word: wordIdx });
-
-    const applyClientX = (clientX: number) => {
-      const rect = innerRef!.getBoundingClientRect();
-      const nextTime = pxToSec(clientX - rect.left);
-      updateAlignmentWordEdge(segIdx, wordIdx, edge, nextTime);
-      setSeekRequest(nextTime);
+    const linked = linkedClips(project()!, clip.id);
+    const draggedOrigin = {
+      start: clip.start,
+      sourceIn: clip.source_in,
+      sourceOut: clip.source_out,
     };
-
-    stopAlignmentDrag();
-    applyClientX(event.clientX);
-
-    const onMove = (moveEvent: PointerEvent) => applyClientX(moveEvent.clientX);
-    const onUp = () => stopAlignmentDrag();
-
-    document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", onUp);
-    alignmentDragCleanup = () => {
+    const origins = new Map(
+      linked.map((item) => [
+        item.id,
+        {
+          start: item.start,
+          sourceIn: item.source_in,
+          sourceOut: item.source_out,
+        },
+      ]),
+    );
+    const onMove = (moveEvent: PointerEvent) => {
+      const nextTime = getTimeFromPointer(moveEvent.clientX);
+      props.updateProject((current) => {
+        if (edge === "start") {
+          const desiredDelta = nextTime - draggedOrigin.start;
+          const resolvedDelta = resolveClipGroupTrimStartDelta(
+            current,
+            linked,
+            desiredDelta,
+            linked.map((item) => item.id),
+          );
+          const updates = linked.flatMap((item) => {
+            const currentClip = getClip(current, item.id);
+            const origin = origins.get(item.id);
+            if (!currentClip || !origin) return [];
+            return [{
+              ...currentClip,
+              start: origin.start + resolvedDelta,
+              source_in: origin.sourceIn + resolvedDelta,
+            }];
+          });
+          return upsertClips(current, updates);
+        }
+        const desiredDelta =
+          nextTime - (draggedOrigin.start + (draggedOrigin.sourceOut - draggedOrigin.sourceIn));
+        const resolvedDelta = resolveClipGroupTrimEndDelta(
+          current,
+          linked,
+          desiredDelta,
+          linked.map((item) => item.id),
+        );
+        const updates = linked.flatMap((item) => {
+          const currentClip = getClip(current, item.id);
+          const origin = origins.get(item.id);
+          if (!currentClip || !origin) return [];
+          return [{
+            ...currentClip,
+            source_out: origin.sourceOut + resolvedDelta,
+          }];
+        });
+        return upsertClips(current, updates);
+      });
+    };
+    const onUp = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
     };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
   };
 
-  const saveAlignment = async () => {
-    const snapshot = localAlignment();
-    const jobId = jobIdAccessor();
-    if (!snapshot || !jobId) return;
-    await updateAlignmentMut.mutateAsync({
-      jobId,
-      transcript: snapshot,
-      target: "transcription",
-    });
-    setAlignmentDirty(false);
+  const beginRulerScrub = (event: PointerEvent) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget as HTMLDivElement | null;
+    const pointerId = event.pointerId;
+    const seekToClientX = (clientX: number) => setSeekRequest(getTimeFromPointer(clientX));
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      if (target?.hasPointerCapture?.(pointerId)) target.releasePointerCapture(pointerId);
+    };
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      seekToClientX(moveEvent.clientX);
+    };
+    const onUp = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      seekToClientX(moveEvent.clientX);
+      cleanup();
+    };
+
+    seekToClientX(event.clientX);
+    target?.setPointerCapture?.(pointerId);
+    document.body.style.cursor = "ew-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
   };
 
-  const showWords = () => spans().length > 0;
-  const showCaptions = () => captions().length > 0;
-  const showCuts = () => cuts().length > 0;
-  const placeholderText = createMemo(() => {
-    if (alignmentMode()) {
-      if (duration() <= 0) return "La timeline della transcription apparira dopo ingest.";
-      return "Esegui transcription per modificare parole e timing.";
+  createEffect(() => {
+    if (!viewportRef || !autoFollow()) return;
+    const px = toPx(playheadTime());
+    const vw = viewportRef.clientWidth;
+    if (px < viewportRef.scrollLeft + 40 || px > viewportRef.scrollLeft + vw - 40) {
+      viewportRef.scrollLeft = Math.max(0, px - vw / 3);
+      syncViewportMetrics();
     }
-    return "La timeline apparira dopo lo step editorial";
   });
+  createEffect(() => {
+    timelineWidth();
+    contentWidth();
+    duration();
+    requestAnimationFrame(syncViewportMetrics);
+  });
+  createEffect(() => {
+    if (!viewportRef) return;
+    syncViewportMetrics();
+    const onScroll = () => syncViewportMetrics();
+    viewportRef.addEventListener("scroll", onScroll, { passive: true });
+    const observer = new ResizeObserver(syncViewportMetrics);
+    observer.observe(viewportRef);
+    const onAssetDragEnd = () => clearDragPreview();
+    window.addEventListener("fellini:asset-drag-end", onAssetDragEnd as EventListener);
+    onCleanup(() => {
+      viewportRef?.removeEventListener("scroll", onScroll);
+      observer.disconnect();
+      window.removeEventListener("fellini:asset-drag-end", onAssetDragEnd as EventListener);
+    });
+  });
+  onCleanup(() => clearTimeout(zoomWheelResetHandle));
 
   return (
     <div class="panel timeline-panel">
       <div class="panel-header">
         <span class="panel-title">Timeline</span>
         <div class="timeline-toolbar">
-          <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
-          <Show when={alignmentMode()}>
-            <span class="timeline-mode-tag">Transcription</span>
-          </Show>
-          <Show when={alignmentMode() && activeAlignmentWordData()}>
-            {(active) => (
-              <span class="timeline-selection-readout">
-                {active().word.text} {fmtTimePrecise(active().word.start)} - {fmtTimePrecise(active().word.end)}
-              </span>
-            )}
-          </Show>
           <button
             type="button"
-            class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`}
-            onClick={() => setAutoFollow(!autoFollow())}
-            title="Auto-follow playhead"
+            class="btn btn-ghost btn-xs"
+            title="Frame precedente (Freccia sinistra)"
+            onClick={() => setFrameStepRequest(-1)}
           >
+            ←
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs"
+            title="Play/Pause (Space)"
+            onClick={() => setPlayPauseRequest((value) => value + 1)}
+          >
+            Space
+          </button>
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs"
+            title="Frame successivo (Freccia destra)"
+            onClick={() => setFrameStepRequest(1)}
+          >
+            →
+          </button>
+          <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
+          <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
             Follow
           </button>
-          <button type="button" class="btn btn-ghost btn-xs" onClick={zoomOut} disabled={zoomIdx() === 0}>-</button>
+          <button type="button" class="btn btn-ghost btn-xs" onClick={() => setZoomIndex(zoomIdx() - 1)}>-</button>
           <span class="timeline-zoom-label">{zoom()}x</span>
-          <button type="button" class="btn btn-ghost btn-xs" onClick={zoomIn} disabled={zoomIdx() === ZOOM_STEPS.length - 1}>+</button>
-          <Show when={alignmentMode() && alignmentDirty()}>
+          <button type="button" class="btn btn-ghost btn-xs" onClick={() => setZoomIndex(zoomIdx() + 1)}>+</button>
+          <Show when={selectedClip()}>
             <button
               type="button"
-              class="btn btn-primary btn-xs"
-              disabled={updateAlignmentMut.isPending || !canEditAlignment()}
-              onClick={saveAlignment}
+              class="btn btn-ghost btn-xs"
+              onClick={() => {
+                if (!selectedClip()) return;
+                props.updateProject((current) => splitClip(current, selectedClip()!.id, playheadTime()));
+              }}
             >
-              {updateAlignmentMut.isPending ? "Salvataggio..." : "Salva transcript"}
+              Split
             </button>
           </Show>
+          <span class="timeline-selection-readout">
+            {selectedClip()
+              ? `Clip ${assetById(project()!, selectedClip()!.asset_id)?.label || ""}`
+              : selectedSubtitle()
+                ? "Subtitle block"
+                : selectedTrackId()
+                  ? `Lane ${getTrack(project()!, selectedTrackId())?.name || ""}`
+                  : "Nessuna selezione"}
+          </span>
         </div>
       </div>
-      <div
-        class="placeholder"
-        style={{ display: hasData() ? "none" : "block" }}
-      >
-        {placeholderText()}
-      </div>
-      <div
-        class="timeline-body"
-        style={{ display: hasData() ? "grid" : "none" }}
-      >
-        {/* Left column: fixed labels */}
-        <div class="tl-labels">
-          <div class="tl-label tl-label--ruler" />
-          <Show
-            when={alignmentMode()}
-            fallback={
-              <>
-                <div class="tl-label tl-label--edl">EDL</div>
-                <div class="tl-label tl-label--words" style={{ display: showWords() ? "flex" : "none" }}>Words</div>
-                <div class="tl-label tl-label--captions" style={{ display: showCaptions() ? "flex" : "none" }}>Captions</div>
-                <div class="tl-label tl-label--cuts" style={{ display: showCuts() ? "flex" : "none" }}>Cuts</div>
-              </>
-            }
-          >
-            <>
-              <div class="tl-label tl-label--groups">Groups</div>
-              <div class="tl-label tl-label--align-words">Words</div>
-            </>
-          </Show>
-        </div>
-
-        {/* Right column: scrollable tracks */}
-        <div
-          ref={viewportRef}
-          class="timeline-viewport"
-          onWheel={onWheel}
-          onScroll={updateScrollFracs}
-        >
-          <div
-            ref={innerRef}
-            class="timeline-scroll-inner"
-            style={{ width: `${totalWidth()}px` }}
-            onPointerDown={onPointerDown}
-          >
-            {/* Playhead */}
-            <div class="tl-playhead" style={{ left: `${playheadPx()}px` }} />
-
-            {/* Ruler */}
-            <div class="tl-ruler">
-              <For each={rulerTicks()}>
-                {(tick) => (
-                  <>
-                    <div
-                      class={`tl-ruler-tick${tick.major ? " major" : ""}`}
-                      style={{ left: `${toPx(tick.sec)}px` }}
-                    />
-                    {tick.major && (
-                      <span class="tl-ruler-label" style={{ left: `${toPx(tick.sec)}px` }}>
-                        {fmtTimePrecise(tick.sec)}
-                      </span>
-                    )}
-                  </>
+      <Show when={project()} fallback={<div class="placeholder">Timeline non disponibile</div>}>
+        <div class="timeline-shell">
+          <div class="timeline-body">
+            <div class="tl-labels">
+              <div class="tl-label tl-label--ruler" />
+              <For each={tracks()}>
+                {(track) => (
+                  <button
+                    type="button"
+                    class={`tl-label tl-label--dynamic${selectedTrackId() === track.id ? " active" : ""}`}
+                    style={{ height: `${trackHeight(track.kind)}px` }}
+                    onClick={() => {
+                      setSelectedTrackId(track.id);
+                      setSelectedClipId(null);
+                      setSelectedSubtitleId(null);
+                    }}
+                  >
+                    {track.name}
+                  </button>
                 )}
               </For>
             </div>
-
-            <Show
-              when={alignmentMode()}
-              fallback={
-                <>
-                  {/* Track: EDL Keep Ranges */}
-                  <div class="tl-track tl-track--edl">
-                    <For each={ranges()}>
-                      {(r) => {
-                        const tip = `KEEP  ${fmtTimePrecise(r.start)} → ${fmtTimePrecise(r.end)}\n${r.reason}`;
-                        return (
-                          <div
-                            class="tl-seg tl-seg--keep"
-                            style={{ left: `${toPx(r.start)}px`, width: `${Math.max(3, toPx(r.end) - toPx(r.start))}px` }}
-                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                            onMouseLeave={onSegmentLeave}
-                          >
-                            <span>{r.reason}</span>
-                          </div>
-                        );
-                      }}
-                    </For>
-                  </div>
-
-                  {/* Track: Labeled Words */}
-                  <div class="tl-track tl-track--words" style={{ display: showWords() ? "block" : "none" }}>
-                    <For each={spans()}>
-                      {(s) => {
-                        const tip = `"${s.text}"  [${s.label}]\n${fmtTimePrecise(s.start)} → ${fmtTimePrecise(s.end)}`;
-                        return (
-                          <div
-                            class={`tl-seg tl-seg--word ${s.label}`}
-                            style={{ left: `${toPx(s.start)}px`, width: `${Math.max(3, toPx(s.end) - toPx(s.start))}px` }}
-                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                            onMouseLeave={onSegmentLeave}
-                          >
-                            <span>{s.text}</span>
-                          </div>
-                        );
-                      }}
-                    </For>
-                  </div>
-
-                  {/* Track: Caption Chunks */}
-                  <div class="tl-track tl-track--captions" style={{ display: showCaptions() ? "block" : "none" }}>
-                    <For each={captions()}>
-                      {(c) => {
-                        const words = (c.display_words || []).join(" ");
-                        const tip = `Caption: "${words}"\n${fmtTimePrecise(c.start)} → ${fmtTimePrecise(c.end)}`;
-                        return (
-                          <div
-                            class="tl-seg tl-seg--caption"
-                            style={{ left: `${toPx(c.start)}px`, width: `${Math.max(3, toPx(c.end) - toPx(c.start))}px` }}
-                            onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                            onMouseLeave={onSegmentLeave}
-                          >
-                            <span>{words}</span>
-                          </div>
-                        );
-                      }}
-                    </For>
-                  </div>
-
-                  {/* Track: Soft Cuts */}
-                  <div class="tl-track tl-track--cuts" style={{ display: showCuts() ? "block" : "none" }}>
-                    <For each={cuts()}>
-                      {(c) => (
-                        <div
-                          class="tl-cut"
-                          style={{ left: `${toPx(c.at)}px` }}
-                          onMouseEnter={(e) => onSegmentEnter(e, `Cut @ ${fmtTimePrecise(c.at)}\nfade: ${c.at}ms`)}
-                          onMouseLeave={onSegmentLeave}
-                        />
-                      )}
-                    </For>
-                  </div>
-                </>
-              }
+            <div
+              ref={viewportRef}
+              class="timeline-viewport"
+              onWheel={onTimelineWheel}
+              onDragLeave={(e) => {
+                const nextTarget = e.relatedTarget;
+                if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+                clearDragPreview();
+              }}
+              onDrop={() => clearDragPreview()}
             >
-              <>
-                <div class="tl-track tl-track--groups">
-                  <For each={alignmentSegments()}>
-                    {(segment, segIdx) => {
-                      const tip = `Group ${segIdx() + 1}\n${fmtTimePrecise(segment.start)} → ${fmtTimePrecise(segment.end)}\n${segment.text}`;
-                      return (
-                        <div
-                          class="tl-seg tl-seg--group"
-                          style={{
-                            left: `${toPx(segment.start)}px`,
-                            width: `${Math.max(4, toPx(segment.end) - toPx(segment.start))}px`,
-                          }}
-                          onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                          onMouseLeave={onSegmentLeave}
-                        >
-                          <span>{segment.text}</span>
-                        </div>
-                      );
-                    }}
-                  </For>
-                </div>
-                <div class="tl-track tl-track--align-words">
-                  <For each={alignmentSegments()}>
-                    {(segment, segIdx) => (
-                      <For each={segment.words}>
-                        {(word, wordIdx) => {
-                          const isActive = () => {
-                            const active = activeAlignmentWord();
-                            return active?.seg === segIdx() && active.word === wordIdx();
-                          };
-                          const tip = `${word.text}\n${fmtTimePrecise(word.start)} → ${fmtTimePrecise(word.end)}`;
-                          return (
-                            <button
-                              type="button"
-                              class={`tl-seg tl-seg--align-word${isActive() ? " is-active" : ""}`}
-                              style={{
-                                left: `${toPx(word.start)}px`,
-                                width: `${Math.max(6, toPx(word.end) - toPx(word.start))}px`,
-                              }}
-                              onMouseEnter={(e) => onSegmentEnter(e, tip)}
-                              onMouseLeave={(e) => {
-                                (e.currentTarget as HTMLButtonElement).style.cursor = canEditAlignment() ? "pointer" : "default";
-                                onSegmentLeave();
-                              }}
-                              onPointerMove={(e) => {
-                                const edge = canEditAlignment() ? edgeFromPointer(e.currentTarget, e.clientX) : null;
-                                e.currentTarget.style.cursor = edge ? "ew-resize" : (canEditAlignment() ? "pointer" : "default");
-                              }}
-                              onPointerDown={(e) => {
-                                if (!canEditAlignment()) return;
-                                const edge = edgeFromPointer(e.currentTarget, e.clientX);
-                                if (edge) {
-                                  beginAlignmentResize(e, segIdx(), wordIdx(), edge);
-                                  return;
-                                }
-                                e.stopPropagation();
-                                setActiveAlignmentWord({ seg: segIdx(), word: wordIdx() });
-                                setSeekRequest(word.start);
-                              }}
-                              onDblClick={() => setSeekRequest(word.start)}
-                            >
-                              <span>{word.text}</span>
-                            </button>
-                          );
-                        }}
-                      </For>
+              <div
+                ref={innerRef}
+                class="timeline-scroll-inner"
+                style={{ width: `${contentWidth()}px` }}
+              >
+                <div class="tl-playhead" style={{ left: `${toPx(playheadTime())}px` }} />
+                <div class="tl-ruler" onPointerDown={beginRulerScrub}>
+                  <For each={rulerTicks()}>
+                    {(tick) => (
+                      <>
+                        <div class={`tl-ruler-tick${tick.labeled ? " major" : ""}`} style={{ left: `${toPx(tick.time)}px` }} />
+                        <Show when={tick.labeled}>
+                          <span class="tl-ruler-label" style={{ left: `${toPx(tick.time)}px` }}>{tick.label}</span>
+                        </Show>
+                      </>
                     )}
                   </For>
                 </div>
-              </>
-            </Show>
+                <For each={tracks()}>
+                  {(track) => (
+                    <div
+                      class={`tl-track tl-track--project tl-track--${track.kind}`}
+                      style={{ height: `${trackHeight(track.kind)}px` }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer!.dropEffect = "copy";
+                        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
+                        if (!assetId) {
+                          clearDragPreview();
+                          return;
+                        }
+                        updateDragPreview(assetId, track.id, e.clientX);
+                      }}
+                      onDragLeave={(e) => {
+                        const nextTarget = e.relatedTarget;
+                        if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+                        const preview = dragPreview();
+                        if (preview?.trackIds.includes(track.id)) clearDragPreview();
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const current = project();
+                        if (!current) return;
+                        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
+                        if (!assetId) return;
+                        const asset = assetById(current, assetId);
+                        if (!asset || !compatibleTrack(asset, track)) return;
+                        const start = getTimeFromPointer(e.clientX);
+                        const { clips, primaryClipId } = createClipsForAssetDrop(current, asset, track, start);
+                        if (!clips.length || !primaryClipId) return;
+                        props.updateProject((value) => upsertClips(value, clips));
+                        clearDragPreview();
+                        setSelectedTrackId(track.id);
+                        setSelectedClipId(primaryClipId);
+                        setSelectedSubtitleId(null);
+                      }}
+                    >
+                      <Show when={dragPreview() && dragPreview()!.trackIds.includes(track.id)}>
+                        <div class="tl-drop-caret" style={{ left: `${toPx(dragPreview()!.start)}px` }} />
+                        <div
+                          class={`tl-seg tl-seg--clip tl-seg--ghost tl-seg--${track.kind}`}
+                          style={{
+                            left: `${toPx(dragPreview()!.start)}px`,
+                            width: `${Math.max(8, dragPreview()!.duration * pxPerSecond())}px`,
+                          }}
+                        >
+                          <span>{dragPreview()!.label}</span>
+                        </div>
+                      </Show>
+                      <Show when={track.kind !== "subtitle"}>
+                        <For each={trackClips(project()!, track.id)}>
+                          {(clip) => (
+                            <button
+                              type="button"
+                              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
+                              style={{
+                                left: `${toPx(clip.start)}px`,
+                                width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
+                              }}
+                              onPointerDown={(e) => beginClipDrag(e, clip)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedClipId(clip.id);
+                                setSelectedTrackId(track.id);
+                                setSelectedSubtitleId(null);
+                                setSeekRequest(clip.start);
+                              }}
+                            >
+                              <span>{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
+                              <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
+                              <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
+                            </button>
+                          )}
+                        </For>
+                      </Show>
+                      <Show when={track.kind === "subtitle"}>
+                        <For each={trackSubtitles(project()!, track.id)}>
+                          {(caption) => (
+                            <button
+                              type="button"
+                              class={`tl-seg tl-seg--subtitle${selectedSubtitleId() === caption.id ? " is-active" : ""}`}
+                              style={{
+                                left: `${toPx(caption.start)}px`,
+                                width: `${Math.max(8, (caption.end - caption.start) * pxPerSecond())}px`,
+                              }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedSubtitleId(caption.id);
+                                setSelectedTrackId(track.id);
+                                setSelectedClipId(null);
+                                setSeekRequest(caption.start);
+                              }}
+                            >
+                              <span>{caption.text}</span>
+                            </button>
+                          )}
+                        </For>
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+          </div>
+          <div class="tl-minimap" style={{ display: "grid" }}>
+            <div class="tl-minimap-label">Overview</div>
+            <div class="tl-minimap-content" onPointerDown={onMinimapPointerDown}>
+              <For each={project()!.clips}>
+                {(clip) => {
+                  const track = getTrack(project()!, clip.track_id);
+                  return (
+                    <div
+                      class={`tl-mini-seg tl-mini-seg--${track?.kind ?? "video"}`}
+                      style={{
+                        left: `${(clip.start / duration()) * 100}%`,
+                        width: `${Math.max(0.5, ((clip.source_out - clip.source_in) / duration()) * 100)}%`,
+                      }}
+                    />
+                  );
+                }}
+              </For>
+              <For each={project()!.captions}>
+                {(caption) => (
+                  <div
+                    class="tl-mini-seg tl-mini-seg--subtitle"
+                    style={{
+                      left: `${(caption.start / duration()) * 100}%`,
+                      width: `${Math.max(0.5, ((caption.end - caption.start) / duration()) * 100)}%`,
+                    }}
+                  />
+                )}
+              </For>
+              <div class="tl-mini-playhead" style={{ left: `${(playheadTime() / duration()) * 100}%` }} />
+              <div
+                class="tl-mini-viewport"
+                style={{
+                  left: `${minimapViewportLeftFrac() * 100}%`,
+                  width: `${Math.max(minimapViewportFrac() * 100, 1)}%`,
+                }}
+                onPointerDown={beginMinimapViewportDrag}
+              />
+            </div>
           </div>
         </div>
-      </div>
-
-      {/* Minimap — shows entire timeline overview when zoomed in */}
-      <div
-        class="tl-minimap"
-        style={{ display: showOverview() ? "grid" : "none" }}
-      >
-        <div class="tl-minimap-label">Overall</div>
-        <div
-          class="tl-minimap-content"
-          onPointerDown={(e) => {
-            if (!viewportRef) return;
-            e.preventDefault();
-            const rect = e.currentTarget.getBoundingClientRect();
-            const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            viewportRef.scrollLeft = frac * totalWidth() - viewportRef.clientWidth / 2;
-
-            const onMove = (ev: PointerEvent) => {
-              const f2 = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
-              viewportRef!.scrollLeft = f2 * totalWidth() - viewportRef!.clientWidth / 2;
-            };
-            const onUp = () => {
-              document.removeEventListener("pointermove", onMove);
-              document.removeEventListener("pointerup", onUp);
-            };
-            document.addEventListener("pointermove", onMove);
-            document.addEventListener("pointerup", onUp);
-          }}
-        >
-          <For each={overviewSegments()}>
-            {(segment) => (
-              <div
-                class={`tl-mini-seg tl-mini-seg--${segment.tone}`}
-                style={{
-                  left: `${(segment.start / duration()) * 100}%`,
-                  width: `${Math.max(0.3, ((segment.end - segment.start) / duration()) * 100)}%`,
-                }}
-              />
-            )}
-          </For>
-          <For each={overviewCuts()}>
-            {(c) => (
-              <div
-                class="tl-mini-cut"
-                style={{ left: `${(c.at / duration()) * 100}%` }}
-              />
-            )}
-          </For>
-          <div
-            class="tl-mini-playhead"
-            style={{ left: `${duration() > 0 ? (playheadTime() / duration()) * 100 : 0}%` }}
-          />
-          <div
-            class="tl-mini-viewport"
-            style={{
-              left: `${scrollFrac() * 100}%`,
-              width: `${viewFrac() * 100}%`,
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Tooltip */}
-      <div
-        class="tl-tooltip"
-        style={{
-          display: tooltip() ? "block" : "none",
-          left: `${tooltip()?.x ?? 0}px`,
-          top: `${(tooltip()?.y ?? 0) - 6}px`,
-        }}
-      >
-        {tooltip()?.text}
-      </div>
+      </Show>
     </div>
   );
 };
-
-
 
 export default Workspace;

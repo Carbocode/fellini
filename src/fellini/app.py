@@ -11,20 +11,25 @@ from fastapi.staticfiles import StaticFiles
 
 from fellini.domain.models import (
     DEFAULT_STEPS,
+    EditorialProject,
     ExecutionMode,
+    InputAsset,
     JobRequest,
     JobSnapshot,
     JobStatus,
     RunProfile,
     StepName,
     StepStatus,
+    TimelineTrackKind,
+    TranscriptArtifact,
 )
 from fellini.log import configure_logging, get_logger
+from fellini.pipeline.context import PipelineContext
+from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings, load_settings
-from fellini.pipeline.context import PipelineContext
 
 logger = get_logger(__name__)
 
@@ -112,6 +117,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     configure_logging(app_settings.log_level)
     store = JobStore(app_settings)
     manager = JobManager(app_settings, store=store)
+    editorial_projects = EditorialProjectStore(app_settings)
     logger.info(
         "app.create settings workspace_root=%s jobs_root=%s host=%s port=%s log_level=%s",
         app_settings.workspace_root,
@@ -125,6 +131,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.settings = app_settings
     app.state.store = store
     app.state.manager = manager
+    app.state.editorial_projects = editorial_projects
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -171,6 +178,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         context.load_state()
         return context
 
+    def ensure_editorial_project(snapshot: JobSnapshot):
+        context = build_context(snapshot)
+        return editorial_projects.ensure(context)
+
     def step_readiness(
         snapshot: JobSnapshot,
         step_name: StepName,
@@ -195,27 +206,26 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if step_name == StepName.transcription:
             if not context.state.mezzanine_path or not Path(context.state.mezzanine_path).exists():
                 return False, "Transcription richiede l'ingest completato."
-            if not context.state.audio_path or not Path(context.state.audio_path).exists():
-                return False, "Audio canonico mancante. Riesegui ingest."
+            project = editorial_projects.ensure(context)
+            if not any(track.kind == TimelineTrackKind.audio for track in project.tracks):
+                return False, "Seleziona o crea almeno una audio lane."
             return True, ""
 
         if step_name == StepName.editorial:
             if not context.state.mezzanine_path or not Path(context.state.mezzanine_path).exists():
                 return False, "Editorial richiede l'ingest completato."
-            transcript = context.state.aligned_transcript or context.state.raw_transcript
-            if not transcript or not transcript.segments:
-                return False, "Editorial richiede una transcription disponibile."
+            project = editorial_projects.ensure(context)
+            story_lane = editorial_projects.story_lane(project)
+            story_transcription = editorial_projects.story_lane_transcription(project)
+            legacy_transcript = context.state.aligned_transcript or context.state.raw_transcript
+            if not story_lane or (not story_transcription and not legacy_transcript):
+                return False, "Editorial richiede una story lane trascritta."
             return True, ""
 
         if step_name == StepName.render:
-            if not context.state.mezzanine_path or not Path(context.state.mezzanine_path).exists():
-                return False, "Render richiede l'ingest completato."
-            if not context.state.edl or not context.state.edl.keep_ranges:
-                return False, "Render richiede uno step editorial valido."
-            if not context.state.render_plan:
-                return False, "Render plan mancante. Riesegui editorial."
-            if snapshot.request.toggles.render_captioned and not context.state.captions:
-                return False, "Render captioned richiede i captions dello step editorial."
+            project = editorial_projects.ensure(context)
+            if not any(clip.enabled for clip in project.clips):
+                return False, "Render richiede una timeline con clip attive."
             return True, ""
 
         return False, "Unknown step."
@@ -238,10 +248,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if not plan.clean_output:
                 return []
             required.append(plan.clean_output)
-        if snapshot.request.toggles.render_captioned:
-            if not plan.captioned_output:
-                return []
-            required.append(plan.captioned_output)
 
         resolved: list[str] = []
         for relative_path in required:
@@ -265,11 +271,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             StepName.editorial: (
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
-                "07_caption_display.json",
                 "09_render_plan.json",
             ),
             StepName.render: (
-                "08_subtitles.ass",
                 "09_render_plan.json",
             ),
         }
@@ -299,16 +303,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             and bool(context.state.audio_path)
             and Path(context.state.audio_path).exists()
         )
-        transcript = context.state.aligned_transcript or context.state.raw_transcript
-        transcription_ready = bool(transcript and transcript.segments)
-        editorial_ready = bool(
-            context.state.edl
-            and context.state.render_plan
-            and (
-                not snapshot.request.toggles.render_captioned
-                or context.state.captions
-            )
+        project = editorial_projects.ensure(context)
+        story_transcription = editorial_projects.story_lane_transcription(project)
+        transcription_ready = story_transcription is not None or bool(
+            context.state.aligned_transcript or context.state.raw_transcript
         )
+        editorial_ready = bool(context.state.edl and context.state.render_plan)
 
         recovered_completion = {
             StepName.ingest: ingest_ready,
@@ -344,6 +344,106 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             step.can_run = can_run and enriched.status != JobStatus.running
             step.blocked_reason = "Run already in progress." if enriched.status == JobStatus.running else blocked_reason
         return enriched
+
+    def sync_story_lane_artifacts(
+        *,
+        context: PipelineContext,
+        transcript: TranscriptArtifact,
+        speech_segments: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        artifacts: list[str] = []
+        if speech_segments is not None:
+            artifacts.append(
+                context.save_json_artifact("02_vad_segments.json", {"segments": speech_segments})
+            )
+        artifacts.append(context.save_json_artifact("03_transcript_raw.json", transcript))
+        artifacts.append(context.save_json_artifact("04_transcript_aligned.json", transcript))
+        context.state.raw_transcript = transcript
+        context.state.aligned_transcript = transcript
+        context.save_state()
+        return artifacts
+
+    def run_lane_transcription(job_id: str, lane_id: str) -> dict[str, Any]:
+        snapshot = enrich_snapshot(_require_job(store, job_id))
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="A run is already in progress for this job.")
+
+        context = build_context(snapshot)
+        project = editorial_projects.ensure(context)
+        lane = next((track for track in project.tracks if track.id == lane_id), None)
+        if not lane or lane.kind != TimelineTrackKind.audio:
+            raise HTTPException(status_code=404, detail="Audio lane not found.")
+
+        store.invalidate_workspace_from_step(job_id, StepName.transcription)
+        store.reset_from_step(job_id, StepName.transcription)
+        store.mark_running(job_id)
+        store.begin_step(job_id, StepName.transcription, f"Transcribing audio lane {lane.name}")
+
+        bounce_path = context.workspace.temp_path(f"lane_{lane_id}_bounce.wav")
+        try:
+            store.update_step_progress(job_id, StepName.transcription, 15, "Bounce della audio lane")
+            context.ffmpeg.mix_audio_lane(
+                workspace_root=context.workspace.job_dir,
+                project=project,
+                track_id=lane_id,
+                target=bounce_path,
+            )
+
+            store.update_step_progress(job_id, StepName.transcription, 45, "Trascrizione della lane")
+            speech_segments, transcript = context.transcriber.transcribe(
+                bounce_path,
+                context.request.transcription,
+                context.request.language,
+            )
+
+            store.update_step_progress(job_id, StepName.transcription, 70, "Allineamento della lane")
+            aligned = context.aligner.align(
+                bounce_path,
+                transcript,
+                context.request.transcription,
+                context.request.language,
+                context.request.toggles.use_whisperx,
+            )
+            saved_project = editorial_projects.set_lane_transcription(
+                context.workspace,
+                project=project,
+                lane_id=lane_id,
+                transcript=aligned,
+                source_audio_path=context.workspace.relative(bounce_path),
+            )
+
+            artifacts = [context.workspace.relative(context.workspace.editorial_project_path)]
+            story_lane = editorial_projects.story_lane(saved_project)
+            if story_lane and story_lane.id == lane_id:
+                artifacts.extend(
+                    sync_story_lane_artifacts(
+                        context=context,
+                        transcript=aligned,
+                        speech_segments=[segment.model_dump(mode="json") for segment in speech_segments],
+                    )
+                )
+
+            store.update_step_progress(job_id, StepName.transcription, 100, "Transcription completata")
+            store.complete_step(
+                job_id,
+                StepName.transcription,
+                message=f"Audio lane {lane.name} transcribed.",
+                artifacts=artifacts,
+            )
+
+            latest = enrich_snapshot(store.load(job_id))
+            if all(step.status.value == "completed" for step in latest.steps):
+                store.mark_completed(job_id, latest.outputs)
+            else:
+                store.mark_pending(job_id)
+            return {
+                "job": enrich_snapshot(store.load(job_id)),
+                "project": editorial_projects.load(context.workspace),
+            }
+        except Exception as exc:
+            store.fail_step(job_id, StepName.transcription, str(exc))
+            store.mark_failed(job_id, str(exc))
+            raise
 
     frontend_dist = _resolve_frontend_dist()
 
@@ -383,18 +483,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.post("/api/jobs")
     async def create_job(
         job_payload: str = Form(...),
-        files: list[UploadFile] = File(...),
+        files: list[UploadFile] | None = File(None),
     ):
-        if not files:
-            raise HTTPException(status_code=400, detail="At least one input file is required.")
-
         try:
             payload = json.loads(job_payload)
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="Invalid job payload.") from exc
 
-        payloads = [(upload.filename or "input.bin", await upload.read()) for upload in files]
         request_model = _build_request_model(payload)
+        payloads = [
+            (upload.filename or "input.bin", await upload.read())
+            for upload in (files or [])
+        ]
         logger.info(
             "api.jobs.create title=%s profile=%s execution_mode=%s files=%s",
             request_model.title,
@@ -402,8 +502,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             request_model.execution_mode.value,
             [name for name, _payload in payloads],
         )
-        snapshot = manager.create_from_uploads(request_model, payloads)
-        if request_model.execution_mode == ExecutionMode.automatic:
+        snapshot = (
+            manager.create_from_uploads(request_model, payloads)
+            if payloads
+            else manager.create_job(request_model)[0]
+        )
+        if payloads and request_model.execution_mode == ExecutionMode.automatic:
             return enrich_snapshot(manager.start(snapshot.id))
         return enrich_snapshot(store.load(snapshot.id))
 
@@ -445,8 +549,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 detail="Cannot edit transcript while a run is in progress.",
             )
 
-        from fellini.domain.models import TranscriptArtifact
-
         try:
             transcript = TranscriptArtifact.model_validate(payload)
         except Exception as exc:
@@ -478,13 +580,139 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             workspace.artifact_path("04_transcript_aligned.json").write_text(
                 transcript.model_dump_json(indent=2), encoding="utf-8"
             )
+        context = build_context(snapshot)
+        project = editorial_projects.ensure(context)
+        story_lane = editorial_projects.story_lane(project)
+        if story_lane:
+            editorial_projects.set_lane_transcription(
+                workspace,
+                project=project,
+                lane_id=story_lane.id,
+                transcript=transcript,
+                source_audio_path=context.workspace.relative(context.workspace.temp_path("audio_16k_mono.wav")),
+            )
         return enrich_snapshot(store.load(job_id))
+
+    @app.get("/api/jobs/{job_id}/editorial-project")
+    async def get_editorial_project(job_id: str):
+        snapshot = _require_job(store, job_id)
+        project = ensure_editorial_project(snapshot)
+        return project
+
+    @app.put("/api/jobs/{job_id}/editorial-project")
+    async def update_editorial_project(job_id: str, payload: dict[str, Any] = Body(...)):
+        snapshot = _require_job(store, job_id)
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="Cannot edit the project while a run is in progress.")
+        try:
+            project = EditorialProject.model_validate(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid editorial project: {exc}") from exc
+
+        story_count = sum(
+            1
+            for track in project.tracks
+            if track.kind == TimelineTrackKind.audio and track.role and track.role.value == "story"
+        )
+        if story_count > 1:
+            raise HTTPException(status_code=400, detail="Only one audio lane can be marked as story.")
+        enabled_clips = [clip for clip in project.clips if clip.enabled]
+        for track in project.tracks:
+            track_clips = sorted(
+                (clip for clip in enabled_clips if clip.track_id == track.id),
+                key=lambda clip: (clip.start, clip.end, clip.id),
+            )
+            previous_end = 0.0
+            previous_clip_id: str | None = None
+            for clip in track_clips:
+                if clip.start < previous_end - 1e-6:
+                    detail = f"Track {track.name} has overlapping clips."
+                    if previous_clip_id:
+                        detail = (
+                            f"Track {track.name} has overlapping clips: "
+                            f"{previous_clip_id} overlaps {clip.id}."
+                        )
+                    raise HTTPException(status_code=400, detail=detail)
+                previous_end = max(previous_end, clip.end)
+                previous_clip_id = clip.id
+        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        try:
+            saved = editorial_projects.save_with_revision_check(workspace, project)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return saved
+
+    @app.post("/api/jobs/{job_id}/assets")
+    async def upload_editorial_asset(job_id: str, file: UploadFile = File(...)):
+        snapshot = _require_job(store, job_id)
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="Cannot upload assets while a run is in progress.")
+        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        payload = await file.read()
+        original_name = file.filename or "asset.bin"
+
+        if not snapshot.request.input_assets:
+            source_asset = manager.save_upload_to_workspace(
+                workspace,
+                original_name=original_name,
+                payload=payload,
+            )
+            store.update(
+                job_id,
+                lambda current: current.request.input_assets.append(
+                    InputAsset(
+                        original_name=source_asset.original_name,
+                        stored_name=source_asset.stored_name,
+                        media_kind=source_asset.media_kind,
+                    )
+                ),
+            )
+            manager.run_step_sync(job_id, StepName.ingest)
+            snapshot = _require_job(store, job_id)
+            project = ensure_editorial_project(snapshot)
+            asset = next(
+                (item for item in project.assets if item.origin == "ingest"),
+                None,
+            )
+            if asset is None:
+                raise HTTPException(status_code=500, detail="Failed to bootstrap the source asset.")
+            return {"asset": asset, "project": project}
+
+        if not editorial_projects.exists(workspace):
+            ensure_editorial_project(snapshot)
+        project, asset, _stored_name = editorial_projects.add_asset(
+            workspace,
+            original_name=original_name,
+            payload=payload,
+        )
+        return {"asset": asset, "project": project}
+
+    @app.post("/api/jobs/{job_id}/audio-lanes/{lane_id}/transcribe")
+    async def transcribe_audio_lane(job_id: str, lane_id: str):
+        try:
+            return run_lane_transcription(job_id, lane_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "api.jobs.audio_lane.transcribe.failed job_id=%s lane_id=%s error=%s",
+                job_id,
+                lane_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/jobs/{job_id}/steps/{step_name}/run")
     async def run_job_step(job_id: str, step_name: StepName):
         snapshot = enrich_snapshot(_require_job(store, job_id))
         _validate_step_run(snapshot, step_name)
         logger.info("api.jobs.step.run job_id=%s step=%s", job_id, step_name.value)
+        if step_name == StepName.transcription:
+            project = ensure_editorial_project(snapshot)
+            story_lane = editorial_projects.story_lane(project)
+            if not story_lane:
+                raise HTTPException(status_code=409, detail="Select an audio lane before running transcription.")
+            return run_lane_transcription(job_id, story_lane.id)["job"]
         prepared = manager.start_step(job_id, step_name)
         return enrich_snapshot(prepared)
 

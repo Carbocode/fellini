@@ -38,6 +38,7 @@ class IngestStep(PipelineStep):
             "01_media_probe.json",
             {"sources": [probe.model_dump(mode="json") for probe in probes]},
         )
+        context.editorial_projects.ensure(context)
         context.report_progress(self.name, 100, "Ingest completato")
         logger.info(
             "step.ingest.done sources=%s duration=%.3f mezzanine=%s audio=%s",
@@ -48,6 +49,7 @@ class IngestStep(PipelineStep):
         )
         return [
             artifact,
+            context.workspace.relative(context.workspace.editorial_project_path),
             context.output_relative(mezzanine_path),
             context.output_relative(audio_path),
         ]

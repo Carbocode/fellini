@@ -59,6 +59,176 @@ class InputAsset(BaseModel):
     media_kind: str = "video"
 
 
+class ProjectAssetKind(StrEnum):
+    video = "video"
+    audio = "audio"
+
+
+class TimelineTrackKind(StrEnum):
+    video = "video"
+    audio = "audio"
+    subtitle = "subtitle"
+
+
+class AudioTrackRole(StrEnum):
+    story = "story"
+    support = "support"
+
+
+class ClipOrigin(StrEnum):
+    generated = "generated"
+    manual = "manual"
+
+
+class LaneTranscriptionStatus(StrEnum):
+    idle = "idle"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class ClipCrop(BaseModel):
+    left: float = 0.0
+    top: float = 0.0
+    right: float = 0.0
+    bottom: float = 0.0
+
+
+class ClipTransform(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+    scale: float = 1.0
+    rotation: float = 0.0
+    opacity: float = 1.0
+    crop: ClipCrop = Field(default_factory=ClipCrop)
+
+
+class ClipAudio(BaseModel):
+    gain: float = 1.0
+    muted: bool = False
+    fade_in_ms: int = 0
+    fade_out_ms: int = 0
+
+
+class ProjectAsset(BaseModel):
+    id: str
+    origin: str = "library"
+    kind: ProjectAssetKind
+    label: str
+    path: str
+    duration: float = 0.0
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    sample_rate: int | None = None
+    has_audio: bool = False
+    transcript_ref: str | None = None
+
+
+class TimelineTrack(BaseModel):
+    id: str
+    kind: TimelineTrackKind
+    name: str
+    order: int = 0
+    visible: bool = True
+    muted: bool = False
+    locked: bool = False
+    auto_generated: bool = False
+    role: AudioTrackRole | None = None
+
+    @field_validator("role")
+    @classmethod
+    def validate_audio_role(cls, value: AudioTrackRole | None, info) -> AudioTrackRole | None:
+        kind = info.data.get("kind")
+        if kind != TimelineTrackKind.audio:
+            return None
+        return value or AudioTrackRole.support
+
+
+class TimelineClip(BaseModel):
+    id: str
+    asset_id: str
+    track_id: str
+    linked_group_id: str | None = None
+    start: float = 0.0
+    source_in: float = 0.0
+    source_out: float = 0.0
+    z_index: int = 0
+    enabled: bool = True
+    origin: ClipOrigin = ClipOrigin.manual
+    transform: ClipTransform = Field(default_factory=ClipTransform)
+    audio: ClipAudio = Field(default_factory=ClipAudio)
+    captions_enabled: bool = True
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.source_out - self.source_in)
+
+    @property
+    def end(self) -> float:
+        return self.start + self.duration
+
+
+class SourceWordRef(BaseModel):
+    segment_id: str
+    word_index: int
+
+
+class SubtitleBlock(BaseModel):
+    id: str
+    track_id: str
+    source_lane_id: str
+    start: float
+    end: float
+    text: str
+    origin: ClipOrigin = ClipOrigin.generated
+    source_word_refs: list[SourceWordRef] = Field(default_factory=list)
+
+
+class LaneTranscription(BaseModel):
+    lane_id: str
+    status: LaneTranscriptionStatus = LaneTranscriptionStatus.idle
+    language: str = "it"
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+    source_audio_path: str | None = None
+    updated_at: datetime = Field(default_factory=utcnow)
+    error: str | None = None
+
+    @property
+    def words(self) -> list[WordTiming]:
+        items: list[WordTiming] = []
+        for segment in self.segments:
+            items.extend(segment.words)
+        return items
+
+
+class ProjectSequence(BaseModel):
+    width: int = 1080
+    height: int = 1920
+    fps: float = 30.0
+    sample_rate: int = 48000
+    background: str = "#000000"
+
+
+class ProjectSelection(BaseModel):
+    track_id: str | None = None
+    clip_id: str | None = None
+    subtitle_block_id: str | None = None
+
+
+class EditorialProject(BaseModel):
+    version: int = 1
+    revision: int = 0
+    sequence: ProjectSequence = Field(default_factory=ProjectSequence)
+    assets: list[ProjectAsset] = Field(default_factory=list)
+    tracks: list[TimelineTrack] = Field(default_factory=list)
+    clips: list[TimelineClip] = Field(default_factory=list)
+    captions: list[SubtitleBlock] = Field(default_factory=list)
+    lane_transcriptions: list[LaneTranscription] = Field(default_factory=list)
+    selection: ProjectSelection = Field(default_factory=ProjectSelection)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
 class PipelineToggles(BaseModel):
     use_whisperx: bool = True
     use_local_llm: bool = False
@@ -98,13 +268,21 @@ class SubtitleConfig(BaseModel):
 
 
 class RenderConfig(BaseModel):
-    width: int = Field(default=1080, ge=720)
-    height: int = Field(default=1920, ge=1280)
+    width: int = Field(default=1080, ge=256)
+    height: int = Field(default=1920, ge=256)
     video_codec: str = "libx264"
     audio_codec: str = "aac"
     crf: int = Field(default=18, ge=0, le=35)
     preset: str = "slow"
     audio_bitrate: str = "192k"
+
+    @field_validator("width", "height")
+    @classmethod
+    def validate_even_dimension(cls, value: int) -> int:
+        if value % 2 != 0:
+            msg = "Render dimensions must be even numbers."
+            raise ValueError(msg)
+        return value
 
 
 class DecisionConfig(BaseModel):

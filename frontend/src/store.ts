@@ -112,3 +112,6 @@ export const [frameStepRequest, setFrameStepRequest] = createSignal<number>(0);
 
 // Transcript editing
 export const [editingWord, setEditingWord] = createSignal<{ seg: number; word: number } | null>(null);
+export const [selectedTrackId, setSelectedTrackId] = createSignal<string | null>(null);
+export const [selectedClipId, setSelectedClipId] = createSignal<string | null>(null);
+export const [selectedSubtitleId, setSelectedSubtitleId] = createSignal<string | null>(null);

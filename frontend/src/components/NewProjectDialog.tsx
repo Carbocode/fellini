@@ -1,71 +1,71 @@
 import { createSignal, Show, type Component } from "solid-js";
-import { useCreateJobMutation, useConfigQuery } from "../api/queries";
-import {
-  dialogOpen,
-  setDialogOpen,
-  selectProjectInTab,
-  setSelectedStep,
-} from "../store";
+import { useCreateJobMutation } from "../api/queries";
+import { dialogOpen, selectProjectInTab, setDialogOpen } from "../store";
+
+const CANVAS_PRESETS = [
+  { id: "vertical", label: "Vertical", width: 1080, height: 1920 },
+  { id: "landscape", label: "Landscape", width: 1920, height: 1080 },
+  { id: "square", label: "Square", width: 1080, height: 1080 },
+  { id: "hd-vertical", label: "Vertical HD", width: 720, height: 1280 },
+] as const;
+
+function evenDimension(value: string, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const normalized = Math.max(256, Math.round(parsed));
+  return normalized % 2 === 0 ? normalized : normalized + 1;
+}
 
 const NewProjectDialog: Component = () => {
-  const config = useConfigQuery();
   const createJob = useCreateJobMutation();
   const [error, setError] = createSignal("");
+  const [presetId, setPresetId] = createSignal<(typeof CANVAS_PRESETS)[number]["id"]>("vertical");
+  const [canvasWidth, setCanvasWidth] = createSignal("1080");
+  const [canvasHeight, setCanvasHeight] = createSignal("1920");
   let formRef: HTMLFormElement | undefined;
-  let fileInputRef: HTMLInputElement | undefined;
-  const [fileLabel, setFileLabel] = createSignal("");
+
+  const applyPreset = (id: (typeof CANVAS_PRESETS)[number]["id"]) => {
+    const preset = CANVAS_PRESETS.find((item) => item.id === id);
+    if (!preset) return;
+    setPresetId(id);
+    setCanvasWidth(String(preset.width));
+    setCanvasHeight(String(preset.height));
+  };
 
   const close = () => {
     setDialogOpen(false);
     setError("");
-    setFileLabel("");
     formRef?.reset();
-  };
-
-  const onFileChange = () => {
-    const files = fileInputRef?.files;
-    if (!files || files.length === 0) setFileLabel("");
-    else if (files.length === 1) setFileLabel(files[0].name);
-    else setFileLabel(`${files.length} file selezionati`);
+    applyPreset("vertical");
   };
 
   const onSubmit = async (e: SubmitEvent) => {
     e.preventDefault();
-    if (!fileInputRef?.files?.length) {
-      setError("Seleziona almeno un file sorgente.");
-      return;
-    }
 
     const form = formRef!;
     const val = (name: string, fb: string) =>
       (form.elements.namedItem(name) as HTMLInputElement)?.value?.trim() || fb;
-    const chk = (name: string) =>
-      (form.elements.namedItem(name) as HTMLInputElement)?.checked ?? false;
 
+    const width = evenDimension(canvasWidth(), 1080);
+    const height = evenDimension(canvasHeight(), 1920);
     const payload = {
       title: val("title", "Nuovo progetto"),
-      profile: val("profile", "balanced"),
-      execution_mode: val("execution_mode", "automatic"),
+      profile: "balanced",
+      execution_mode: "step_by_step",
       language: val("language", "it"),
       editorial_notes: val("editorial_notes", ""),
-      toggles: {
-        use_whisperx: chk("use_whisperx"),
-        use_local_llm: chk("use_local_llm"),
-        render_clean: chk("render_clean"),
-        render_captioned: chk("render_captioned"),
+      render: {
+        width,
+        height,
       },
     };
 
     const formData = new FormData();
-    for (const file of Array.from(fileInputRef.files)) {
-      formData.append("files", file);
-    }
     formData.append("job_payload", JSON.stringify(payload));
 
     try {
       const job = await createJob.mutateAsync(formData);
       selectProjectInTab(job.id, job.title);
-      setSelectedStep(null);
       close();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Errore nella creazione");
@@ -96,48 +96,43 @@ const NewProjectDialog: Component = () => {
               </div>
               <div class="form-row">
                 <label class="form-field">
-                  <span>Profilo</span>
-                  <select name="profile">
-                    {(config.data?.profiles ?? ["fast", "balanced", "quality", "custom"]).map(
-                      (p) => (
-                        <option value={p} selected={p === "balanced"}>
-                          {p.charAt(0).toUpperCase() + p.slice(1)}
-                        </option>
-                      ),
-                    )}
+                  <span>Canvas</span>
+                  <select
+                    value={presetId()}
+                    onInput={(e) =>
+                      applyPreset(e.currentTarget.value as (typeof CANVAS_PRESETS)[number]["id"])
+                    }
+                  >
+                    {CANVAS_PRESETS.map((preset) => (
+                      <option value={preset.id}>
+                        {preset.label} {preset.width}×{preset.height}
+                      </option>
+                    ))}
                   </select>
                 </label>
-                <label class="form-field">
-                  <span>Esecuzione</span>
-                  <select name="execution_mode">
-                    {(config.data?.execution_modes ?? ["automatic", "step_by_step"]).map(
-                      (m) => (
-                        <option value={m} selected={m === "automatic"}>
-                          {m === "step_by_step" ? "Step-by-step" : "Automatic"}
-                        </option>
-                      ),
-                    )}
-                  </select>
-                </label>
-              </div>
-              <label class="form-field">
-                <span>File sorgente</span>
-                <div class="dropzone">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    name="files"
-                    multiple
-                    onChange={onFileChange}
-                  />
-                  <p>
-                    Trascina i file qui oppure <strong>sfoglia</strong>
-                  </p>
-                  <Show when={fileLabel()}>
-                    <span class="dropzone-info">{fileLabel()}</span>
-                  </Show>
+                <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
+                  <label class="form-field">
+                    <span>Width</span>
+                    <input
+                      type="number"
+                      min="256"
+                      step="2"
+                      value={canvasWidth()}
+                      onInput={(e) => setCanvasWidth(e.currentTarget.value)}
+                    />
+                  </label>
+                  <label class="form-field">
+                    <span>Height</span>
+                    <input
+                      type="number"
+                      min="256"
+                      step="2"
+                      value={canvasHeight()}
+                      onInput={(e) => setCanvasHeight(e.currentTarget.value)}
+                    />
+                  </label>
                 </div>
-              </label>
+              </div>
               <label class="form-field">
                 <span>Note editoriali</span>
                 <textarea
@@ -146,24 +141,6 @@ const NewProjectDialog: Component = () => {
                   placeholder="Tone, hook, istruzioni di taglio..."
                 />
               </label>
-              <div class="toggle-row">
-                <label class="toggle">
-                  <input type="checkbox" name="use_whisperx" checked />
-                  <span>WhisperX</span>
-                </label>
-                <label class="toggle">
-                  <input type="checkbox" name="use_local_llm" />
-                  <span>LLM locale</span>
-                </label>
-                <label class="toggle">
-                  <input type="checkbox" name="render_clean" checked />
-                  <span>Export clean</span>
-                </label>
-                <label class="toggle">
-                  <input type="checkbox" name="render_captioned" checked />
-                  <span>Export captioned</span>
-                </label>
-              </div>
             </div>
             <div class="dialog-footer">
               <span class={`dialog-status${error() ? " error" : ""}`}>

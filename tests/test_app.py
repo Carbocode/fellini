@@ -1,9 +1,18 @@
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from fellini.app import create_app
-from fellini.domain.models import JobStatus, StepName, StepStatus
+from fellini.domain.models import (
+    JobStatus,
+    ProbeInfo,
+    StepName,
+    StepStatus,
+    TranscriptArtifact,
+    TranscriptSegment,
+    WordTiming,
+)
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
 
@@ -465,3 +474,282 @@ def test_existing_workspace_transcript_marks_transcription_as_completed(tmp_path
         "pending",
     ]
     assert recovered_job["steps"][2]["can_run"] is True
+
+
+def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Project bootstrap job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+
+    response = client.get(f"/api/jobs/{created_job['id']}/editorial-project")
+    assert response.status_code == 200
+    project = response.json()
+    assert [track["kind"] for track in project["tracks"]] == ["video", "audio", "subtitle"]
+    assert len(project["assets"]) == 1
+    assert len(project["clips"]) == 0
+
+
+def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "No overlap job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+
+    project = client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    asset = project["assets"][0]
+    video_track = next(track for track in project["tracks"] if track["kind"] == "video")
+    project["clips"] = [
+        {
+            "id": "clip_a",
+            "asset_id": asset["id"],
+            "track_id": video_track["id"],
+            "linked_group_id": None,
+            "start": 0.0,
+            "source_in": 0.0,
+            "source_out": 2.0,
+            "z_index": 0,
+            "enabled": True,
+            "origin": "manual",
+            "transform": {
+                "x": 0.0,
+                "y": 0.0,
+                "scale": 1.0,
+                "rotation": 0.0,
+                "opacity": 1.0,
+                "crop": {"left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0},
+            },
+            "audio": {
+                "gain": 1.0,
+                "muted": False,
+                "fade_in_ms": 0,
+                "fade_out_ms": 0,
+            },
+            "captions_enabled": True,
+        },
+        {
+            "id": "clip_b",
+            "asset_id": asset["id"],
+            "track_id": video_track["id"],
+            "linked_group_id": None,
+            "start": 1.5,
+            "source_in": 0.0,
+            "source_out": 2.0,
+            "z_index": 0,
+            "enabled": True,
+            "origin": "manual",
+            "transform": {
+                "x": 0.0,
+                "y": 0.0,
+                "scale": 1.0,
+                "rotation": 0.0,
+                "opacity": 1.0,
+                "crop": {"left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0},
+            },
+            "audio": {
+                "gain": 1.0,
+                "muted": False,
+                "fade_in_ms": 0,
+                "fade_out_ms": 0,
+            },
+            "captions_enabled": True,
+        },
+    ]
+
+    response = client.put(f"/api/jobs/{created_job['id']}/editorial-project", json=project)
+    assert response.status_code == 400
+    assert "overlapping clips" in response.json()["detail"]
+
+
+def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Lane transcription job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+    project = client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    audio_lane = next(track for track in project["tracks"] if track["kind"] == "audio")
+
+    monkeypatch.setattr(
+        "fellini.adapters.ffmpeg.FFmpegAdapter.mix_audio_lane",
+        lambda self, **kwargs: Path(kwargs["target"]).write_bytes(b"wav"),
+    )
+    monkeypatch.setattr(
+        "fellini.adapters.asr.FasterWhisperTranscriber.transcribe",
+        lambda self, audio_path, config, language: (
+            [],
+            TranscriptArtifact(
+                language=language,
+                source="test-lane",
+                segments=[
+                    TranscriptSegment(
+                        id="seg_1",
+                        start=0.0,
+                        end=0.8,
+                        text="ciao lane",
+                        words=[WordTiming(text="ciao", start=0.0, end=0.4, confidence=1.0)],
+                    )
+                ],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "fellini.adapters.alignment.TranscriptAligner.align",
+        lambda self, audio_path, transcript, config, language, use_whisperx: transcript,
+    )
+
+    response = client.post(f"/api/jobs/{created_job['id']}/audio-lanes/{audio_lane['id']}/transcribe")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job"]["steps"][1]["status"] == "completed"
+    assert payload["project"]["lane_transcriptions"][0]["lane_id"] == audio_lane["id"]
+    assert payload["project"]["captions"][0]["text"] == "ciao lane"

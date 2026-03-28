@@ -11,9 +11,11 @@ class JobWorkspace:
         self.uploads_dir = self.job_dir / "uploads"
         self.artifacts_dir = self.job_dir / "artifacts"
         self.output_dir = self.job_dir / "output"
+        self.project_dir = self.job_dir / "project"
         self.temp_dir = self.job_dir / "temp"
         self.snapshot_path = self.job_dir / "job.json"
         self.state_path = self.temp_dir / "pipeline_state.json"
+        self.editorial_project_path = self.project_dir / "editorial_project.json"
 
     def bootstrap(self) -> None:
         for path in (
@@ -21,6 +23,7 @@ class JobWorkspace:
             self.uploads_dir,
             self.artifacts_dir,
             self.output_dir,
+            self.project_dir,
             self.temp_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)

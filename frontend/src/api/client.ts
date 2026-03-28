@@ -1,4 +1,10 @@
-import type { AppConfig, JobSnapshot } from "../types";
+import type {
+  AppConfig,
+  EditorialProject,
+  JobSnapshot,
+  LaneTranscriptionResponse,
+  ProjectAsset,
+} from "../types";
 
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -61,6 +67,48 @@ export async function runStep(
 ): Promise<JobSnapshot> {
   return json(
     await fetch(`/api/jobs/${jobId}/steps/${stepName}/run`, { method: "POST" }),
+  );
+}
+
+export async function fetchEditorialProject(jobId: string): Promise<EditorialProject> {
+  return json(await fetch(`/api/jobs/${jobId}/editorial-project`, { cache: "no-store" }));
+}
+
+export async function updateEditorialProject(
+  jobId: string,
+  project: EditorialProject,
+): Promise<EditorialProject> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/editorial-project`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(project),
+    }),
+  );
+}
+
+export async function uploadEditorialAsset(
+  jobId: string,
+  file: File,
+): Promise<{ asset: ProjectAsset; project: EditorialProject }> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return json(
+    await fetch(`/api/jobs/${jobId}/assets`, {
+      method: "POST",
+      body: formData,
+    }),
+  );
+}
+
+export async function transcribeAudioLane(
+  jobId: string,
+  laneId: string,
+): Promise<LaneTranscriptionResponse> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/audio-lanes/${laneId}/transcribe`, {
+      method: "POST",
+    }),
   );
 }
 
