@@ -29,6 +29,9 @@ from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
 
 logger = get_logger(__name__)
+DEFAULT_TRACK_PAIR_COUNT = 2
+# Legacy-only track id kept for migration of older saved projects.
+CAPTION_TRACK_ID = "track_subtitle_1"
 
 if TYPE_CHECKING:
     from fellini.pipeline.context import PipelineContext
@@ -47,6 +50,7 @@ class EditorialProjectStore:
         return EditorialProject.model_validate(payload)
 
     def save(self, workspace: JobWorkspace, project: EditorialProject) -> EditorialProject:
+        project, _ = self._normalize_track_layout(project)
         current_revision = 0
         if workspace.editorial_project_path.exists():
             current_revision = self.load(workspace).revision
@@ -99,8 +103,15 @@ class EditorialProjectStore:
                 project = self._bootstrap_from_context(context)
                 return self.save(workspace, project)
             project, linked_migrated = self._normalize_linked_clip_groups(project)
+            project, tracks_migrated = self._normalize_track_layout(project)
             hydrated = self._hydrate_legacy_captions(workspace, project)
-            if linked_migrated or len(hydrated.captions) != len(project.captions):
+            hydrated, subtitles_migrated = self._normalize_generated_subtitles(hydrated)
+            if (
+                linked_migrated
+                or tracks_migrated
+                or subtitles_migrated
+                or len(hydrated.captions) != len(project.captions)
+            ):
                 return self.save(workspace, hydrated)
             return hydrated
 
@@ -166,12 +177,27 @@ class EditorialProjectStore:
         )
 
     def subtitle_track(self, project: EditorialProject) -> TimelineTrack:
+        video_tracks = sorted(
+            (track for track in project.tracks if track.kind == TimelineTrackKind.video),
+            key=lambda track: track.order,
+        )
         match = next(
-            (track for track in project.tracks if track.kind == TimelineTrackKind.subtitle),
+            (
+                track
+                for track in video_tracks
+                if not any(clip.enabled and clip.track_id == track.id for clip in project.clips)
+            ),
             None,
         )
         if not match:
-            msg = "Editorial project is missing the subtitle track."
+            match = video_tracks[0] if video_tracks else None
+        if not match:
+            match = next(
+                (track for track in project.tracks if track.kind == TimelineTrackKind.subtitle),
+                None,
+            )
+        if not match:
+            msg = "Editorial project is missing a video lane for subtitles."
             raise ValueError(msg)
         return match
 
@@ -199,27 +225,19 @@ class EditorialProjectStore:
         )
 
         project.tracks = [
-            TimelineTrack(
-                id="track_video_1",
-                kind=TimelineTrackKind.video,
-                name="Video 1",
-                order=0,
-                auto_generated=True,
-            ),
-            TimelineTrack(
-                id="track_audio_1",
-                kind=TimelineTrackKind.audio,
-                name="Audio 1",
-                order=1,
-                auto_generated=True,
+            self._create_generated_track(TimelineTrackKind.video, 2, 0),
+            self._create_generated_track(TimelineTrackKind.video, 1, 1),
+            self._create_generated_track(
+                TimelineTrackKind.audio,
+                1,
+                2,
                 role=AudioTrackRole.story,
             ),
-            TimelineTrack(
-                id="track_subtitle_1",
-                kind=TimelineTrackKind.subtitle,
-                name="Subtitles",
-                order=2,
-                auto_generated=True,
+            self._create_generated_track(
+                TimelineTrackKind.audio,
+                2,
+                3,
+                role=AudioTrackRole.support,
             ),
         ]
 
@@ -233,6 +251,190 @@ class EditorialProjectStore:
             project.assets.append(source_asset)
 
         return self._hydrate_legacy_captions(context.workspace, project)
+
+    def _numeric_suffix(self, value: str) -> int | None:
+        digits = []
+        for char in reversed(value):
+            if not char.isdigit():
+                break
+            digits.append(char)
+        if not digits:
+            return None
+        return int("".join(reversed(digits)))
+
+    def _track_pair_number(self, project: EditorialProject, track: TimelineTrack) -> int:
+        if track.kind == TimelineTrackKind.subtitle:
+            return 0
+        direct = self._numeric_suffix(track.id) or self._numeric_suffix(track.name)
+        if direct:
+            return direct
+        siblings = [item for item in sorted(project.tracks, key=lambda current: current.order) if item.kind == track.kind]
+        for index, sibling in enumerate(siblings, start=1):
+            if sibling.id == track.id:
+                return index
+        return 1
+
+    def _next_pair_number(self, pair_numbers: list[int]) -> int:
+        used = {value for value in pair_numbers if value > 0}
+        next_pair = 1
+        while next_pair in used:
+            next_pair += 1
+        return next_pair
+
+    def _create_generated_track(
+        self,
+        kind: TimelineTrackKind,
+        pair_number: int,
+        order: int,
+        *,
+        role: AudioTrackRole | None = None,
+    ) -> TimelineTrack:
+        return TimelineTrack(
+            id=f"track_{kind.value}_{pair_number}",
+            kind=kind,
+            name=f"{'Video' if kind == TimelineTrackKind.video else 'Audio'} {pair_number}",
+            order=order,
+            auto_generated=True,
+            role=role,
+        )
+
+    def _normalize_track_layout(
+        self, project: EditorialProject
+    ) -> tuple[EditorialProject, bool]:
+        updated = project.model_copy(deep=True)
+        legacy_caption_track = next(
+            (
+                track
+                for track in updated.tracks
+                if track.id == CAPTION_TRACK_ID or track.kind == TimelineTrackKind.subtitle
+            ),
+            None,
+        )
+
+        av_tracks = [
+            track for track in sorted(updated.tracks, key=lambda current: current.order)
+            if track.kind in {TimelineTrackKind.video, TimelineTrackKind.audio}
+            and track.id != CAPTION_TRACK_ID
+        ]
+        pair_numbers = sorted(
+            {
+                self._track_pair_number(updated, track)
+                for track in av_tracks
+                if self._track_pair_number(updated, track) > 0
+            }
+        )
+        while len(pair_numbers) < DEFAULT_TRACK_PAIR_COUNT:
+            pair_numbers.append(self._next_pair_number(pair_numbers))
+
+        tracks_by_pair: dict[int, dict[str, TimelineTrack]] = {}
+        for track in av_tracks:
+            pair_number = self._track_pair_number(updated, track)
+            pair_entry = tracks_by_pair.setdefault(pair_number, {})
+            pair_entry[track.kind.value] = track
+
+        track_lookup = {track.id: track for track in updated.tracks}
+        occupied_pairs: set[int] = set()
+        for clip in updated.clips:
+            if not clip.enabled:
+                continue
+            track = track_lookup.get(clip.track_id)
+            if not track or track.kind not in {TimelineTrackKind.video, TimelineTrackKind.audio}:
+                continue
+            occupied_pairs.add(self._track_pair_number(updated, track))
+        if pair_numbers and all(pair_number in occupied_pairs for pair_number in pair_numbers):
+            pair_numbers.append(self._next_pair_number(pair_numbers))
+
+        sorted_pair_numbers = sorted(pair_numbers)
+        next_video_tracks: list[TimelineTrack] = []
+        next_audio_tracks: list[TimelineTrack] = []
+        for pair_number in sorted_pair_numbers:
+            pair_entry = tracks_by_pair.get(pair_number, {})
+            video_track = pair_entry.get("video") or self._create_generated_track(
+                TimelineTrackKind.video,
+                pair_number,
+                0,
+            )
+            audio_track = pair_entry.get("audio") or self._create_generated_track(
+                TimelineTrackKind.audio,
+                pair_number,
+                0,
+                role=AudioTrackRole.support,
+            )
+            next_video_tracks.append(
+                video_track.model_copy(
+                    update={
+                        "name": f"Video {pair_number}",
+                        "order": 0,
+                        "role": None,
+                    },
+                    deep=True,
+                )
+            )
+            next_audio_tracks.append(
+                audio_track.model_copy(
+                    update={
+                        "name": f"Audio {pair_number}",
+                        "order": 0,
+                        "role": audio_track.role or AudioTrackRole.support,
+                    },
+                    deep=True,
+                )
+            )
+        next_tracks = [
+            track.model_copy(update={"order": index}, deep=True)
+            for index, track in enumerate([*reversed(next_video_tracks), *next_audio_tracks])
+        ]
+
+        story_assigned = False
+        for track in next_tracks:
+            if track.kind != TimelineTrackKind.audio:
+                continue
+            if track.role == AudioTrackRole.story and not story_assigned:
+                story_assigned = True
+                continue
+            if track.role == AudioTrackRole.story:
+                track.role = AudioTrackRole.support
+        if not story_assigned:
+            first_audio = next(
+                (track for track in next_tracks if track.kind == TimelineTrackKind.audio),
+                None,
+            )
+            if first_audio:
+                first_audio.role = AudioTrackRole.story
+
+        host_track = self.subtitle_track(
+            updated.model_copy(update={"tracks": next_tracks}, deep=True)
+        )
+        host_track_id = host_track.id
+        next_captions = updated.captions
+        if host_track_id:
+            legacy_track_id = legacy_caption_track.id if legacy_caption_track else None
+            next_captions = [
+                caption.model_copy(
+                    update={"track_id": host_track_id},
+                    deep=True,
+                )
+                if caption.track_id in {CAPTION_TRACK_ID, legacy_track_id}
+                else caption
+                for caption in updated.captions
+            ]
+
+        next_selection = updated.selection.model_copy(deep=True)
+        if next_selection.track_id in {
+            CAPTION_TRACK_ID,
+            legacy_caption_track.id if legacy_caption_track else None,
+        }:
+            next_selection.track_id = host_track_id
+
+        changed = (
+            updated.tracks != next_tracks
+            or updated.captions != next_captions
+            or updated.selection != next_selection
+        )
+        updated.tracks = next_tracks
+        updated.captions = next_captions
+        updated.selection = next_selection
+        return updated, changed
 
     def _normalize_linked_clip_groups(
         self, project: EditorialProject
@@ -348,20 +550,65 @@ class EditorialProjectStore:
             )
         ]
         for segment_index, segment in enumerate(transcript.segments):
-            refs = [
-                SourceWordRef(segment_id=segment.id, word_index=word_index)
-                for word_index, _word in enumerate(segment.words)
-            ]
+            if segment.words:
+                for word_index, word in enumerate(segment.words):
+                    captions.append(
+                        SubtitleBlock(
+                            id=f"subtitle_{lane_id}_{segment_index:04d}_{word_index:04d}",
+                            track_id=subtitle_track.id,
+                            source_lane_id=lane_id,
+                            start=word.start,
+                            end=max(word.end, word.start + 0.02),
+                            text=word.text,
+                            origin=ClipOrigin.generated,
+                            source_word_refs=[
+                                SourceWordRef(segment_id=segment.id, word_index=word_index)
+                            ],
+                        )
+                    )
+                continue
             captions.append(
                 SubtitleBlock(
                     id=f"subtitle_{lane_id}_{segment_index:04d}",
                     track_id=subtitle_track.id,
                     source_lane_id=lane_id,
                     start=segment.start,
-                    end=segment.end,
+                    end=max(segment.end, segment.start + 0.02),
                     text=segment.text,
                     origin=ClipOrigin.generated,
-                    source_word_refs=refs,
+                    source_word_refs=[],
                 )
             )
         project.captions = captions
+
+    def _normalize_generated_subtitles(
+        self, project: EditorialProject
+    ) -> tuple[EditorialProject, bool]:
+        updated = project.model_copy(deep=True)
+        changed = False
+        for lane in updated.lane_transcriptions:
+            total_words = sum(len(segment.words) for segment in lane.segments if segment.words)
+            if total_words <= 0:
+                continue
+            generated = [
+                caption
+                for caption in updated.captions
+                if caption.source_lane_id == lane.lane_id and caption.origin == ClipOrigin.generated
+            ]
+            is_word_level = (
+                len(generated) == total_words
+                and all(len(caption.source_word_refs) == 1 for caption in generated)
+            )
+            if is_word_level:
+                continue
+            self._replace_generated_subtitle_blocks(
+                updated,
+                lane.lane_id,
+                TranscriptArtifact(
+                    language=lane.language,
+                    source=f"lane:{lane.lane_id}",
+                    segments=lane.segments,
+                ),
+            )
+            changed = True
+        return updated, changed

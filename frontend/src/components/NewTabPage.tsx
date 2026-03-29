@@ -3,6 +3,25 @@ import { useJobsQuery, useDeleteJobMutation } from "../api/queries";
 import { selectProjectInTab, updateTabLabel, setDialogOpen, tabs, closeTab } from "../store";
 import type { JobSnapshot } from "../types";
 
+function projectCanvasLabel(job: JobSnapshot): string {
+  return `${job.request.render.width}×${job.request.render.height}`;
+}
+
+function projectSubtitle(job: JobSnapshot): string {
+  const notes = job.request.editorial_notes.trim();
+  if (notes) return notes;
+  return `Canvas ${projectCanvasLabel(job)} · ${job.request.language.toUpperCase()}`;
+}
+
+function updatedAtLabel(value: string): string {
+  return new Intl.DateTimeFormat("it-IT", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
 const NewTabPage: Component = () => {
   const jobs = useJobsQuery();
   const deleteJob = useDeleteJobMutation();
@@ -40,7 +59,7 @@ const NewTabPage: Component = () => {
       <div class="ntp-content">
         <div class="ntp-header">
           <h1 class="ntp-title">Fellini</h1>
-          <p class="ntp-subtitle">Seleziona un progetto o creane uno nuovo</p>
+          <p class="ntp-subtitle">Apri un progetto e continua il montaggio</p>
         </div>
 
         <div class="ntp-actions">
@@ -86,10 +105,11 @@ const NewTabPage: Component = () => {
                       x
                     </button>
                   </div>
+                  <div class="ntp-card-subtitle">{projectSubtitle(job)}</div>
                   <div class="ntp-card-meta">
-                    <span>{job.request.profile}</span>
-                    <span>{job.request.execution_mode === "step_by_step" ? "manual" : "auto"}</span>
-                    <span>{job.steps.filter((s) => s.status === "completed").length}/{job.steps.length} steps</span>
+                    <span>{projectCanvasLabel(job)}</span>
+                    <span>{job.request.language.toUpperCase()}</span>
+                    <span>{updatedAtLabel(job.updated_at)}</span>
                   </div>
                   <div class="ntp-card-id">{job.id}</div>
                 </div>

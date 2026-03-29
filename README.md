@@ -60,6 +60,12 @@ Avvia la UI locale:
 poetry run fellini serve
 ```
 
+Il comando abilita il backend hot reload di default. Se vuoi un processo stabile senza reload:
+
+```bash
+poetry run fellini serve --no-reload
+```
+
 Apri `http://127.0.0.1:8123`.
 
 Run singolo da terminale:

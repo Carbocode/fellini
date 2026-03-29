@@ -22,10 +22,9 @@ class JobManager:
 
     def create_job(self, request: JobRequest) -> tuple[JobSnapshot, JobWorkspace]:
         logger.info(
-            "job_manager.create_job title=%s profile=%s execution_mode=%s",
+            "job_manager.create_job title=%s language=%s",
             request.title,
-            request.profile.value,
-            request.execution_mode.value,
+            request.language,
         )
         return self.store.create_job(request)
 

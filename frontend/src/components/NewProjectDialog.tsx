@@ -50,8 +50,6 @@ const NewProjectDialog: Component = () => {
     const height = evenDimension(canvasHeight(), 1920);
     const payload = {
       title: val("title", "Nuovo progetto"),
-      profile: "balanced",
-      execution_mode: "step_by_step",
       language: val("language", "it"),
       editorial_notes: val("editorial_notes", ""),
       render: {

@@ -146,10 +146,9 @@ class JobStore:
 
     def replace_request(self, job_id: str, request: JobRequest) -> JobSnapshot:
         logger.info(
-            "job_store.replace_request job_id=%s title=%s profile=%s",
+            "job_store.replace_request job_id=%s title=%s",
             job_id,
             request.title,
-            request.profile.value,
         )
         def mutate(snapshot: JobSnapshot) -> None:
             snapshot.request = request

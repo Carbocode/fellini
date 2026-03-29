@@ -1,5 +1,4 @@
 import type {
-  AppConfig,
   EditorialProject,
   JobSnapshot,
   LaneTranscriptionResponse,
@@ -12,10 +11,6 @@ async function json<T>(res: Response): Promise<T> {
     throw new Error(body.detail || `HTTP ${res.status}`);
   }
   return res.json();
-}
-
-export async function fetchConfig(): Promise<AppConfig> {
-  return json(await fetch("/api/config"));
 }
 
 export async function fetchJobs(): Promise<JobSnapshot[]> {

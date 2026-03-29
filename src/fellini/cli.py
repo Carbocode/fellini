@@ -22,6 +22,12 @@ def main() -> None:
     serve_parser = subparsers.add_parser("serve", help="Start the local web UI.")
     serve_parser.add_argument("--host", default=None)
     serve_parser.add_argument("--port", type=int, default=None)
+    serve_parser.add_argument(
+        "--reload",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable backend hot reload while developing locally (default: enabled).",
+    )
 
     run_parser = subparsers.add_parser("run", help="Run the pipeline once from the CLI.")
     run_parser.add_argument("inputs", nargs="+", type=Path)
@@ -43,16 +49,18 @@ def main() -> None:
 
     if args.command == "serve":
         logger.info(
-            "cli.serve host=%s port=%s",
+            "cli.serve host=%s port=%s reload=%s",
             args.host or settings.host,
             args.port or settings.port,
+            args.reload,
         )
         uvicorn.run(
             "fellini.app:create_app",
             factory=True,
             host=args.host or settings.host,
             port=args.port or settings.port,
-            reload=False,
+            reload=args.reload,
+            reload_dirs=["src"] if args.reload else None,
         )
         return
 

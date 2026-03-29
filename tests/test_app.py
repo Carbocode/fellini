@@ -17,15 +17,10 @@ from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
 
 
-def test_api_config_and_jobs(tmp_path):
+def test_api_jobs_list_empty(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     app = create_app(settings)
     client = TestClient(app)
-
-    config = client.get("/api/config")
-    assert config.status_code == 200
-    assert "profiles" in config.json()
-    assert "balanced" in config.json()["profiles"]
 
     jobs = client.get("/api/jobs")
     assert jobs.status_code == 200
@@ -535,7 +530,18 @@ def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatc
     response = client.get(f"/api/jobs/{created_job['id']}/editorial-project")
     assert response.status_code == 200
     project = response.json()
-    assert [track["kind"] for track in project["tracks"]] == ["video", "audio", "subtitle"]
+    assert [track["kind"] for track in project["tracks"]] == [
+        "video",
+        "video",
+        "audio",
+        "audio",
+    ]
+    assert [track["name"] for track in project["tracks"]] == [
+        "Video 2",
+        "Video 1",
+        "Audio 1",
+        "Audio 2",
+    ]
     assert len(project["assets"]) == 1
     assert len(project["clips"]) == 0
 
@@ -736,7 +742,10 @@ def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch)
                         start=0.0,
                         end=0.8,
                         text="ciao lane",
-                        words=[WordTiming(text="ciao", start=0.0, end=0.4, confidence=1.0)],
+                        words=[
+                            WordTiming(text="ciao", start=0.0, end=0.4, confidence=1.0),
+                            WordTiming(text="lane", start=0.42, end=0.8, confidence=1.0),
+                        ],
                     )
                 ],
             ),
@@ -752,4 +761,4 @@ def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch)
     payload = response.json()
     assert payload["job"]["steps"][1]["status"] == "completed"
     assert payload["project"]["lane_transcriptions"][0]["lane_id"] == audio_lane["id"]
-    assert payload["project"]["captions"][0]["text"] == "ciao lane"
+    assert [caption["text"] for caption in payload["project"]["captions"]] == ["ciao", "lane"]

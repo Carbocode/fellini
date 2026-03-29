@@ -6,6 +6,7 @@ import {
 import type { Accessor } from "solid-js";
 import * as api from "./client";
 import type { EditorialProject, JobSnapshot } from "../types";
+import { normalizeEditorialProject } from "../lib/editorial";
 
 function syncJobSnapshot(qc: ReturnType<typeof useQueryClient>, snapshot: JobSnapshot) {
   qc.setQueryData(["job", snapshot.id], snapshot);
@@ -16,14 +17,6 @@ function syncJobSnapshot(qc: ReturnType<typeof useQueryClient>, snapshot: JobSna
     ? jobs.map((job) => (job.id === snapshot.id ? snapshot : job))
     : [snapshot, ...jobs];
   qc.setQueryData(["jobs"], nextJobs);
-}
-
-export function useConfigQuery() {
-  return createQuery(() => ({
-    queryKey: ["config"],
-    queryFn: api.fetchConfig,
-    staleTime: Infinity,
-  }));
 }
 
 export function useJobsQuery() {
@@ -59,7 +52,7 @@ export function useArtifactQuery(
 export function useEditorialProjectQuery(jobId: Accessor<string | null>) {
   return createQuery(() => ({
     queryKey: ["editorial-project", jobId()],
-    queryFn: () => api.fetchEditorialProject(jobId()!),
+    queryFn: async () => normalizeEditorialProject(await api.fetchEditorialProject(jobId()!)),
     enabled: !!jobId(),
     staleTime: 2_000,
   }));
@@ -136,7 +129,7 @@ export function useUpdateEditorialProjectMutation() {
     mutationFn: (vars: { jobId: string; project: EditorialProject }) =>
       api.updateEditorialProject(vars.jobId, vars.project),
     onSuccess: (project, vars) => {
-      qc.setQueryData(["editorial-project", vars.jobId], project);
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(project));
     },
   }));
 }
@@ -147,7 +140,7 @@ export function useUploadEditorialAssetMutation() {
     mutationFn: (vars: { jobId: string; file: File }) =>
       api.uploadEditorialAsset(vars.jobId, vars.file),
     onSuccess: (payload, vars) => {
-      qc.setQueryData(["editorial-project", vars.jobId], payload.project);
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(payload.project));
     },
   }));
 }
@@ -155,12 +148,68 @@ export function useUploadEditorialAssetMutation() {
 export function useTranscribeLaneMutation() {
   const qc = useQueryClient();
   return createMutation(() => ({
+    onMutate: async (vars) => {
+      const projectQueryKey = ["editorial-project", vars.jobId] as const;
+      const previousProject = qc.getQueryData<EditorialProject>(projectQueryKey) ?? null;
+      const previousJob = qc.getQueryData<JobSnapshot>(["job", vars.jobId]) ?? null;
+
+      if (previousJob) {
+        const nextJob: JobSnapshot = {
+          ...previousJob,
+          status: "running",
+          current_step: "transcription",
+          steps: previousJob.steps.map((step) =>
+            step.name === "transcription"
+              ? {
+                  ...step,
+                  status: "running",
+                  progress: Math.max(step.progress, 1),
+                  message: "Trascrizione della lane in corso",
+                  started_at: step.started_at ?? new Date().toISOString(),
+                  finished_at: null,
+                }
+              : step
+          ),
+        };
+        syncJobSnapshot(qc, nextJob);
+      }
+
+      if (!previousProject) {
+        return { previousProject, previousJob, projectQueryKey };
+      }
+
+      const currentLane = previousProject.lane_transcriptions.find(
+        (lane) => lane.lane_id === vars.laneId,
+      );
+      const nextProject = normalizeEditorialProject({
+        ...previousProject,
+        lane_transcriptions: [
+          ...previousProject.lane_transcriptions.filter((lane) => lane.lane_id !== vars.laneId),
+          {
+            lane_id: vars.laneId,
+            status: "running",
+            language: currentLane?.language ?? "it",
+            segments: currentLane?.segments ?? [],
+            source_audio_path: currentLane?.source_audio_path ?? null,
+            updated_at: new Date().toISOString(),
+            error: null,
+          },
+        ],
+      });
+      qc.setQueryData(projectQueryKey, nextProject);
+      return { previousProject, previousJob, projectQueryKey };
+    },
     mutationFn: (vars: { jobId: string; laneId: string }) =>
       api.transcribeAudioLane(vars.jobId, vars.laneId),
     onSuccess: (payload, vars) => {
       syncJobSnapshot(qc, payload.job);
-      qc.setQueryData(["editorial-project", vars.jobId], payload.project);
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(payload.project));
       qc.invalidateQueries({ queryKey: ["artifact", vars.jobId] });
+    },
+    onError: (_error, vars) => {
+      qc.invalidateQueries({ queryKey: ["job", vars.jobId] });
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      qc.invalidateQueries({ queryKey: ["editorial-project", vars.jobId] });
     },
   }));
 }

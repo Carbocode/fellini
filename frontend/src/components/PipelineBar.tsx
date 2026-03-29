@@ -20,7 +20,7 @@ const TOOL_CONFIG: Array<{ step: ToolStep; label: string; hint: string }> = [
   {
     step: "editorial",
     label: "Editorial",
-    hint: "Aggiorna il montaggio automatico dalla story lane",
+    hint: "Aggiorna il montaggio dalla story lane",
   },
   {
     step: "render",

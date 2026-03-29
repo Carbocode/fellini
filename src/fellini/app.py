@@ -10,14 +10,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from fellini.domain.models import (
-    DEFAULT_STEPS,
     EditorialProject,
-    ExecutionMode,
     InputAsset,
     JobRequest,
     JobSnapshot,
     JobStatus,
-    RunProfile,
     StepName,
     StepStatus,
     TimelineTrackKind,
@@ -53,12 +50,8 @@ def _build_request_model(
     if existing_request:
         base_payload = existing_request.model_dump(mode="json")
     else:
-        profile = RunProfile(payload.get("profile", RunProfile.balanced))
-        execution_mode = ExecutionMode(payload.get("execution_mode", ExecutionMode.automatic))
-        base_payload = JobRequest.with_profile(
+        base_payload = JobRequest(
             title=payload.get("title", "Nuovo progetto"),
-            profile=profile,
-            execution_mode=execution_mode,
             language=payload.get("language", "it"),
             editorial_notes=payload.get("editorial_notes", ""),
         ).model_dump(mode="json")
@@ -66,8 +59,7 @@ def _build_request_model(
     merged_payload = _deep_merge(base_payload, payload)
     if existing_request:
         merged_payload["input_assets"] = base_payload["input_assets"]
-    request_model = JobRequest.model_validate(merged_payload)
-    return request_model.apply_profile_overrides()
+    return JobRequest.model_validate(merged_payload)
 
 
 def _require_job(store: JobStore, job_id: str):
@@ -452,14 +444,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-    @app.get("/api/config")
-    async def get_config():
-        return {
-            "profiles": [profile.value for profile in RunProfile],
-            "execution_modes": [mode.value for mode in ExecutionMode],
-            "step_names": [step.value for step in DEFAULT_STEPS],
-        }
-
     @app.get("/api/jobs")
     async def list_jobs():
         logger.debug("api.jobs.list")
@@ -496,10 +480,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             for upload in (files or [])
         ]
         logger.info(
-            "api.jobs.create title=%s profile=%s execution_mode=%s files=%s",
+            "api.jobs.create title=%s files=%s",
             request_model.title,
-            request_model.profile.value,
-            request_model.execution_mode.value,
             [name for name, _payload in payloads],
         )
         snapshot = (
@@ -507,8 +489,6 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             if payloads
             else manager.create_job(request_model)[0]
         )
-        if payloads and request_model.execution_mode == ExecutionMode.automatic:
-            return enrich_snapshot(manager.start(snapshot.id))
         return enrich_snapshot(store.load(snapshot.id))
 
     @app.put("/api/jobs/{job_id}/request")

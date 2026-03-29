@@ -8,6 +8,9 @@ import type {
   TimelineTrackKind,
 } from "../types";
 
+const MIN_TRACK_PAIR_COUNT = 2;
+const CAPTION_TRACK_ID = "track_subtitle_1";
+
 function clipDuration(clip: Pick<TimelineClip, "source_in" | "source_out">): number {
   return Math.max(0, clip.source_out - clip.source_in);
 }
@@ -19,6 +22,85 @@ export function projectDuration(project: EditorialProject): number {
   );
   const subtitleEnd = project.captions.reduce((max, caption) => Math.max(max, caption.end), 0);
   return Math.max(clipEnd, subtitleEnd, 0);
+}
+
+function subtitleTrackForProject(project: EditorialProject): TimelineTrack | undefined {
+  const orderedTracks = sortedTracks(project);
+  const videoTracks = orderedTracks.filter((track) => track.kind === "video");
+  const emptyVideoTrack = videoTracks.find((track) => !project.clips.some((clip) => (
+    clip.enabled && clip.track_id === track.id
+  )));
+  return emptyVideoTrack
+    ?? videoTracks[0]
+    ?? orderedTracks.find((track) => track.kind === "subtitle");
+}
+
+function replaceGeneratedSubtitlesForLane(
+  project: EditorialProject,
+  laneId: string,
+  trackId: string,
+): SubtitleBlock[] {
+  const captions = project.captions.filter((caption) => (
+    caption.source_lane_id !== laneId || caption.origin !== "generated"
+  ));
+  const lane = project.lane_transcriptions.find((item) => item.lane_id === laneId);
+  if (!lane) return captions;
+  for (const [segmentIndex, segment] of lane.segments.entries()) {
+    if (segment.words.length > 0) {
+      for (const [wordIndex, word] of segment.words.entries()) {
+        captions.push({
+          id: `subtitle_${laneId}_${segmentIndex.toString().padStart(4, "0")}_${wordIndex.toString().padStart(4, "0")}`,
+          track_id: trackId,
+          source_lane_id: laneId,
+          start: word.start,
+          end: Math.max(word.end, word.start + 0.02),
+          text: word.text,
+          origin: "generated",
+          source_word_refs: [{ segment_id: segment.id, word_index: wordIndex }],
+        });
+      }
+      continue;
+    }
+    captions.push({
+      id: `subtitle_${laneId}_${segmentIndex.toString().padStart(4, "0")}`,
+      track_id: trackId,
+      source_lane_id: laneId,
+      start: segment.start,
+      end: Math.max(segment.end, segment.start + 0.02),
+      text: segment.text,
+      origin: "generated",
+      source_word_refs: [],
+    });
+  }
+  return captions;
+}
+
+export function normalizeGeneratedSubtitles(project: EditorialProject): EditorialProject {
+  const subtitleTrack = subtitleTrackForProject(project);
+  if (!subtitleTrack) return project;
+
+  let captions = project.captions;
+  let changed = false;
+  for (const lane of project.lane_transcriptions) {
+    const totalWords = lane.segments.reduce((sum, segment) => sum + segment.words.length, 0);
+    if (totalWords <= 0) continue;
+    const generated = captions.filter((caption) => (
+      caption.source_lane_id === lane.lane_id && caption.origin === "generated"
+    ));
+    const isWordLevel = (
+      generated.length === totalWords
+      && generated.every((caption) => caption.source_word_refs.length === 1)
+    );
+    if (isWordLevel) continue;
+    captions = replaceGeneratedSubtitlesForLane(
+      { ...project, captions },
+      lane.lane_id,
+      subtitleTrack.id,
+    );
+    changed = true;
+  }
+
+  return changed ? { ...project, captions } : project;
 }
 
 export function getTrack(project: EditorialProject, trackId: string | null): TimelineTrack | null {
@@ -55,6 +137,18 @@ export function trackSubtitles(project: EditorialProject, trackId: string): Subt
     .sort((a, b) => a.start - b.start);
 }
 
+export function laneContentRange(
+  project: EditorialProject,
+  laneId: string,
+): { start: number; end: number } | null {
+  const clips = trackClips(project, laneId);
+  if (!clips.length) return null;
+  return {
+    start: Math.min(...clips.map((clip) => clip.start)),
+    end: Math.max(...clips.map((clip) => clip.start + clipDuration(clip))),
+  };
+}
+
 export function assetById(project: EditorialProject, assetId: string): ProjectAsset | undefined {
   return project.assets.find((asset) => asset.id === assetId);
 }
@@ -63,9 +157,201 @@ function firstTrackOfKind(project: EditorialProject, kind: TimelineTrackKind): T
   return sortedTracks(project).find((track) => track.kind === kind);
 }
 
+function numericSuffix(value: string): number | null {
+  const match = value.match(/(\d+)$/);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1] ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function avTracks(project: EditorialProject, kind: "video" | "audio"): TimelineTrack[] {
+  return sortedTracks(project).filter((track) => track.kind === kind);
+}
+
+function trackPairNumber(project: EditorialProject, track: TimelineTrack): number {
+  if (track.kind === "subtitle") return 0;
+  const direct = numericSuffix(track.id) ?? numericSuffix(track.name);
+  if (direct) return direct;
+  const siblings = sortedTracks(project).filter((item) => item.kind === track.kind);
+  const index = siblings.findIndex((item) => item.id === track.id);
+  return index >= 0 ? index + 1 : 1;
+}
+
+function pairTrackOfKind(
+  project: EditorialProject,
+  track: TimelineTrack,
+  kind: "video" | "audio",
+): TimelineTrack | undefined {
+  const pairNumber = trackPairNumber(project, track);
+  return avTracks(project, kind).find((item) => trackPairNumber(project, item) === pairNumber);
+}
+
+export function retargetClipGroup(
+  project: EditorialProject,
+  clips: TimelineClip[],
+  anchorClipId: string,
+  targetTrackId: string,
+): TimelineClip[] {
+  const anchorClip = clips.find((clip) => clip.id === anchorClipId);
+  if (!anchorClip) return clips;
+  const anchorTrack = getTrack(project, anchorClip.track_id);
+  const targetTrack = getTrack(project, targetTrackId);
+  if (
+    !anchorTrack
+    || !targetTrack
+    || anchorTrack.kind === "subtitle"
+    || targetTrack.kind !== anchorTrack.kind
+  ) {
+    return clips;
+  }
+  const targetPairNumber = trackPairNumber(project, targetTrack);
+  return clips.map((clip) => {
+    const currentTrack = getTrack(project, clip.track_id);
+    if (!currentTrack || currentTrack.kind === "subtitle") return clip;
+    const nextTrack = clip.id === anchorClipId
+      ? targetTrack
+      : currentTrack.kind === anchorTrack.kind
+        ? targetTrack
+        : avTracks(project, currentTrack.kind).find((track) => trackPairNumber(project, track) === targetPairNumber) ?? currentTrack;
+    return nextTrack.id === clip.track_id ? clip : { ...clip, track_id: nextTrack.id };
+  });
+}
+
 function preferredAudioTrack(project: EditorialProject): TimelineTrack | undefined {
   return sortedTracks(project).find((track) => track.kind === "audio" && track.role === "story")
     ?? firstTrackOfKind(project, "audio");
+}
+
+function nextPairNumber(pairNumbers: number[]): number {
+  const used = new Set(pairNumbers.filter((value) => value > 0));
+  let next = 1;
+  while (used.has(next)) next += 1;
+  return next;
+}
+
+function createGeneratedTrack(
+  kind: "video" | "audio",
+  pairNumber: number,
+  order: number,
+  role?: AudioTrackRole | null,
+): TimelineTrack {
+  return {
+    id: `track_${kind}_${pairNumber}`,
+    kind,
+    name: `${kind === "video" ? "Video" : "Audio"} ${pairNumber}`,
+    order,
+    visible: true,
+    muted: false,
+    locked: false,
+    auto_generated: true,
+    role: kind === "audio" ? (role ?? "support") : null,
+  };
+}
+
+export function normalizeTrackLayout(project: EditorialProject): EditorialProject {
+  const legacyCaptionTrack = sortedTracks(project).find((track) => track.id === CAPTION_TRACK_ID || track.kind === "subtitle");
+  const existingPairs = [
+    ...new Set(
+      sortedTracks(project)
+        .filter((track) => (
+          track.kind === "video" || track.kind === "audio"
+        ) && track.id !== CAPTION_TRACK_ID)
+        .map((track) => trackPairNumber(project, track))
+        .filter((value) => value > 0),
+    ),
+  ].sort((a, b) => a - b);
+  const pairNumbers = [...existingPairs];
+  while (pairNumbers.length < MIN_TRACK_PAIR_COUNT) pairNumbers.push(nextPairNumber(pairNumbers));
+
+  const tracksByPair = new Map<number, { video?: TimelineTrack; audio?: TimelineTrack }>();
+  for (const track of sortedTracks(project)) {
+    if ((track.kind !== "video" && track.kind !== "audio") || track.id === CAPTION_TRACK_ID) continue;
+    const pairNumber = trackPairNumber(project, track);
+    const entry = tracksByPair.get(pairNumber) ?? {};
+    if (track.kind === "video") entry.video = track;
+    else entry.audio = track;
+    tracksByPair.set(pairNumber, entry);
+  }
+
+  const occupiedPairs = new Set<number>();
+  const tracksById = new Map(project.tracks.map((track) => [track.id, track]));
+  for (const clip of project.clips) {
+    if (!clip.enabled) continue;
+    const track = tracksById.get(clip.track_id);
+    if (!track || (track.kind !== "video" && track.kind !== "audio")) continue;
+    occupiedPairs.add(trackPairNumber(project, track));
+  }
+  if (pairNumbers.length > 0 && pairNumbers.every((pairNumber) => occupiedPairs.has(pairNumber))) {
+    pairNumbers.push(nextPairNumber(pairNumbers));
+  }
+
+  let hasStoryLane = false;
+  const sortedPairNumbers = [...pairNumbers].sort((a, b) => a - b);
+  const nextVideoTracks: TimelineTrack[] = [];
+  const nextAudioTracks: TimelineTrack[] = [];
+  for (const pairNumber of sortedPairNumbers) {
+    const existingPair = tracksByPair.get(pairNumber);
+    const videoTrack = existingPair?.video ?? createGeneratedTrack("video", pairNumber, 0);
+    const audioTrack = existingPair?.audio
+      ?? createGeneratedTrack("audio", pairNumber, 0, hasStoryLane ? "support" : "story");
+    const nextAudioRole = audioTrack.role === "story"
+      ? (hasStoryLane ? "support" : "story")
+      : (audioTrack.role ?? "support");
+    if (nextAudioRole === "story") hasStoryLane = true;
+    nextVideoTracks.push({
+      ...videoTrack,
+      name: `Video ${pairNumber}`,
+      order: 0,
+      role: null,
+    });
+    nextAudioTracks.push({
+      ...audioTrack,
+      name: `Audio ${pairNumber}`,
+      order: 0,
+      role: nextAudioRole,
+    });
+  }
+  const nextTracks: TimelineTrack[] = [
+    ...[...nextVideoTracks.reverse(), ...nextAudioTracks].map((track, index) => ({
+      ...track,
+      order: index,
+    })),
+  ];
+  const hostTrackId = subtitleTrackForProject({
+    ...project,
+    tracks: nextTracks,
+    captions: project.captions,
+  })?.id ?? null;
+  const nextCaptions = hostTrackId
+    ? project.captions.map((caption) => {
+      if (caption.track_id === hostTrackId) return caption;
+      if (caption.track_id === CAPTION_TRACK_ID || caption.track_id === legacyCaptionTrack?.id) {
+        return { ...caption, track_id: hostTrackId };
+      }
+      return caption;
+    })
+    : project.captions;
+  if (!hasStoryLane) {
+    const firstAudio = nextTracks.find((track) => track.kind === "audio");
+    if (firstAudio) firstAudio.role = "story";
+  }
+  return {
+    ...project,
+    tracks: nextTracks,
+    captions: nextCaptions,
+    selection: {
+      ...project.selection,
+      track_id:
+        project.selection.track_id === CAPTION_TRACK_ID
+        || project.selection.track_id === legacyCaptionTrack?.id
+          ? hostTrackId
+          : project.selection.track_id,
+    },
+  };
+}
+
+export function normalizeEditorialProject(project: EditorialProject): EditorialProject {
+  return normalizeTrackLayout(normalizeGeneratedSubtitles(project));
 }
 
 type PlacementInterval = { min: number; max: number };
@@ -202,8 +488,12 @@ export function dropPreviewTargets(
   if (track.kind === "subtitle") return [];
   if (asset.kind !== "video" || !asset.has_audio) return [track];
 
-  const videoTrack = track.kind === "video" ? track : firstTrackOfKind(project, "video");
-  const audioTrack = track.kind === "audio" ? track : preferredAudioTrack(project);
+  const videoTrack = track.kind === "video"
+    ? track
+    : pairTrackOfKind(project, track, "video") ?? firstTrackOfKind(project, "video");
+  const audioTrack = track.kind === "audio"
+    ? track
+    : pairTrackOfKind(project, track, "audio") ?? preferredAudioTrack(project);
   return [videoTrack, audioTrack].filter((item): item is TimelineTrack => Boolean(item));
 }
 
@@ -303,10 +593,10 @@ export function upsertClips(project: EditorialProject, clips: TimelineClip[]): E
   for (const clip of clips) {
     if (!presentIds.has(clip.id)) nextClips.push(clip);
   }
-  return {
+  return normalizeTrackLayout({
     ...project,
     clips: nextClips,
-  };
+  });
 }
 
 export function upsertClip(project: EditorialProject, clip: TimelineClip): EditorialProject {
@@ -316,7 +606,7 @@ export function upsertClip(project: EditorialProject, clip: TimelineClip): Edito
 export function removeClip(project: EditorialProject, clipId: string): EditorialProject {
   const clips = linkedClips(project, clipId);
   const ids = new Set(clips.map((clip) => clip.id));
-  return { ...project, clips: project.clips.filter((clip) => !ids.has(clip.id)) };
+  return normalizeTrackLayout({ ...project, clips: project.clips.filter((clip) => !ids.has(clip.id)) });
 }
 
 export function splitClip(project: EditorialProject, clipId: string, atTime: number): EditorialProject {
@@ -346,10 +636,10 @@ export function splitClip(project: EditorialProject, clipId: string, atTime: num
     };
     replacements.set(current.id, [left, right]);
   }
-  return {
+  return normalizeTrackLayout({
     ...project,
     clips: project.clips.flatMap((item) => replacements.get(item.id) ?? [item]),
-  };
+  });
 }
 
 export function patchSubtitle(
@@ -379,7 +669,7 @@ export function setStoryLane(project: EditorialProject, laneId: string): Editori
 }
 
 export function subtitleTrack(project: EditorialProject): TimelineTrack | undefined {
-  return project.tracks.find((track) => track.kind === "subtitle");
+  return subtitleTrackForProject(project);
 }
 
 export function isAudioTrack(track: TimelineTrack | null): boolean {
@@ -393,10 +683,10 @@ export function isSubtitleTrack(track: TimelineTrack | null): boolean {
 export function trackHeight(kind: TimelineTrackKind): number {
   switch (kind) {
     case "video":
-      return 30;
+      return 52;
     case "audio":
-      return 28;
+      return 47;
     case "subtitle":
-      return 24;
+      return 39;
   }
 }

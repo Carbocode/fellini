@@ -43,20 +43,26 @@ import type {
   JobSnapshot,
   ProjectAsset,
   TimelineClip,
+  TimelineTrack,
 } from "../types";
 import {
   assetById,
   compatibleTrack,
   createClipsForAssetDrop,
   getClip,
+  getSubtitleBlock,
   getTrack,
+  laneContentRange,
   linkedClips,
+  normalizeEditorialProject,
   projectDuration,
+  retargetClipGroup,
   resolveClipGroupStart,
   resolveClipGroupTrimEndDelta,
   resolveClipGroupTrimStartDelta,
   sortedTracks,
   splitClip,
+  subtitleTrack,
   trackClips,
   trackHeight,
   trackSubtitles,
@@ -86,6 +92,7 @@ const TIMELINE_TAIL_MAX_SECONDS = 600;
 const RULER_MINOR_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
 const RULER_MINOR_TARGET_PX = 18;
 const RULER_LABEL_EVERY_N_TICKS = 4;
+const TIMELINE_RULER_HEIGHT = 20;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
 
@@ -160,7 +167,10 @@ const Workspace: Component = () => {
           setDraftProject(null);
           return;
         }
-        setDraftProject(JSON.parse(JSON.stringify(projectQuery.data)) as EditorialProject);
+        const normalized = normalizeEditorialProject(
+          JSON.parse(JSON.stringify(projectQuery.data)) as EditorialProject,
+        );
+        setDraftProject(normalized);
       },
     ),
   );
@@ -216,8 +226,9 @@ const Workspace: Component = () => {
       typeof next === "function"
         ? (next as (project: EditorialProject) => EditorialProject)(current)
         : next;
-    setDraftProject(updated);
-    persistProject(updated);
+    const normalized = normalizeEditorialProject(updated);
+    setDraftProject(normalized);
+    persistProject(normalized);
   };
 
   const clampBrowserWidth = (width: number) =>
@@ -366,6 +377,7 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
   const job = useJobQuery(selectedJobId);
   const uploadAsset = useUploadEditorialAssetMutation();
   const [filter, setFilter] = createSignal("");
+  const [selectedAssetId, setSelectedAssetId] = createSignal<string | null>(null);
   const [previewAssetId, setPreviewAssetId] = createSignal<string | null>(null);
   const [draggingAssetId, setDraggingAssetId] = createSignal<string | null>(null);
   const [activeTab, setActiveTab] = createSignal<"assets" | "logs">("assets");
@@ -380,7 +392,7 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
   const previewAsset = createMemo(() => {
     const current = project();
     if (!current) return null;
-    return assetById(current, previewAssetId() ?? assets()[0]?.id ?? "") ?? null;
+    return assetById(current, previewAssetId() ?? "") ?? null;
   });
   const previewSrc = createMemo(() => {
     const current = previewAsset();
@@ -389,11 +401,13 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
   });
   const logs = createMemo(() => (job.data as JobSnapshot | undefined)?.logs ?? []);
 
-  const openAsset = (asset: ProjectAsset) => {
+  const openAssetPreview = (asset: ProjectAsset) => {
+    setSelectedAssetId(asset.id);
     setPreviewAssetId(asset.id);
     const jobId = selectedJobId();
     if (jobId) setPreviewForJob(jobId, asset.path);
   };
+  const closeAssetPreview = () => setPreviewAssetId(null);
 
   const onFiles = (files: FileList | null) => {
     const jobId = selectedJobId();
@@ -451,12 +465,13 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
           <Show when={assets().length > 0} fallback={<div class="asset-explorer-empty"><span>Nessun asset disponibile</span></div>}>
             <For each={assets()}>
               {(asset) => (
-                <button
-                  type="button"
-                  class={`asset-item${previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
+                <div
+                  role="button"
+                  tabIndex={0}
+                  class={`asset-item${selectedAssetId() === asset.id || previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
                   draggable={true}
                   onDragStart={(e) => {
-                    openAsset(asset);
+                    setSelectedAssetId(asset.id);
                     setDraggingAssetId(asset.id);
                     if (!e.dataTransfer) return;
                     e.dataTransfer.setData("application/x-fellini-asset", asset.id);
@@ -467,32 +482,59 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
                     setDraggingAssetId(null);
                     window.dispatchEvent(new CustomEvent("fellini:asset-drag-end"));
                   }}
-                  onClick={() => openAsset(asset)}
+                  onClick={() => setSelectedAssetId(asset.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setSelectedAssetId(asset.id);
+                    }
+                  }}
                 >
                   <FileTypeIcon type={asset.kind} />
                   <span class="asset-item-name">{asset.label || humanizeMediaName(asset.path)}</span>
+                  <button
+                    type="button"
+                    class={`asset-item-action${previewAssetId() === asset.id ? " active" : ""}`}
+                    title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openAssetPreview(asset);
+                    }}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" />
+                      <circle cx="12" cy="12" r="3" />
+                    </svg>
+                  </button>
                   <span class={`asset-item-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
-                </button>
+                </div>
               )}
             </For>
           </Show>
         </div>
-        <div class="asset-preview-pane asset-preview-pane--fixed">
-          <div class="asset-preview-header">
-            <span class="asset-preview-title">{previewAsset()?.label || "Preview"}</span>
+        <Show when={previewAsset()}>
+          <div class="asset-preview-pane asset-preview-pane--fixed">
+            <div class="asset-preview-header">
+              <span class="asset-preview-title">{previewAsset()?.label || "Preview"}</span>
+              <button type="button" class="asset-preview-close" title="Chiudi preview" onClick={closeAssetPreview}>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div class="asset-preview-body">
+              <Show when={previewSrc()} fallback={<div class="asset-preview-empty">Seleziona un asset</div>}>
+                {(() => {
+                  const src = previewSrc();
+                  const asset = previewAsset();
+                  if (!src || !asset) return null;
+                  if (asset.kind === "video") return <video class="asset-preview-media" src={src} controls preload="metadata" />;
+                  return <audio class="asset-preview-media asset-preview-audio" src={src} controls preload="metadata" />;
+                })()}
+              </Show>
+            </div>
           </div>
-          <div class="asset-preview-body">
-            <Show when={previewSrc()} fallback={<div class="asset-preview-empty">Seleziona un asset</div>}>
-              {(() => {
-                const src = previewSrc();
-                const asset = previewAsset();
-                if (!src || !asset) return null;
-                if (asset.kind === "video") return <video class="asset-preview-media" src={src} controls preload="metadata" />;
-                return <audio class="asset-preview-media asset-preview-audio" src={src} controls preload="metadata" />;
-              })()}
-            </Show>
-          </div>
-        </div>
+        </Show>
       </div>
 
       <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: activeTab() === "logs" ? "flex" : "none" }}>
@@ -519,10 +561,11 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   const [codecStatus, setCodecStatus] = createSignal<"ready" | "unsupported">("unsupported");
   const [stageSize, setStageSize] = createSignal({ width: 0, height: 0 });
   const [transportPlaying, setTransportPlaying] = createSignal(false);
+  const [videoFrameReady, setVideoFrameReady] = createSignal(false);
   let stageRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
   let videoRef: HTMLVideoElement | undefined;
-  let audioRef: HTMLAudioElement | undefined;
+  const audioRefs = new Map<string, HTMLAudioElement>();
   let gpuContext: any;
   let gpuDevice: any;
   let gpuPipeline: any;
@@ -531,6 +574,8 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   let raf = 0;
   let transportStartAt = 0;
   let transportStartTime = 0;
+  let videoFrameCallbackHandle: number | null = null;
+  let videoWarmupToken = 0;
 
   const project = () => props.project();
   const frameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
@@ -553,12 +598,21 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const current = project();
     if (!current) return null;
     const at = playheadTime();
+    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
     return [...current.clips]
       .filter((clip) => {
         const track = getTrack(current, clip.track_id);
-        return track?.kind === "video" && clip.start <= at && (clip.start + (clip.source_out - clip.source_in)) >= at;
+        return clip.enabled
+          && track?.kind === "video"
+          && track.visible
+          && clip.start <= at
+          && (clip.start + (clip.source_out - clip.source_in)) >= at;
       })
-      .sort((a, b) => b.z_index - a.z_index)[0] ?? null;
+      .sort((a, b) =>
+        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
+        || (b.z_index - a.z_index)
+        || (a.start - b.start)
+      )[0] ?? null;
   });
   const activeVideoAsset = createMemo(() => {
     const current = project();
@@ -566,12 +620,25 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     if (!current || !clip) return null;
     return assetById(current, clip.asset_id) ?? null;
   });
-  const activeAudioClip = createMemo(() => {
+  const activeAudioClips = createMemo(() => {
     const current = project();
-    if (!current) return null;
+    if (!current) return [] as TimelineClip[];
     const at = playheadTime();
-    const story = current.tracks.find((track) => track.kind === "audio" && track.role === "story");
-    return current.clips.find((clip) => clip.track_id === story?.id && clip.start <= at && (clip.start + (clip.source_out - clip.source_in)) >= at) ?? null;
+    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
+    return [...current.clips]
+      .filter((clip) => {
+        const track = getTrack(current, clip.track_id);
+        return clip.enabled
+          && track?.kind === "audio"
+          && !track.muted
+          && !clip.audio.muted
+          && clip.start <= at
+          && (clip.start + (clip.source_out - clip.source_in)) >= at;
+      })
+      .sort((a, b) =>
+        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
+        || (a.start - b.start)
+      );
   });
   const mediaSource = (clip: TimelineClip | null) => {
     const current = project();
@@ -580,6 +647,29 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const asset = assetById(current, clip.asset_id);
     return asset ? fileUrl(jobId, asset.path) : null;
   };
+  const mediaSourceForClip = (clip: TimelineClip) => mediaSource(clip);
+  const normalizeMediaSource = (src: string) => {
+    try {
+      return new URL(src, window.location.href).href;
+    } catch {
+      return src;
+    }
+  };
+  const mediaElementHasSource = (
+    element: HTMLMediaElement | undefined,
+    src: string | null,
+  ) => {
+    if (!element || !src) return false;
+    const expected = normalizeMediaSource(src);
+    const current = element.currentSrc || element.getAttribute("src") || "";
+    return normalizeMediaSource(current) === expected;
+  };
+  const activeVideoSource = createMemo(() => mediaSource(activeVideoClip()));
+  const activeVideoSourceKey = createMemo(() => {
+    const clip = activeVideoClip();
+    const src = activeVideoSource();
+    return clip && src ? `${clip.id}:${src}` : null;
+  });
   const syncClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
     if (!clip || !element) return;
     const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
@@ -594,11 +684,72 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     transportStartTime = playheadTime();
     setTransportPlaying(false);
     videoRef?.pause();
-    audioRef?.pause();
+    for (const element of audioRefs.values()) element.pause();
   };
   const playMediaElement = (element: HTMLMediaElement | undefined) => {
     if (!element || element.readyState < 2 || !element.paused) return;
     void element.play().catch(() => {});
+  };
+  const clearVideoFrameCallback = () => {
+    if (!videoRef || videoFrameCallbackHandle === null || !("cancelVideoFrameCallback" in videoRef)) return;
+    try {
+      (
+        videoRef as HTMLVideoElement & {
+          cancelVideoFrameCallback?: (handle: number) => void;
+        }
+      ).cancelVideoFrameCallback?.(videoFrameCallbackHandle);
+    } catch {
+      // Ignore cancellation errors during source swaps.
+    }
+    videoFrameCallbackHandle = null;
+  };
+  const scheduleVideoFrameProbe = () => {
+    const video = videoRef as (HTMLVideoElement & {
+      requestVideoFrameCallback?: (cb: () => void) => number;
+    }) | undefined;
+    if (!video || !("requestVideoFrameCallback" in video)) return;
+    clearVideoFrameCallback();
+    try {
+      videoFrameCallbackHandle = video.requestVideoFrameCallback?.(() => {
+        videoFrameCallbackHandle = null;
+        setVideoFrameReady(true);
+        if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
+      }) ?? null;
+    } catch {
+      videoFrameCallbackHandle = null;
+    }
+  };
+  const requestVideoFrameDraw = () => {
+    if (!videoRef) return;
+    scheduleVideoFrameProbe();
+    if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
+  };
+  const warmVideoFrame = () => {
+    const video = videoRef;
+    const clip = activeVideoClip();
+    if (!video || !clip || transportPlaying() || video.readyState < 2) return;
+    const token = ++videoWarmupToken;
+    syncClipTime(clip, video);
+    const settle = () => {
+      if (token !== videoWarmupToken) return;
+      video.pause();
+      syncClipTime(activeVideoClip(), videoRef);
+      requestVideoFrameDraw();
+    };
+    const playAttempt = video.play();
+    if (!playAttempt || typeof playAttempt.then !== "function") {
+      settle();
+      return;
+    }
+    void playAttempt
+      .then(() => {
+        requestAnimationFrame(() => {
+          settle();
+        });
+      })
+      .catch(() => {
+        settle();
+      });
   };
   const syncTransportClock = (time: number) => {
     transportStartAt = performance.now();
@@ -615,9 +766,13 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     syncTransportClock(startTime);
     setTransportPlaying(true);
     syncClipTime(activeVideoClip(), videoRef);
-    syncClipTime(activeAudioClip(), audioRef);
+    for (const clip of activeAudioClips()) {
+      syncClipTime(clip, audioRefs.get(clip.id));
+    }
     playMediaElement(videoRef);
-    playMediaElement(audioRef);
+    for (const clip of activeAudioClips()) {
+      playMediaElement(audioRefs.get(clip.id));
+    }
   };
 
   const initGpu = async () => {
@@ -752,6 +907,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       pass.draw(6);
       pass.end();
       gpuDevice.queue.submit([encoder.finish()]);
+      if (!videoFrameReady()) setVideoFrameReady(true);
     } catch {
       setGpuStatus("fallback");
     }
@@ -772,12 +928,21 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const clip = activeVideoClip();
     if (clip) syncClipTime(clip, videoRef);
     else videoRef?.pause();
-    const audioClip = activeAudioClip();
-    syncClipTime(audioClip, audioRef);
-    if (!audioClip) audioRef?.pause();
+    const activeAudioIds = new Set(activeAudioClips().map((item) => item.id));
+    for (const audioClip of activeAudioClips()) {
+      const element = audioRefs.get(audioClip.id);
+      if (!element) continue;
+      element.volume = Math.max(0, Math.min(1, audioClip.audio.gain));
+      syncClipTime(audioClip, element);
+    }
+    for (const [clipId, element] of audioRefs.entries()) {
+      if (!activeAudioIds.has(clipId)) element.pause();
+    }
     if (transportPlaying()) {
       if (clip) playMediaElement(videoRef);
-      if (audioClip) playMediaElement(audioRef);
+      for (const audioClip of activeAudioClips()) {
+        playMediaElement(audioRefs.get(audioClip.id));
+      }
     }
     if (gpuStatus() === "ready") drawFrame();
     raf = requestAnimationFrame(tick);
@@ -823,17 +988,47 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   });
 
   createEffect(() => {
-    const src = mediaSource(activeVideoClip());
-    if (videoRef && src && videoRef.getAttribute("src") !== src) {
-      videoRef.src = src;
+    const src = activeVideoSource();
+    const key = activeVideoSourceKey();
+    if (!videoRef) return;
+    videoWarmupToken += 1;
+    clearVideoFrameCallback();
+    setVideoFrameReady(false);
+    if (!src || !key) {
+      videoRef.pause();
+      videoRef.removeAttribute("src");
       videoRef.load();
+      return;
     }
+    if (mediaElementHasSource(videoRef, src)) {
+      syncClipTime(activeVideoClip(), videoRef);
+      requestVideoFrameDraw();
+      warmVideoFrame();
+      return;
+    }
+    videoRef.pause();
+    videoRef.removeAttribute("src");
+    videoRef.load();
+    videoRef.src = src;
+    videoRef.load();
   });
   createEffect(() => {
-    const src = mediaSource(activeAudioClip());
-    if (audioRef && src && audioRef.getAttribute("src") !== src) {
-      audioRef.src = src;
-      audioRef.load();
+    const activeIds = new Set(activeAudioClips().map((clip) => clip.id));
+    for (const [clipId, element] of audioRefs.entries()) {
+      if (activeIds.has(clipId)) continue;
+      element.pause();
+      audioRefs.delete(clipId);
+    }
+    for (const clip of activeAudioClips()) {
+      const element = audioRefs.get(clip.id);
+      const src = mediaSourceForClip(clip);
+      if (!element || !src) continue;
+      if (!mediaElementHasSource(element, src)) {
+        element.src = src;
+        element.load();
+      }
+      element.volume = Math.max(0, Math.min(1, clip.audio.gain));
+      element.muted = !!clip.audio.muted;
     }
   });
 
@@ -843,7 +1038,9 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       setPlayheadTime(time);
       if (transportPlaying()) syncTransportClock(time);
       syncClipTime(activeVideoClip(), videoRef);
-      syncClipTime(activeAudioClip(), audioRef);
+      for (const clip of activeAudioClips()) {
+        syncClipTime(clip, audioRefs.get(clip.id));
+      }
       setSeekRequest(null);
     }),
   );
@@ -861,6 +1058,9 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       setFrameStepRequest(0);
     }),
   );
+  onCleanup(() => {
+    clearVideoFrameCallback();
+  });
 
   return (
     <div class="panel monitor-panel">
@@ -881,35 +1081,63 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
         >
           <canvas
             ref={canvasRef}
-            class={`monitor-canvas${gpuStatus() === "ready" ? " active" : ""}`}
+            class="monitor-canvas"
             width={sequenceWidth()}
             height={sequenceHeight()}
           />
           <video
             ref={videoRef}
             controls
-            preload="metadata"
+            preload="auto"
             muted
             playsinline
-            class={`monitor-fallback-video${gpuStatus() === "ready" ? " hidden" : ""}`}
-            style={{ display: mediaSource(activeVideoClip()) ? "block" : "none" }}
+            class="monitor-fallback-video"
+            style={{ display: activeVideoSource() ? "block" : "none" }}
+            onLoadedMetadata={() => {
+              syncClipTime(activeVideoClip(), videoRef);
+              requestVideoFrameDraw();
+              warmVideoFrame();
+            }}
             onLoadedData={() => {
               syncClipTime(activeVideoClip(), videoRef);
+              requestVideoFrameDraw();
+              warmVideoFrame();
+              if (transportPlaying()) playMediaElement(videoRef);
+            }}
+            onCanPlay={() => {
+              syncClipTime(activeVideoClip(), videoRef);
+              requestVideoFrameDraw();
+              warmVideoFrame();
+              if (transportPlaying()) playMediaElement(videoRef);
+            }}
+            onSeeked={() => {
+              syncClipTime(activeVideoClip(), videoRef);
+              requestVideoFrameDraw();
+              warmVideoFrame();
               if (transportPlaying()) playMediaElement(videoRef);
             }}
           />
         </div>
-        <audio
-          ref={audioRef}
-          controls
-          preload="metadata"
-          class={`monitor-audio${activeVideoClip() ? " hidden" : " active"}`}
-          style={{ display: mediaSource(activeAudioClip()) ? "block" : "none" }}
-          onLoadedData={() => {
-            syncClipTime(activeAudioClip(), audioRef);
-            if (transportPlaying()) playMediaElement(audioRef);
-          }}
-        />
+        <div class="monitor-audio hidden" aria-hidden="true">
+          <For each={activeAudioClips()}>
+            {(clip) => (
+              <audio
+                ref={(element) => {
+                  if (!element) return;
+                  audioRefs.set(clip.id, element);
+                }}
+                preload="metadata"
+                style={{ display: "none" }}
+                onLoadedData={(event) => {
+                  const element = event.currentTarget;
+                  audioRefs.set(clip.id, element);
+                  syncClipTime(clip, element);
+                  if (transportPlaying()) playMediaElement(element);
+                }}
+              />
+            )}
+          </For>
+        </div>
       </div>
     </div>
   );
@@ -934,8 +1162,19 @@ const TimelinePanel: Component<{
   const [viewportWidth, setViewportWidth] = createSignal(1);
   let zoomWheelAccumulator = 0;
   let zoomWheelResetHandle: ReturnType<typeof setTimeout> | undefined;
-  let viewportRef: HTMLDivElement | undefined;
-  let innerRef: HTMLDivElement | undefined;
+  let rulerViewportRef: HTMLDivElement | undefined;
+  let rulerInnerRef: HTMLDivElement | undefined;
+  let assetViewportRef: HTMLDivElement | undefined;
+  let audioViewportRef: HTMLDivElement | undefined;
+  let assetLabelsRef: HTMLDivElement | undefined;
+  let audioLabelsRef: HTMLDivElement | undefined;
+  let assetInnerRef: HTMLDivElement | undefined;
+  let audioInnerRef: HTMLDivElement | undefined;
+  let horizontalSyncHandle: number | undefined;
+  let verticalSyncHandle: number | undefined;
+  let syncingHorizontal = false;
+  let syncingVertical = false;
+  let didInitMirroredVertical = false;
   const actualDuration = createMemo(() => (project() ? projectDuration(project()!) : 0));
   const tailDuration = createMemo(() =>
     Math.min(
@@ -949,6 +1188,39 @@ const TimelinePanel: Component<{
   const toPx = (seconds: number) => seconds * pxPerSecond();
   const pxToSec = (px: number) => Math.max(0, Math.min(duration(), px / pxPerSecond()));
   const tracks = createMemo(() => (project() ? sortedTracks(project()!) : []));
+  const assetTracks = createMemo(() => tracks().filter((track) => track.kind !== "audio"));
+  const audioTracks = createMemo(() => tracks().filter((track) => track.kind === "audio"));
+  const captionHostTrackId = createMemo(() => {
+    const current = project();
+    return current ? subtitleTrack(current)?.id ?? null : null;
+  });
+  const runningSubtitleLaneIds = createMemo(() => new Set(
+    (project()?.lane_transcriptions ?? [])
+      .filter((lane) => lane.status === "running")
+      .map((lane) => lane.lane_id),
+  ));
+  const pendingSubtitleRanges = createMemo(() => {
+    const current = project();
+    const hostTrackId = captionHostTrackId();
+    if (!current || !hostTrackId) return [];
+    return current.lane_transcriptions.flatMap((lane) => {
+      if (lane.status !== "running") return [];
+      const range = laneContentRange(current, lane.lane_id);
+      if (!range || range.end <= range.start) return [];
+      const sourceTrack = getTrack(current, lane.lane_id);
+      return [{
+        id: `subtitle_pending_${lane.lane_id}`,
+        trackId: hostTrackId,
+        start: range.start,
+        end: range.end,
+        label: sourceTrack ? `AI TRANSCRIPTION / ${sourceTrack.name}` : "AI TRANSCRIPTION",
+      }];
+    });
+  });
+  const visibleTrackSubtitles = (trackId: string) =>
+    trackSubtitles(project()!, trackId).filter((caption) => !(
+      runningSubtitleLaneIds().has(caption.source_lane_id) && caption.origin === "generated"
+    ));
   const viewportFrac = createMemo(() => {
     const visible = Math.min(viewportWidth(), contentWidth());
     return Math.max(visible / Math.max(contentWidth(), 1), 0);
@@ -985,18 +1257,122 @@ const TimelinePanel: Component<{
   const selectedClip = createMemo(() => project() ? getClip(project()!, selectedClipId()) : null);
   const selectedLinkedGroupId = createMemo(() => selectedClip()?.linked_group_id ?? null);
   const selectedSubtitle = createMemo(() =>
-    project() ? project()!.captions.find((caption) => caption.id === selectedSubtitleId()) ?? null : null
+    project() ? getSubtitleBlock(project()!, selectedSubtitleId()) : null
   );
-  const syncViewportMetrics = () => {
-    if (!viewportRef) return;
-    setViewportLeft(viewportRef.scrollLeft);
-    setViewportWidth(viewportRef.clientWidth);
+  const horizontalViewports = () =>
+    [rulerViewportRef, assetViewportRef, audioViewportRef].filter(Boolean) as HTMLDivElement[];
+  const syncViewportMetrics = (source?: HTMLDivElement) => {
+    const viewport = source ?? rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    if (!viewport) return;
+    setViewportLeft(viewport.scrollLeft);
+    setViewportWidth(viewport.clientWidth);
+  };
+  const scheduleHorizontalUnlock = () => {
+    if (horizontalSyncHandle) cancelAnimationFrame(horizontalSyncHandle);
+    horizontalSyncHandle = requestAnimationFrame(() => {
+      syncingHorizontal = false;
+    });
+  };
+  const scheduleVerticalUnlock = () => {
+    if (verticalSyncHandle) cancelAnimationFrame(verticalSyncHandle);
+    verticalSyncHandle = requestAnimationFrame(() => {
+      syncingVertical = false;
+    });
+  };
+  const syncHorizontalScroll = (source: HTMLDivElement) => {
+    syncViewportMetrics(source);
+    if (syncingHorizontal) return;
+    syncingHorizontal = true;
+    const nextLeft = source.scrollLeft;
+    for (const viewport of horizontalViewports()) {
+      if (viewport === source) continue;
+      if (Math.abs(viewport.scrollLeft - nextLeft) > 0.5) viewport.scrollLeft = nextLeft;
+    }
+    syncViewportMetrics(source);
+    scheduleHorizontalUnlock();
+  };
+  const syncMirroredVerticalScroll = (group: "asset" | "audio", source: HTMLDivElement) => {
+    const ownViewport = group === "asset" ? assetViewportRef : audioViewportRef;
+    const ownLabels = group === "asset" ? assetLabelsRef : audioLabelsRef;
+    const otherViewport = group === "asset" ? audioViewportRef : assetViewportRef;
+    const otherLabels = group === "asset" ? audioLabelsRef : assetLabelsRef;
+    const ownTop = source.scrollTop;
+
+    if (ownViewport && ownViewport !== source && Math.abs(ownViewport.scrollTop - ownTop) > 0.5) {
+      ownViewport.scrollTop = ownTop;
+    }
+    if (ownLabels && ownLabels !== source && Math.abs(ownLabels.scrollTop - ownTop) > 0.5) {
+      ownLabels.scrollTop = ownTop;
+    }
+    if (syncingVertical) return;
+
+    syncingVertical = true;
+    const sourceMax = Math.max(source.scrollHeight - source.clientHeight, 0);
+    const frac = sourceMax > 0 ? ownTop / sourceMax : 0;
+    const otherMax = otherViewport
+      ? Math.max(otherViewport.scrollHeight - otherViewport.clientHeight, 0)
+      : 0;
+    const otherTop = otherMax * (1 - frac);
+    if (otherViewport && Math.abs(otherViewport.scrollTop - otherTop) > 0.5) {
+      otherViewport.scrollTop = otherTop;
+    }
+    if (otherLabels && Math.abs(otherLabels.scrollTop - otherTop) > 0.5) {
+      otherLabels.scrollTop = otherTop;
+    }
+    scheduleVerticalUnlock();
+  };
+  const initializeMirroredVerticalScroll = () => {
+    if (didInitMirroredVertical || !assetViewportRef || !audioViewportRef) return;
+    const assetMax = Math.max(assetViewportRef.scrollHeight - assetViewportRef.clientHeight, 0);
+    if (assetMax > 0) {
+      assetViewportRef.scrollTop = assetMax;
+      if (assetLabelsRef) assetLabelsRef.scrollTop = assetMax;
+    }
+    audioViewportRef.scrollTop = 0;
+    if (audioLabelsRef) audioLabelsRef.scrollTop = 0;
+    didInitMirroredVertical = true;
   };
 
   const getTimeFromPointer = (clientX: number) => {
-    const rect = innerRef?.getBoundingClientRect();
+    const rect = (rulerInnerRef ?? assetInnerRef ?? audioInnerRef)?.getBoundingClientRect();
     if (!rect) return 0;
     return pxToSec(clientX - rect.left);
+  };
+  const trackGroupOffset = (kind: "video" | "audio") => {
+    const inner = kind === "audio" ? audioInnerRef : assetInnerRef;
+    const trackList = kind === "audio" ? audioTracks() : assetTracks();
+    if (!inner || !trackList.length || kind === "audio") return 0;
+    const totalHeight = trackList.reduce((sum, track) => sum + trackHeight(track.kind), 0);
+    return Math.max(0, inner.clientHeight - totalHeight);
+  };
+  const getTrackFromPointerY = (
+    clientY: number,
+    kind: "video" | "audio",
+  ) => {
+    const inner = kind === "audio" ? audioInnerRef : assetInnerRef;
+    const trackList = kind === "audio" ? audioTracks() : assetTracks();
+    const rect = inner?.getBoundingClientRect();
+    if (!rect || clientY < rect.top || clientY > rect.bottom) return null;
+    const pointerY = clientY - rect.top;
+    let cursor = trackGroupOffset(kind);
+    const rows = trackList.map((track) => {
+      const top = cursor;
+      cursor += trackHeight(track.kind);
+      return {
+        track,
+        top,
+        bottom: cursor,
+      };
+    });
+    const hovered = rows.find((row) => pointerY >= row.top && pointerY <= row.bottom)?.track ?? null;
+    if (hovered?.kind === kind) return hovered;
+    const candidates = rows.filter((row) => row.track.kind === kind);
+    if (!candidates.length) return null;
+    return candidates.reduce((best, current) => {
+      const bestCenter = (best.top + best.bottom) / 2;
+      const currentCenter = (current.top + current.bottom) / 2;
+      return Math.abs(pointerY - currentCenter) < Math.abs(pointerY - bestCenter) ? current : best;
+    }).track;
   };
   const clearDragPreview = () => setDragPreview(null);
   const updateDragPreview = (assetId: string, trackId: string, clientX: number) => {
@@ -1025,7 +1401,7 @@ const TimelinePanel: Component<{
   const setZoomIndex = (nextIdx: number, anchorClientX?: number) => {
     const clamped = Math.max(0, Math.min(ZOOM_STEPS.length - 1, nextIdx));
     if (clamped === zoomIdx()) return;
-    const viewport = viewportRef;
+    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
     const nextPxPerSecond = MIN_PX_PER_SEC * ZOOM_STEPS[clamped];
     const anchorOffset = viewport && anchorClientX !== undefined
       ? anchorClientX - viewport.getBoundingClientRect().left
@@ -1035,24 +1411,27 @@ const TimelinePanel: Component<{
       : null;
     setZoomIdx(clamped);
     requestAnimationFrame(() => {
-      if (!viewportRef || anchorOffset === null || anchorTime === null) {
+      const nextViewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+      if (!nextViewport || anchorOffset === null || anchorTime === null) {
         syncViewportMetrics();
         return;
       }
       const nextTimelineWidth = Math.max(400, duration() * nextPxPerSecond);
-      const nextContentWidth = Math.max(nextTimelineWidth, viewportRef.clientWidth);
-      const maxScroll = Math.max(nextContentWidth - viewportRef.clientWidth, 0);
+      const nextContentWidth = Math.max(nextTimelineWidth, nextViewport.clientWidth);
+      const maxScroll = Math.max(nextContentWidth - nextViewport.clientWidth, 0);
       const nextLeft = (anchorTime * nextPxPerSecond) - anchorOffset;
-      viewportRef.scrollLeft = Math.max(0, Math.min(maxScroll, nextLeft));
-      syncViewportMetrics();
+      const clampedLeft = Math.max(0, Math.min(maxScroll, nextLeft));
+      nextViewport.scrollLeft = clampedLeft;
+      syncHorizontalScroll(nextViewport);
     });
   };
   const centerViewportAtTime = (time: number) => {
-    if (!viewportRef) return;
-    const maxScroll = Math.max(contentWidth() - viewportRef.clientWidth, 0);
-    const nextLeft = toPx(time) - (viewportRef.clientWidth / 2);
-    viewportRef.scrollLeft = Math.max(0, Math.min(maxScroll, nextLeft));
-    syncViewportMetrics();
+    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    if (!viewport) return;
+    const maxScroll = Math.max(contentWidth() - viewport.clientWidth, 0);
+    const nextLeft = toPx(time) - (viewport.clientWidth / 2);
+    viewport.scrollLeft = Math.max(0, Math.min(maxScroll, nextLeft));
+    syncHorizontalScroll(viewport);
   };
   const onTimelineWheel = (event: WheelEvent) => {
     if (!event.ctrlKey && !event.metaKey) return;
@@ -1070,7 +1449,7 @@ const TimelinePanel: Component<{
     setZoomIndex(zoomIdx() + (direction * stepCount), event.clientX);
   };
   const onMinimapPointerDown = (event: PointerEvent) => {
-    if (!viewportRef) return;
+    if (!rulerViewportRef && !assetViewportRef && !audioViewportRef) return;
     const target = event.currentTarget as HTMLDivElement | null;
     if (!target) return;
     const rect = target.getBoundingClientRect();
@@ -1079,7 +1458,7 @@ const TimelinePanel: Component<{
     centerViewportAtTime(nextTime);
   };
   const beginMinimapViewportDrag = (event: PointerEvent) => {
-    if (!viewportRef) return;
+    if (!rulerViewportRef && !assetViewportRef && !audioViewportRef) return;
     event.preventDefault();
     event.stopPropagation();
     const viewportEl = event.currentTarget as HTMLDivElement | null;
@@ -1096,7 +1475,8 @@ const TimelinePanel: Component<{
     let didDrag = false;
 
     const updateFromClientX = (clientX: number) => {
-      if (!viewportRef) return;
+      const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+      if (!viewport) return;
       const pointerFrac = Math.max(0, Math.min(1, (clientX - contentRect.left) / contentRect.width));
       const visibleFrac = Math.min(viewportFrac(), 1);
       const maxViewportLeft = Math.max(1 - visibleFrac, 0);
@@ -1105,9 +1485,9 @@ const TimelinePanel: Component<{
         Math.min(maxViewportLeft, pointerFrac - (grabRatio * visibleFrac)),
       );
       const normalizedScroll = maxViewportLeft > 0 ? viewportLeftFrac / maxViewportLeft : 0;
-      const maxScroll = Math.max(contentWidth() - viewportRef.clientWidth, 0);
-      viewportRef.scrollLeft = normalizedScroll * maxScroll;
-      syncViewportMetrics();
+      const maxScroll = Math.max(contentWidth() - viewport.clientWidth, 0);
+      viewport.scrollLeft = normalizedScroll * maxScroll;
+      syncHorizontalScroll(viewport);
     };
 
     const onMove = (moveEvent: PointerEvent) => {
@@ -1131,8 +1511,13 @@ const TimelinePanel: Component<{
   const beginClipDrag = (event: PointerEvent, clip: TimelineClip) => {
     event.preventDefault();
     event.stopPropagation();
+    const currentProject = project();
+    if (!currentProject) return;
     const startX = event.clientX;
-    const linked = linkedClips(project()!, clip.id);
+    const linked = linkedClips(currentProject, clip.id);
+    const anchorTrack = getTrack(currentProject, clip.track_id);
+    if (!anchorTrack || anchorTrack.kind === "subtitle") return;
+    const dragKind = anchorTrack.kind;
     const anchorStart = Math.min(...linked.map((item) => item.start));
     const origins = new Map(
       linked.map((item) => [item.id, { start: item.start, trackId: item.track_id }]),
@@ -1140,14 +1525,19 @@ const TimelinePanel: Component<{
     const onMove = (moveEvent: PointerEvent) => {
       const deltaSec = (moveEvent.clientX - startX) / pxPerSecond();
       const desiredStart = Math.max(0, anchorStart + deltaSec);
+      const targetTrack = getTrackFromPointerY(moveEvent.clientY, dragKind);
       props.updateProject((current) => {
+        const retargeted = targetTrack
+          ? retargetClipGroup(current, linked, clip.id, targetTrack.id)
+          : linked;
         const resolvedStart = resolveClipGroupStart(
           current,
-          linked,
+          retargeted,
           desiredStart,
           linked.map((item) => item.id),
         );
         const resolvedDelta = resolvedStart - anchorStart;
+        const nextTrackIds = new Map(retargeted.map((item) => [item.id, item.track_id]));
         const updates = linked.flatMap((item) => {
           const currentClip = getClip(current, item.id);
           const origin = origins.get(item.id);
@@ -1155,7 +1545,7 @@ const TimelinePanel: Component<{
           return [{
             ...currentClip,
             start: Math.max(0, origin.start + resolvedDelta),
-            track_id: origin.trackId,
+            track_id: nextTrackIds.get(item.id) ?? origin.trackId,
           }];
         });
         return upsertClips(current, updates);
@@ -1164,6 +1554,9 @@ const TimelinePanel: Component<{
     const onUp = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
+      const current = project();
+      const movedClip = current ? getClip(current, clip.id) : null;
+      if (movedClip) setSelectedTrackId(movedClip.track_id);
     };
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
@@ -1273,37 +1666,198 @@ const TimelinePanel: Component<{
     document.addEventListener("pointercancel", onUp);
   };
 
+  const onRulerScroll = (event: Event) => {
+    syncHorizontalScroll(event.currentTarget as HTMLDivElement);
+  };
+  const onGroupViewportScroll = (group: "asset" | "audio") => (event: Event) => {
+    const target = event.currentTarget as HTMLDivElement;
+    syncHorizontalScroll(target);
+    syncMirroredVerticalScroll(group, target);
+  };
+  const onGroupLabelsScroll = (group: "asset" | "audio") => (event: Event) => {
+    syncMirroredVerticalScroll(group, event.currentTarget as HTMLDivElement);
+  };
+  const renderTrackLabel = (track: TimelineTrack) => (
+    <button
+      type="button"
+      class={`tl-label tl-label--dynamic${selectedTrackId() === track.id ? " active" : ""}`}
+      style={{ height: `${trackHeight(track.kind)}px` }}
+      onClick={() => {
+        setSelectedTrackId(track.id);
+        setSelectedClipId(null);
+        setSelectedSubtitleId(null);
+      }}
+    >
+      {track.name}
+    </button>
+  );
+  const renderTrackRow = (track: TimelineTrack) => (
+    <div
+      class={`tl-track tl-track--project tl-track--${track.kind}`}
+      style={{ height: `${trackHeight(track.kind)}px` }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = "copy";
+        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
+        if (!assetId) {
+          clearDragPreview();
+          return;
+        }
+        updateDragPreview(assetId, track.id, e.clientX);
+      }}
+      onDragLeave={(e) => {
+        const nextTarget = e.relatedTarget;
+        if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+        const preview = dragPreview();
+        if (preview?.trackIds.includes(track.id)) clearDragPreview();
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        const current = project();
+        if (!current) return;
+        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
+        if (!assetId) return;
+        const asset = assetById(current, assetId);
+        if (!asset || !compatibleTrack(asset, track)) return;
+        const start = getTimeFromPointer(e.clientX);
+        const { clips, primaryClipId } = createClipsForAssetDrop(current, asset, track, start);
+        if (!clips.length || !primaryClipId) return;
+        props.updateProject((value) => upsertClips(value, clips));
+        clearDragPreview();
+        setSelectedTrackId(track.id);
+        setSelectedClipId(primaryClipId);
+        setSelectedSubtitleId(null);
+      }}
+    >
+      <Show when={dragPreview() && dragPreview()!.trackIds.includes(track.id)}>
+        <div class="tl-drop-caret" style={{ left: `${toPx(dragPreview()!.start)}px` }} />
+        <div
+          class={`tl-seg tl-seg--clip tl-seg--ghost tl-seg--${track.kind}`}
+          style={{
+            left: `${toPx(dragPreview()!.start)}px`,
+            width: `${Math.max(8, dragPreview()!.duration * pxPerSecond())}px`,
+          }}
+        >
+          <span>{dragPreview()!.label}</span>
+        </div>
+      </Show>
+      <Show when={track.kind !== "subtitle"}>
+        <For each={trackClips(project()!, track.id)}>
+          {(clip) => (
+            <button
+              type="button"
+              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
+              style={{
+                left: `${toPx(clip.start)}px`,
+                width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
+              }}
+              onPointerDown={(e) => beginClipDrag(e, clip)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSelectedClipId(clip.id);
+                setSelectedTrackId(track.id);
+                setSelectedSubtitleId(null);
+              }}
+            >
+              <span>{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
+              <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
+              <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
+            </button>
+          )}
+        </For>
+      </Show>
+      <Show when={track.id === captionHostTrackId() || track.kind === "subtitle"}>
+        <For each={pendingSubtitleRanges().filter((item) => item.trackId === track.id)}>
+          {(pending) => (
+            <div
+              class="tl-seg tl-seg--clip tl-seg--video tl-seg--subtitle-pending"
+              style={{
+                left: `${toPx(pending.start)}px`,
+                width: `${Math.max(18, (pending.end - pending.start) * pxPerSecond())}px`,
+              }}
+            >
+              <div class="tl-subtitle-pending-core">
+                <span>{pending.label}</span>
+                <div class="tl-subtitle-pending-dots" aria-hidden="true">
+                  <i />
+                  <i />
+                  <i />
+                </div>
+              </div>
+            </div>
+          )}
+        </For>
+        <For each={visibleTrackSubtitles(track.id)}>
+          {(caption) => (
+            <button
+              type="button"
+              class={`tl-seg tl-seg--subtitle${selectedSubtitleId() === caption.id ? " is-active" : ""}`}
+              style={{
+                left: `${toPx(caption.start)}px`,
+                width: `${Math.max(8, (caption.end - caption.start) * pxPerSecond())}px`,
+              }}
+              onClick={(e) => {
+                e.stopPropagation();
+                setSelectedSubtitleId(caption.id);
+                setSelectedTrackId(track.id);
+                setSelectedClipId(null);
+              }}
+            >
+              <span>{caption.text}</span>
+            </button>
+          )}
+        </For>
+      </Show>
+    </div>
+  );
+
   createEffect(() => {
-    if (!viewportRef || !autoFollow()) return;
+    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    if (!viewport || !autoFollow()) return;
     const px = toPx(playheadTime());
-    const vw = viewportRef.clientWidth;
-    if (px < viewportRef.scrollLeft + 40 || px > viewportRef.scrollLeft + vw - 40) {
-      viewportRef.scrollLeft = Math.max(0, px - vw / 3);
-      syncViewportMetrics();
+    const vw = viewport.clientWidth;
+    if (px < viewport.scrollLeft + 40 || px > viewport.scrollLeft + vw - 40) {
+      viewport.scrollLeft = Math.max(0, px - vw / 3);
+      syncHorizontalScroll(viewport);
     }
   });
   createEffect(() => {
     timelineWidth();
     contentWidth();
     duration();
-    requestAnimationFrame(syncViewportMetrics);
+    requestAnimationFrame(() => syncViewportMetrics());
   });
   createEffect(() => {
-    if (!viewportRef) return;
-    syncViewportMetrics();
-    const onScroll = () => syncViewportMetrics();
-    viewportRef.addEventListener("scroll", onScroll, { passive: true });
-    const observer = new ResizeObserver(syncViewportMetrics);
-    observer.observe(viewportRef);
+    const viewports = horizontalViewports();
+    if (!viewports.length) return;
+    syncViewportMetrics(viewports[0]);
+    const observer = new ResizeObserver(() => {
+      syncViewportMetrics();
+      initializeMirroredVerticalScroll();
+    });
+    viewports.forEach((viewport) => observer.observe(viewport));
+    requestAnimationFrame(initializeMirroredVerticalScroll);
     const onAssetDragEnd = () => clearDragPreview();
     window.addEventListener("fellini:asset-drag-end", onAssetDragEnd as EventListener);
     onCleanup(() => {
-      viewportRef?.removeEventListener("scroll", onScroll);
       observer.disconnect();
       window.removeEventListener("fellini:asset-drag-end", onAssetDragEnd as EventListener);
     });
   });
-  onCleanup(() => clearTimeout(zoomWheelResetHandle));
+  createEffect(
+    on(
+      () => selectedJobId(),
+      () => {
+        didInitMirroredVertical = false;
+        requestAnimationFrame(initializeMirroredVerticalScroll);
+      },
+    ),
+  );
+  onCleanup(() => {
+    clearTimeout(zoomWheelResetHandle);
+    if (horizontalSyncHandle) cancelAnimationFrame(horizontalSyncHandle);
+    if (verticalSyncHandle) cancelAnimationFrame(verticalSyncHandle);
+  });
 
   return (
     <div class="panel timeline-panel">
@@ -1367,42 +1921,19 @@ const TimelinePanel: Component<{
       <Show when={project()} fallback={<div class="placeholder">Timeline non disponibile</div>}>
         <div class="timeline-shell">
           <div class="timeline-body">
-            <div class="tl-labels">
-              <div class="tl-label tl-label--ruler" />
-              <For each={tracks()}>
-                {(track) => (
-                  <button
-                    type="button"
-                    class={`tl-label tl-label--dynamic${selectedTrackId() === track.id ? " active" : ""}`}
-                    style={{ height: `${trackHeight(track.kind)}px` }}
-                    onClick={() => {
-                      setSelectedTrackId(track.id);
-                      setSelectedClipId(null);
-                      setSelectedSubtitleId(null);
-                    }}
-                  >
-                    {track.name}
-                  </button>
-                )}
-              </For>
-            </div>
+            <div class="tl-label tl-label--ruler" />
             <div
-              ref={viewportRef}
-              class="timeline-viewport"
+              ref={rulerViewportRef}
+              class="timeline-ruler-viewport"
               onWheel={onTimelineWheel}
-              onDragLeave={(e) => {
-                const nextTarget = e.relatedTarget;
-                if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
-                clearDragPreview();
-              }}
-              onDrop={() => clearDragPreview()}
+              onScroll={onRulerScroll}
             >
               <div
-                ref={innerRef}
+                ref={rulerInnerRef}
                 class="timeline-scroll-inner"
                 style={{ width: `${contentWidth()}px` }}
               >
-                <div class="tl-playhead" style={{ left: `${toPx(playheadTime())}px` }} />
+                <div class="tl-playhead tl-playhead--ruler" style={{ left: `${toPx(playheadTime())}px` }} />
                 <div class="tl-ruler" onPointerDown={beginRulerScrub}>
                   <For each={rulerTicks()}>
                     {(tick) => (
@@ -1415,109 +1946,64 @@ const TimelinePanel: Component<{
                     )}
                   </For>
                 </div>
-                <For each={tracks()}>
-                  {(track) => (
-                    <div
-                      class={`tl-track tl-track--project tl-track--${track.kind}`}
-                      style={{ height: `${trackHeight(track.kind)}px` }}
-                      onDragOver={(e) => {
-                        e.preventDefault();
-                        e.dataTransfer!.dropEffect = "copy";
-                        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
-                        if (!assetId) {
-                          clearDragPreview();
-                          return;
-                        }
-                        updateDragPreview(assetId, track.id, e.clientX);
-                      }}
-                      onDragLeave={(e) => {
-                        const nextTarget = e.relatedTarget;
-                        if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
-                        const preview = dragPreview();
-                        if (preview?.trackIds.includes(track.id)) clearDragPreview();
-                      }}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        const current = project();
-                        if (!current) return;
-                        const assetId = e.dataTransfer?.getData("application/x-fellini-asset");
-                        if (!assetId) return;
-                        const asset = assetById(current, assetId);
-                        if (!asset || !compatibleTrack(asset, track)) return;
-                        const start = getTimeFromPointer(e.clientX);
-                        const { clips, primaryClipId } = createClipsForAssetDrop(current, asset, track, start);
-                        if (!clips.length || !primaryClipId) return;
-                        props.updateProject((value) => upsertClips(value, clips));
-                        clearDragPreview();
-                        setSelectedTrackId(track.id);
-                        setSelectedClipId(primaryClipId);
-                        setSelectedSubtitleId(null);
-                      }}
-                    >
-                      <Show when={dragPreview() && dragPreview()!.trackIds.includes(track.id)}>
-                        <div class="tl-drop-caret" style={{ left: `${toPx(dragPreview()!.start)}px` }} />
-                        <div
-                          class={`tl-seg tl-seg--clip tl-seg--ghost tl-seg--${track.kind}`}
-                          style={{
-                            left: `${toPx(dragPreview()!.start)}px`,
-                            width: `${Math.max(8, dragPreview()!.duration * pxPerSecond())}px`,
-                          }}
-                        >
-                          <span>{dragPreview()!.label}</span>
-                        </div>
-                      </Show>
-                      <Show when={track.kind !== "subtitle"}>
-                        <For each={trackClips(project()!, track.id)}>
-                          {(clip) => (
-                            <button
-                              type="button"
-                              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
-                              style={{
-                                left: `${toPx(clip.start)}px`,
-                                width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
-                              }}
-                              onPointerDown={(e) => beginClipDrag(e, clip)}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedClipId(clip.id);
-                                setSelectedTrackId(track.id);
-                                setSelectedSubtitleId(null);
-                                setSeekRequest(clip.start);
-                              }}
-                            >
-                              <span>{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
-                              <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
-                              <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
-                            </button>
-                          )}
-                        </For>
-                      </Show>
-                      <Show when={track.kind === "subtitle"}>
-                        <For each={trackSubtitles(project()!, track.id)}>
-                          {(caption) => (
-                            <button
-                              type="button"
-                              class={`tl-seg tl-seg--subtitle${selectedSubtitleId() === caption.id ? " is-active" : ""}`}
-                              style={{
-                                left: `${toPx(caption.start)}px`,
-                                width: `${Math.max(8, (caption.end - caption.start) * pxPerSecond())}px`,
-                              }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedSubtitleId(caption.id);
-                                setSelectedTrackId(track.id);
-                                setSelectedClipId(null);
-                                setSeekRequest(caption.start);
-                              }}
-                            >
-                              <span>{caption.text}</span>
-                            </button>
-                          )}
-                        </For>
-                      </Show>
-                    </div>
-                  )}
-                </For>
+              </div>
+            </div>
+
+            <div
+              ref={assetLabelsRef}
+              class="tl-labels tl-labels--group tl-labels--assets"
+              onScroll={onGroupLabelsScroll("asset")}
+            >
+              <For each={assetTracks()}>{renderTrackLabel}</For>
+            </div>
+            <div
+              ref={assetViewportRef}
+              class="timeline-viewport timeline-viewport--group timeline-viewport--assets"
+              onWheel={onTimelineWheel}
+              onScroll={onGroupViewportScroll("asset")}
+              onDragLeave={(e) => {
+                const nextTarget = e.relatedTarget;
+                if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+                clearDragPreview();
+              }}
+              onDrop={() => clearDragPreview()}
+            >
+              <div
+                ref={assetInnerRef}
+                class="timeline-scroll-inner timeline-scroll-inner--assets"
+                style={{ width: `${contentWidth()}px` }}
+              >
+                <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
+                <For each={assetTracks()}>{renderTrackRow}</For>
+              </div>
+            </div>
+
+            <div
+              ref={audioLabelsRef}
+              class="tl-labels tl-labels--group tl-labels--audio"
+              onScroll={onGroupLabelsScroll("audio")}
+            >
+              <For each={audioTracks()}>{renderTrackLabel}</For>
+            </div>
+            <div
+              ref={audioViewportRef}
+              class="timeline-viewport timeline-viewport--group timeline-viewport--audio"
+              onWheel={onTimelineWheel}
+              onScroll={onGroupViewportScroll("audio")}
+              onDragLeave={(e) => {
+                const nextTarget = e.relatedTarget;
+                if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+                clearDragPreview();
+              }}
+              onDrop={() => clearDragPreview()}
+            >
+              <div
+                ref={audioInnerRef}
+                class="timeline-scroll-inner timeline-scroll-inner--audio"
+                style={{ width: `${contentWidth()}px` }}
+              >
+                <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
+                <For each={audioTracks()}>{renderTrackRow}</For>
               </div>
             </div>
           </div>
