@@ -13,6 +13,7 @@ import {
   useEditorialProjectQuery,
   useJobPolling,
   useJobQuery,
+  useTranscribeLaneMutation,
   useUpdateEditorialProjectMutation,
   useUploadEditorialAssetMutation,
 } from "../api/queries";
@@ -93,8 +94,20 @@ const RULER_MINOR_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 3
 const RULER_MINOR_TARGET_PX = 18;
 const RULER_LABEL_EVERY_N_TICKS = 4;
 const TIMELINE_RULER_HEIGHT = 20;
+const AUDIO_PREWARM_LEAD_SECONDS = 0.8;
+const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
+
+function readPersistedSidebarCollapsed(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 function isTypingTarget(target: EventTarget | null): boolean {
   return target instanceof HTMLElement
@@ -134,7 +147,7 @@ const Workspace: Component = () => {
   const [draftProject, setDraftProject] = createSignal<EditorialProject | null>(null);
   const [timelineHeight, setTimelineHeight] = createSignal<number | null>(null);
   const [browserWidth, setBrowserWidth] = createSignal(280);
-  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = createSignal(readPersistedSidebarCollapsed());
   let editorMainRef: HTMLDivElement | undefined;
   let saveHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -184,6 +197,17 @@ const Workspace: Component = () => {
         setSelectedSubtitleId(null);
       },
     ),
+  );
+
+  createEffect(
+    on(sidebarCollapsed, (collapsed) => {
+      if (typeof window === "undefined") return;
+      try {
+        window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+      } catch {
+        // Ignore storage failures and keep the in-memory state.
+      }
+    }),
   );
 
   createEffect(() => {
@@ -561,10 +585,10 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   const [codecStatus, setCodecStatus] = createSignal<"ready" | "unsupported">("unsupported");
   const [stageSize, setStageSize] = createSignal({ width: 0, height: 0 });
   const [transportPlaying, setTransportPlaying] = createSignal(false);
-  const [videoFrameReady, setVideoFrameReady] = createSignal(false);
   let stageRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
-  let videoRef: HTMLVideoElement | undefined;
+  let playbackVideoRef: HTMLVideoElement | undefined;
+  let decoderVideoRef: HTMLVideoElement | undefined;
   const audioRefs = new Map<string, HTMLAudioElement>();
   let gpuContext: any;
   let gpuDevice: any;
@@ -576,6 +600,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   let transportStartTime = 0;
   let videoFrameCallbackHandle: number | null = null;
   let videoWarmupToken = 0;
+  const desiredMediaTimes = new WeakMap<HTMLMediaElement, number>();
 
   const project = () => props.project();
   const frameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
@@ -640,6 +665,24 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
         || (a.start - b.start)
       );
   });
+  const monitorAudioClips = createMemo(() => {
+    const current = project();
+    if (!current) return [] as TimelineClip[];
+    const at = playheadTime();
+    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
+    return [...current.clips]
+      .filter((clip) => {
+        const track = getTrack(current, clip.track_id);
+        if (!clip.enabled || track?.kind !== "audio" || track.muted || clip.audio.muted) return false;
+        const clipEnd = clip.start + (clip.source_out - clip.source_in);
+        return clipEnd >= (at - AUDIO_PREWARM_TRAIL_SECONDS)
+          && clip.start <= (at + AUDIO_PREWARM_LEAD_SECONDS);
+      })
+      .sort((a, b) =>
+        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
+        || (a.start - b.start)
+      );
+  });
   const mediaSource = (clip: TimelineClip | null) => {
     const current = project();
     const jobId = selectedJobId();
@@ -673,17 +716,50 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   const syncClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
     if (!clip || !element) return;
     const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
+    desiredMediaTimes.set(element, localTime);
     if (element.readyState < 1) return;
+    if (element.seeking) return;
     try {
-      if (Math.abs(element.currentTime - localTime) > 0.12) element.currentTime = localTime;
+      if (Math.abs(element.currentTime - localTime) > 0.08) element.currentTime = localTime;
     } catch {
       // Media can reject seeks before metadata is fully ready; tick will retry.
+    }
+  };
+  const syncAudioClipTime = (
+    clip: TimelineClip | null,
+    element: HTMLAudioElement | undefined,
+    mode: "soft" | "force" = "soft",
+  ) => {
+    if (!clip || !element) return;
+    const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
+    desiredMediaTimes.set(element, localTime);
+    if (element.readyState < 1) return;
+    if (element.seeking) return;
+    const drift = Math.abs(element.currentTime - localTime);
+    const threshold = mode === "force"
+      ? 0.02
+      : (transportPlaying() && !element.paused ? 0.35 : 0.1);
+    try {
+      if (drift > threshold) element.currentTime = localTime;
+    } catch {
+      // Media can reject seeks before metadata is fully ready; tick will retry.
+    }
+  };
+  const settleClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
+    if (!clip || !element) return;
+    if (element.readyState < 1 || element.seeking) return;
+    const target = desiredMediaTimes.get(element);
+    if (target === undefined) return;
+    try {
+      if (Math.abs(element.currentTime - target) > 0.04) element.currentTime = target;
+    } catch {
+      // Ignore late seek reconciliation errors.
     }
   };
   const pausePlayback = () => {
     transportStartTime = playheadTime();
     setTransportPlaying(false);
-    videoRef?.pause();
+    playbackVideoRef?.pause();
     for (const element of audioRefs.values()) element.pause();
   };
   const playMediaElement = (element: HTMLMediaElement | undefined) => {
@@ -691,10 +767,10 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     void element.play().catch(() => {});
   };
   const clearVideoFrameCallback = () => {
-    if (!videoRef || videoFrameCallbackHandle === null || !("cancelVideoFrameCallback" in videoRef)) return;
+    if (!decoderVideoRef || videoFrameCallbackHandle === null || !("cancelVideoFrameCallback" in decoderVideoRef)) return;
     try {
       (
-        videoRef as HTMLVideoElement & {
+        decoderVideoRef as HTMLVideoElement & {
           cancelVideoFrameCallback?: (handle: number) => void;
         }
       ).cancelVideoFrameCallback?.(videoFrameCallbackHandle);
@@ -704,7 +780,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     videoFrameCallbackHandle = null;
   };
   const scheduleVideoFrameProbe = () => {
-    const video = videoRef as (HTMLVideoElement & {
+    const video = decoderVideoRef as (HTMLVideoElement & {
       requestVideoFrameCallback?: (cb: () => void) => number;
     }) | undefined;
     if (!video || !("requestVideoFrameCallback" in video)) return;
@@ -712,7 +788,6 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     try {
       videoFrameCallbackHandle = video.requestVideoFrameCallback?.(() => {
         videoFrameCallbackHandle = null;
-        setVideoFrameReady(true);
         if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
       }) ?? null;
     } catch {
@@ -720,12 +795,12 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     }
   };
   const requestVideoFrameDraw = () => {
-    if (!videoRef) return;
+    if (!decoderVideoRef) return;
     scheduleVideoFrameProbe();
     if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
   };
   const warmVideoFrame = () => {
-    const video = videoRef;
+    const video = decoderVideoRef;
     const clip = activeVideoClip();
     if (!video || !clip || transportPlaying() || video.readyState < 2) return;
     const token = ++videoWarmupToken;
@@ -733,7 +808,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const settle = () => {
       if (token !== videoWarmupToken) return;
       video.pause();
-      syncClipTime(activeVideoClip(), videoRef);
+      syncClipTime(activeVideoClip(), decoderVideoRef);
       requestVideoFrameDraw();
     };
     const playAttempt = video.play();
@@ -765,11 +840,12 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     setPlayheadTime(startTime);
     syncTransportClock(startTime);
     setTransportPlaying(true);
-    syncClipTime(activeVideoClip(), videoRef);
+    syncClipTime(activeVideoClip(), playbackVideoRef);
+    syncClipTime(activeVideoClip(), decoderVideoRef);
     for (const clip of activeAudioClips()) {
-      syncClipTime(clip, audioRefs.get(clip.id));
+      syncAudioClipTime(clip, audioRefs.get(clip.id), "force");
     }
-    playMediaElement(videoRef);
+    playMediaElement(playbackVideoRef);
     for (const clip of activeAudioClips()) {
       playMediaElement(audioRefs.get(clip.id));
     }
@@ -864,7 +940,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   };
 
   const drawFrame = () => {
-    const video = videoRef;
+    const video = decoderVideoRef;
     if (
       !canvasRef
       || !video
@@ -907,7 +983,6 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       pass.draw(6);
       pass.end();
       gpuDevice.queue.submit([encoder.finish()]);
-      if (!videoFrameReady()) setVideoFrameReady(true);
     } catch {
       setGpuStatus("fallback");
     }
@@ -926,25 +1001,29 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       }
     }
     const clip = activeVideoClip();
-    if (clip) syncClipTime(clip, videoRef);
-    else videoRef?.pause();
+    if (clip) {
+      syncClipTime(clip, playbackVideoRef);
+      syncClipTime(clip, decoderVideoRef);
+    } else {
+      playbackVideoRef?.pause();
+      decoderVideoRef?.pause();
+    }
     const activeAudioIds = new Set(activeAudioClips().map((item) => item.id));
     for (const audioClip of activeAudioClips()) {
       const element = audioRefs.get(audioClip.id);
       if (!element) continue;
       element.volume = Math.max(0, Math.min(1, audioClip.audio.gain));
-      syncClipTime(audioClip, element);
+      syncAudioClipTime(audioClip, element, "soft");
     }
     for (const [clipId, element] of audioRefs.entries()) {
       if (!activeAudioIds.has(clipId)) element.pause();
     }
     if (transportPlaying()) {
-      if (clip) playMediaElement(videoRef);
+      if (clip) playMediaElement(playbackVideoRef);
       for (const audioClip of activeAudioClips()) {
         playMediaElement(audioRefs.get(audioClip.id));
       }
     }
-    if (gpuStatus() === "ready") drawFrame();
     raf = requestAnimationFrame(tick);
   };
 
@@ -990,45 +1069,57 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   createEffect(() => {
     const src = activeVideoSource();
     const key = activeVideoSourceKey();
-    if (!videoRef) return;
+    if (!playbackVideoRef && !decoderVideoRef) return;
     videoWarmupToken += 1;
     clearVideoFrameCallback();
-    setVideoFrameReady(false);
     if (!src || !key) {
-      videoRef.pause();
-      videoRef.removeAttribute("src");
-      videoRef.load();
+      playbackVideoRef?.pause();
+      decoderVideoRef?.pause();
       return;
     }
-    if (mediaElementHasSource(videoRef, src)) {
-      syncClipTime(activeVideoClip(), videoRef);
-      requestVideoFrameDraw();
-      warmVideoFrame();
-      return;
+    if (playbackVideoRef) {
+      if (mediaElementHasSource(playbackVideoRef, src)) {
+        syncClipTime(activeVideoClip(), playbackVideoRef);
+      } else {
+        playbackVideoRef.pause();
+        playbackVideoRef.removeAttribute("src");
+        playbackVideoRef.load();
+        playbackVideoRef.src = src;
+        playbackVideoRef.load();
+      }
     }
-    videoRef.pause();
-    videoRef.removeAttribute("src");
-    videoRef.load();
-    videoRef.src = src;
-    videoRef.load();
+    if (decoderVideoRef) {
+      if (mediaElementHasSource(decoderVideoRef, src)) {
+        syncClipTime(activeVideoClip(), decoderVideoRef);
+        requestVideoFrameDraw();
+        warmVideoFrame();
+      } else {
+        decoderVideoRef.pause();
+        decoderVideoRef.removeAttribute("src");
+        decoderVideoRef.load();
+        decoderVideoRef.src = src;
+        decoderVideoRef.load();
+      }
+    }
   });
   createEffect(() => {
-    const activeIds = new Set(activeAudioClips().map((clip) => clip.id));
+    const mountedIds = new Set(monitorAudioClips().map((clip) => clip.id));
     for (const [clipId, element] of audioRefs.entries()) {
-      if (activeIds.has(clipId)) continue;
+      if (mountedIds.has(clipId)) continue;
       element.pause();
       audioRefs.delete(clipId);
     }
-    for (const clip of activeAudioClips()) {
+    for (const clip of monitorAudioClips()) {
       const element = audioRefs.get(clip.id);
       const src = mediaSourceForClip(clip);
       if (!element || !src) continue;
+      const track = project() ? getTrack(project()!, clip.track_id) : null;
       if (!mediaElementHasSource(element, src)) {
         element.src = src;
         element.load();
       }
       element.volume = Math.max(0, Math.min(1, clip.audio.gain));
-      element.muted = !!clip.audio.muted;
+      element.muted = !!clip.audio.muted || !!track?.muted;
     }
   });
 
@@ -1037,9 +1128,10 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       if (time === null) return;
       setPlayheadTime(time);
       if (transportPlaying()) syncTransportClock(time);
-      syncClipTime(activeVideoClip(), videoRef);
+      syncClipTime(activeVideoClip(), playbackVideoRef);
+      syncClipTime(activeVideoClip(), decoderVideoRef);
       for (const clip of activeAudioClips()) {
-        syncClipTime(clip, audioRefs.get(clip.id));
+        syncAudioClipTime(clip, audioRefs.get(clip.id), "force");
       }
       setSeekRequest(null);
     }),
@@ -1086,7 +1178,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
             height={sequenceHeight()}
           />
           <video
-            ref={videoRef}
+            ref={playbackVideoRef}
             controls
             preload="auto"
             muted
@@ -1094,45 +1186,80 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
             class="monitor-fallback-video"
             style={{ display: activeVideoSource() ? "block" : "none" }}
             onLoadedMetadata={() => {
-              syncClipTime(activeVideoClip(), videoRef);
+              syncClipTime(activeVideoClip(), playbackVideoRef);
+            }}
+            onLoadedData={() => {
+              syncClipTime(activeVideoClip(), playbackVideoRef);
+              if (transportPlaying()) playMediaElement(playbackVideoRef);
+            }}
+            onCanPlay={() => {
+              syncClipTime(activeVideoClip(), playbackVideoRef);
+              if (transportPlaying()) playMediaElement(playbackVideoRef);
+            }}
+            onSeeked={() => {
+              settleClipTime(activeVideoClip(), playbackVideoRef);
+              if (transportPlaying()) playMediaElement(playbackVideoRef);
+            }}
+          />
+          <video
+            ref={decoderVideoRef}
+            preload="auto"
+            muted
+            playsinline
+            class="monitor-decoder-video"
+            aria-hidden="true"
+            tabindex={-1}
+            onLoadedMetadata={() => {
+              syncClipTime(activeVideoClip(), decoderVideoRef);
               requestVideoFrameDraw();
               warmVideoFrame();
             }}
             onLoadedData={() => {
-              syncClipTime(activeVideoClip(), videoRef);
+              syncClipTime(activeVideoClip(), decoderVideoRef);
               requestVideoFrameDraw();
-              warmVideoFrame();
-              if (transportPlaying()) playMediaElement(videoRef);
             }}
             onCanPlay={() => {
-              syncClipTime(activeVideoClip(), videoRef);
+              syncClipTime(activeVideoClip(), decoderVideoRef);
               requestVideoFrameDraw();
-              warmVideoFrame();
-              if (transportPlaying()) playMediaElement(videoRef);
             }}
             onSeeked={() => {
-              syncClipTime(activeVideoClip(), videoRef);
+              settleClipTime(activeVideoClip(), decoderVideoRef);
               requestVideoFrameDraw();
-              warmVideoFrame();
-              if (transportPlaying()) playMediaElement(videoRef);
             }}
           />
         </div>
         <div class="monitor-audio hidden" aria-hidden="true">
-          <For each={activeAudioClips()}>
+          <For each={monitorAudioClips()}>
             {(clip) => (
               <audio
                 ref={(element) => {
                   if (!element) return;
                   audioRefs.set(clip.id, element);
                 }}
-                preload="metadata"
+                preload="auto"
                 style={{ display: "none" }}
                 onLoadedData={(event) => {
                   const element = event.currentTarget;
                   audioRefs.set(clip.id, element);
-                  syncClipTime(clip, element);
-                  if (transportPlaying()) playMediaElement(element);
+                  syncAudioClipTime(clip, element, "force");
+                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
+                    playMediaElement(element);
+                  }
+                }}
+                onCanPlay={(event) => {
+                  const element = event.currentTarget;
+                  audioRefs.set(clip.id, element);
+                  syncAudioClipTime(clip, element, "force");
+                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
+                    playMediaElement(element);
+                  }
+                }}
+                onSeeked={(event) => {
+                  const element = event.currentTarget;
+                  settleClipTime(clip, element);
+                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
+                    playMediaElement(element);
+                  }
                 }}
               />
             )}
@@ -1147,6 +1274,8 @@ const TimelinePanel: Component<{
   project: Accessor<EditorialProject | null>;
   updateProject: (next: ProjectUpdater) => void;
 }> = (props) => {
+  const job = useJobQuery(selectedJobId);
+  const transcribeLaneMut = useTranscribeLaneMutation();
   const [dragPreview, setDragPreview] = createSignal<{
     assetId: string;
     start: number;
@@ -1174,6 +1303,8 @@ const TimelinePanel: Component<{
   let verticalSyncHandle: number | undefined;
   let syncingHorizontal = false;
   let syncingVertical = false;
+  let activeHorizontalSource: HTMLDivElement | null = null;
+  let activeVerticalSource: HTMLDivElement | null = null;
   let didInitMirroredVertical = false;
   const actualDuration = createMemo(() => (project() ? projectDuration(project()!) : 0));
   const tailDuration = createMemo(() =>
@@ -1221,6 +1352,42 @@ const TimelinePanel: Component<{
     trackSubtitles(project()!, trackId).filter((caption) => !(
       runningSubtitleLaneIds().has(caption.source_lane_id) && caption.origin === "generated"
     ));
+  const selectTrack = (trackId: string) => {
+    setSelectedTrackId(trackId);
+    setSelectedClipId(null);
+    setSelectedSubtitleId(null);
+  };
+  const updateTrack = (trackId: string, patch: Partial<TimelineTrack>) => {
+    props.updateProject((current) => ({
+      ...current,
+      tracks: current.tracks.map((track) => (
+        track.id === trackId ? { ...track, ...patch } : track
+      )),
+    }));
+  };
+  const laneClipCount = (trackId: string) => (project() ? trackClips(project()!, trackId).length : 0);
+  const laneTranscriptionStatus = (trackId: string) =>
+    project()?.lane_transcriptions.find((lane) => lane.lane_id === trackId)?.status ?? "idle";
+  const canTranscribeLane = (track: TimelineTrack) =>
+    track.kind === "audio"
+    && !!selectedJobId()
+    && !!job.data
+    && job.data.status !== "running"
+    && laneClipCount(track.id) > 0
+    && laneTranscriptionStatus(track.id) !== "running";
+  const triggerLaneSubtitles = (trackId: string) => {
+    const jobId = selectedJobId();
+    if (!jobId) return;
+    transcribeLaneMut.mutate({ jobId, laneId: trackId });
+  };
+  const subtitleButtonTitle = (trackId: string) => {
+    const status = laneTranscriptionStatus(trackId);
+    if (laneClipCount(trackId) <= 0) return "Lane vuota";
+    if (status === "running") return "Generazione sottotitoli in corso";
+    if (status === "completed") return "Rigenera i sottotitoli per questa lane";
+    if (status === "failed") return "Riprova a generare i sottotitoli per questa lane";
+    return "Genera sottotitoli da questa lane audio";
+  };
   const viewportFrac = createMemo(() => {
     const visible = Math.min(viewportWidth(), contentWidth());
     return Math.max(visible / Math.max(contentWidth(), 1), 0);
@@ -1271,18 +1438,21 @@ const TimelinePanel: Component<{
     if (horizontalSyncHandle) cancelAnimationFrame(horizontalSyncHandle);
     horizontalSyncHandle = requestAnimationFrame(() => {
       syncingHorizontal = false;
+      activeHorizontalSource = null;
     });
   };
   const scheduleVerticalUnlock = () => {
     if (verticalSyncHandle) cancelAnimationFrame(verticalSyncHandle);
     verticalSyncHandle = requestAnimationFrame(() => {
       syncingVertical = false;
+      activeVerticalSource = null;
     });
   };
   const syncHorizontalScroll = (source: HTMLDivElement) => {
     syncViewportMetrics(source);
-    if (syncingHorizontal) return;
+    if (syncingHorizontal && activeHorizontalSource !== source) return;
     syncingHorizontal = true;
+    activeHorizontalSource = source;
     const nextLeft = source.scrollLeft;
     for (const viewport of horizontalViewports()) {
       if (viewport === source) continue;
@@ -1304,9 +1474,10 @@ const TimelinePanel: Component<{
     if (ownLabels && ownLabels !== source && Math.abs(ownLabels.scrollTop - ownTop) > 0.5) {
       ownLabels.scrollTop = ownTop;
     }
-    if (syncingVertical) return;
+    if (syncingVertical && activeVerticalSource !== source) return;
 
     syncingVertical = true;
+    activeVerticalSource = source;
     const sourceMax = Math.max(source.scrollHeight - source.clientHeight, 0);
     const frac = sourceMax > 0 ? ownTop / sourceMax : 0;
     const otherMax = otherViewport
@@ -1678,18 +1849,86 @@ const TimelinePanel: Component<{
     syncMirroredVerticalScroll(group, event.currentTarget as HTMLDivElement);
   };
   const renderTrackLabel = (track: TimelineTrack) => (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       class={`tl-label tl-label--dynamic${selectedTrackId() === track.id ? " active" : ""}`}
       style={{ height: `${trackHeight(track.kind)}px` }}
-      onClick={() => {
-        setSelectedTrackId(track.id);
-        setSelectedClipId(null);
-        setSelectedSubtitleId(null);
+      onClick={() => selectTrack(track.id)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        selectTrack(track.id);
       }}
     >
-      {track.name}
-    </button>
+      <div class="tl-lane-card">
+        <div class="tl-lane-head">
+          <Show when={track.kind === "audio"}>
+            <span class="tl-lane-icon tl-lane-icon--audio">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6v4M5 4v8M8 2v12M11 4v8M14 6v4"/></svg>
+            </span>
+          </Show>
+          <Show when={track.kind === "video"}>
+            <span class="tl-lane-icon tl-lane-icon--video">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10" height="9" rx="1.5"/><path d="M11.5 6.5L14.5 4.5v7l-3-2"/></svg>
+            </span>
+          </Show>
+          <span class="tl-lane-name">{track.name}</span>
+          <Show when={track.kind === "audio" && track.role}>
+            <span class={`tl-lane-meta${track.role === "story" ? " is-story" : ""}`}>
+              {track.role === "story" ? "Story" : "Support"}
+            </span>
+          </Show>
+          <Show when={track.kind === "video"}>
+            <span class="tl-lane-meta">Canvas</span>
+          </Show>
+        </div>
+
+        <Show when={track.kind === "audio"}>
+          <div class="tl-lane-actions">
+            <button
+              type="button"
+              class={`tl-lane-btn tl-lane-btn--icon tl-lane-btn--subtitle${laneTranscriptionStatus(track.id) === "completed" ? " is-active" : ""}${laneTranscriptionStatus(track.id) === "running" ? " is-running" : ""}`}
+              disabled={!canTranscribeLane(track)}
+              aria-label={subtitleButtonTitle(track.id)}
+              title={subtitleButtonTitle(track.id)}
+              onClick={() => triggerLaneSubtitles(track.id)}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="14" height="10" rx="2"/><path d="M4 8h3M9 8h3M4 10.5h5"/></svg>
+            </button>
+            <button
+              type="button"
+              class={`tl-lane-btn tl-lane-btn--mute${track.muted ? " is-active" : ""}`}
+              title={track.muted ? "Riattiva audio lane" : "Metti in muto la lane"}
+              onClick={() => updateTrack(track.id, { muted: !track.muted })}
+            >
+              <Show when={!track.muted} fallback={
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L4 5.5H1.5v5H4L8 14V2z"/><path d="M12 5l-5 6M7 5l5 6"/></svg>
+              }>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L4 5.5H1.5v5H4L8 14V2z"/><path d="M11 6.5c.6.7 1 1.6 1 2.5s-.4 1.8-1 2.5"/></svg>
+              </Show>
+            </button>
+          </div>
+        </Show>
+        <Show when={track.kind === "video"}>
+          <div class="tl-lane-actions tl-lane-actions--single">
+            <button
+              type="button"
+              class={`tl-lane-btn tl-lane-btn--icon${track.visible ? " is-active" : ""}`}
+              aria-label={track.visible ? "Nascondi dal canvas questa lane video" : "Mostra nel canvas questa lane video"}
+              title={track.visible ? "Nascondi dal canvas questa lane video" : "Mostra nel canvas questa lane video"}
+              onClick={() => updateTrack(track.id, { visible: !track.visible })}
+            >
+              <Show when={track.visible} fallback={
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3l12 10M6.5 6.5a2 2 0 002.8 2.8M13.4 10.6C14.4 9.6 15 8.8 15 8c0-2.5-3.1-5-7-5-.8 0-1.6.1-2.3.3M1 8c0 2.5 3.1 5 7 5 .8 0 1.6-.1 2.3-.3"/></svg>
+              }>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2"/><path d="M1 8c0-2.5 3.1-5 7-5s7 2.5 7 5-3.1 5-7 5-7-2.5-7-5z"/></svg>
+              </Show>
+            </button>
+          </div>
+        </Show>
+      </div>
+    </div>
   );
   const renderTrackRow = (track: TimelineTrack) => (
     <div
@@ -1738,7 +1977,7 @@ const TimelinePanel: Component<{
             width: `${Math.max(8, dragPreview()!.duration * pxPerSecond())}px`,
           }}
         >
-          <span>{dragPreview()!.label}</span>
+          <span class="tl-clip-label">{dragPreview()!.label}</span>
         </div>
       </Show>
       <Show when={track.kind !== "subtitle"}>
@@ -1759,7 +1998,7 @@ const TimelinePanel: Component<{
                 setSelectedSubtitleId(null);
               }}
             >
-              <span>{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
+              <span class="tl-clip-label">{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
               <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
               <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
             </button>
@@ -1954,7 +2193,9 @@ const TimelinePanel: Component<{
               class="tl-labels tl-labels--group tl-labels--assets"
               onScroll={onGroupLabelsScroll("asset")}
             >
-              <For each={assetTracks()}>{renderTrackLabel}</For>
+              <div class="tl-labels-inner tl-labels-inner--assets">
+                <For each={assetTracks()}>{renderTrackLabel}</For>
+              </div>
             </div>
             <div
               ref={assetViewportRef}
@@ -1983,7 +2224,9 @@ const TimelinePanel: Component<{
               class="tl-labels tl-labels--group tl-labels--audio"
               onScroll={onGroupLabelsScroll("audio")}
             >
-              <For each={audioTracks()}>{renderTrackLabel}</For>
+              <div class="tl-labels-inner tl-labels-inner--audio">
+                <For each={audioTracks()}>{renderTrackLabel}</For>
+              </div>
             </div>
             <div
               ref={audioViewportRef}

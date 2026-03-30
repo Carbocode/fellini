@@ -10,6 +10,7 @@ from fellini.domain.models import (
     AudioTrackRole,
     ClipOrigin,
     EditorialProject,
+    InputAsset,
     LaneTranscription,
     LaneTranscriptionStatus,
     ProjectAsset,
@@ -105,10 +106,15 @@ class EditorialProjectStore:
             project, linked_migrated = self._normalize_linked_clip_groups(project)
             project, tracks_migrated = self._normalize_track_layout(project)
             hydrated = self._hydrate_legacy_captions(workspace, project)
+            hydrated, source_labels_migrated = self._normalize_source_asset_labels(
+                hydrated,
+                context.request.input_assets,
+            )
             hydrated, subtitles_migrated = self._normalize_generated_subtitles(hydrated)
             if (
                 linked_migrated
                 or tracks_migrated
+                or source_labels_migrated
                 or subtitles_migrated
                 or len(hydrated.captions) != len(project.captions)
             ):
@@ -130,7 +136,7 @@ class EditorialProjectStore:
         stored_name = f"lib_{uuid4().hex[:8]}{suffix}"
         target = workspace.upload_path(stored_name)
         target.write_bytes(payload)
-        asset = self._asset_from_media(workspace, target, label=Path(original_name).stem)
+        asset = self._asset_from_media(workspace, target, label=Path(original_name).name)
         project.assets.append(asset)
         project = self.save(workspace, project)
         return project, asset, stored_name
@@ -245,12 +251,48 @@ class EditorialProjectStore:
             source_asset = self._asset_from_media(
                 context.workspace,
                 Path(state.mezzanine_path),
-                label="Source",
+                label=self._source_asset_label(
+                    context.request.input_assets,
+                    Path(state.mezzanine_path),
+                ),
                 origin="ingest",
             )
             project.assets.append(source_asset)
 
         return self._hydrate_legacy_captions(context.workspace, project)
+
+    def _source_asset_label(self, input_assets: list[InputAsset], fallback_path: Path) -> str:
+        labels = [Path(asset.original_name).name for asset in input_assets if asset.original_name]
+        if not labels:
+            return fallback_path.name
+        if len(labels) == 1:
+            return labels[0]
+        return f"{labels[0]} +{len(labels) - 1}"
+
+    def _normalize_source_asset_labels(
+        self,
+        project: EditorialProject,
+        input_assets: list[InputAsset],
+    ) -> tuple[EditorialProject, bool]:
+        source_asset = next(
+            (
+                asset
+                for asset in project.assets
+                if asset.origin == "ingest" and asset.path.endswith("source_mezzanine.mp4")
+            ),
+            None,
+        )
+        if not source_asset:
+            return project, False
+        label = self._source_asset_label(input_assets, Path(source_asset.path))
+        if source_asset.label == label:
+            return project, False
+        updated = project.model_copy(deep=True)
+        for asset in updated.assets:
+            if asset.id == source_asset.id:
+                asset.label = label
+                break
+        return updated, True
 
     def _numeric_suffix(self, value: str) -> int | None:
         digits = []

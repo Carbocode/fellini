@@ -78,9 +78,22 @@ export function getMonitorSources(
   job: JobSnapshot,
 ): { path: string; label: string }[] {
   const catalog = buildArtifactCatalog(job);
+  const sourceInputLabel = (() => {
+    const labels = (job.request.input_assets ?? [])
+      .map((asset) => baseName(asset.original_name))
+      .filter(Boolean);
+    if (!labels.length) return null;
+    if (labels.length === 1) return labels[0];
+    return `${labels[0]} +${labels.length - 1}`;
+  })();
   return MONITOR_ORDER.map((suffix) => catalog.find((i) => i.path.endsWith(suffix)))
     .filter(Boolean)
-    .map((i) => ({ path: i!.path, label: humanizeMediaName(i!.path) }));
+    .map((i) => ({
+      path: i!.path,
+      label: i!.path.endsWith("source_mezzanine.mp4")
+        ? (sourceInputLabel ?? humanizeMediaName(i!.path))
+        : humanizeMediaName(i!.path),
+    }));
 }
 
 export function canRunStep(job: JobSnapshot, stepName: string): boolean {

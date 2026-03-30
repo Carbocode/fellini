@@ -680,13 +680,8 @@ export function isSubtitleTrack(track: TimelineTrack | null): boolean {
   return track?.kind === "subtitle";
 }
 
-export function trackHeight(kind: TimelineTrackKind): number {
-  switch (kind) {
-    case "video":
-      return 52;
-    case "audio":
-      return 47;
-    case "subtitle":
-      return 39;
-  }
+const TIMELINE_TRACK_HEIGHT = 64;
+
+export function trackHeight(_kind: TimelineTrackKind): number {
+  return TIMELINE_TRACK_HEIGHT;
 }
