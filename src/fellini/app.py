@@ -22,6 +22,7 @@ from fellini.domain.models import (
 )
 from fellini.log import configure_logging, get_logger
 from fellini.pipeline.context import PipelineContext
+from fellini.services.asset_previews import AssetPreviewService
 from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
@@ -110,6 +111,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     store = JobStore(app_settings)
     manager = JobManager(app_settings, store=store)
     editorial_projects = EditorialProjectStore(app_settings)
+    asset_previews = AssetPreviewService(app_settings)
     logger.info(
         "app.create settings workspace_root=%s jobs_root=%s host=%s port=%s log_level=%s",
         app_settings.workspace_root,
@@ -124,6 +126,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.store = store
     app.state.manager = manager
     app.state.editorial_projects = editorial_projects
+    app.state.asset_previews = asset_previews
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -172,7 +175,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     def ensure_editorial_project(snapshot: JobSnapshot):
         context = build_context(snapshot)
-        return editorial_projects.ensure(context)
+        return asset_previews.enrich_project(
+            context.workspace,
+            editorial_projects.ensure(context),
+        )
 
     def step_readiness(
         snapshot: JobSnapshot,
@@ -430,7 +436,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 store.mark_pending(job_id)
             return {
                 "job": enrich_snapshot(store.load(job_id)),
-                "project": editorial_projects.load(context.workspace),
+                "project": asset_previews.enrich_project(
+                    context.workspace,
+                    editorial_projects.load(context.workspace),
+                ),
             }
         except Exception as exc:
             store.fail_step(job_id, StepName.transcription, str(exc))
@@ -620,7 +629,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             saved = editorial_projects.save_with_revision_check(workspace, project)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return saved
+        return asset_previews.enrich_project(workspace, saved)
+
+    @app.post("/api/jobs/{job_id}/asset-previews")
+    async def generate_asset_previews(job_id: str, payload: dict[str, list[str]] = Body(...)):
+        snapshot = _require_job(store, job_id)
+        project = ensure_editorial_project(snapshot)
+        asset_ids = payload.get("asset_ids", [])
+        return asset_previews.request_previews(snapshot, project, asset_ids)
 
     @app.post("/api/jobs/{job_id}/assets")
     async def upload_editorial_asset(job_id: str, file: UploadFile = File(...)):
@@ -656,7 +672,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             )
             if asset is None:
                 raise HTTPException(status_code=500, detail="Failed to bootstrap the source asset.")
-            return {"asset": asset, "project": project}
+            enriched_project = asset_previews.enrich_project(workspace, project)
+            enriched_asset = next((item for item in enriched_project.assets if item.id == asset.id), asset)
+            return {"asset": enriched_asset, "project": enriched_project}
 
         if not editorial_projects.exists(workspace):
             ensure_editorial_project(snapshot)
@@ -665,7 +683,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             original_name=original_name,
             payload=payload,
         )
-        return {"asset": asset, "project": project}
+        enriched_project = asset_previews.enrich_project(workspace, project)
+        enriched_asset = next((item for item in enriched_project.assets if item.id == asset.id), asset)
+        return {"asset": enriched_asset, "project": enriched_project}
 
     @app.post("/api/jobs/{job_id}/audio-lanes/{lane_id}/transcribe")
     async def transcribe_audio_lane(job_id: str, lane_id: str):

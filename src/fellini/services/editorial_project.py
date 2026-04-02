@@ -62,9 +62,10 @@ class EditorialProjectStore:
             },
             deep=True,
         )
+        serialized = self._strip_runtime_asset_fields(project)
         workspace.project_dir.mkdir(parents=True, exist_ok=True)
         workspace.editorial_project_path.write_text(
-            project.model_dump_json(indent=2),
+            serialized.model_dump_json(indent=2),
             encoding="utf-8",
         )
         logger.info(
@@ -77,6 +78,12 @@ class EditorialProjectStore:
             len(project.captions),
         )
         return project
+
+    def _strip_runtime_asset_fields(self, project: EditorialProject) -> EditorialProject:
+        stripped = project.model_copy(deep=True)
+        for asset in stripped.assets:
+            asset.preview = None
+        return stripped
 
     def save_with_revision_check(
         self, workspace: JobWorkspace, project: EditorialProject

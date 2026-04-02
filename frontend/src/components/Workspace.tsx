@@ -9,10 +9,12 @@ import {
   type Accessor,
   type Component,
 } from "solid-js";
+import { useQueryClient } from "@tanstack/solid-query";
 import {
   useEditorialProjectQuery,
   useJobPolling,
   useJobQuery,
+  useRequestAssetPreviewsMutation,
   useTranscribeLaneMutation,
   useUpdateEditorialProjectMutation,
   useUploadEditorialAssetMutation,
@@ -40,6 +42,7 @@ import {
   updateTabLabel,
 } from "../store";
 import type {
+  AssetPreviewEntry,
   EditorialProject,
   JobSnapshot,
   ProjectAsset,
@@ -97,8 +100,67 @@ const TIMELINE_RULER_HEIGHT = 20;
 const AUDIO_PREWARM_LEAD_SECONDS = 0.8;
 const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
+const CLIP_PREVIEW_MIN_WIDTH_PX = 32;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
+type WaveformData = {
+  version: number;
+  metric: string;
+  channels: number;
+  duration: number;
+  bucket_count: number;
+  values: number[];
+};
+
+const waveformDataCache = new Map<string, Promise<WaveformData> | WaveformData>();
+
+function clipPreviewEntry(
+  asset: ProjectAsset | null | undefined,
+  trackKind: "video" | "audio",
+): AssetPreviewEntry | null {
+  if (!asset) return null;
+  if (trackKind === "video") {
+    if (asset.kind !== "video") return null;
+    return asset.preview?.filmstrip ?? null;
+  }
+  if (asset.kind !== "audio" && !asset.has_audio) return null;
+  return asset.preview?.waveform ?? null;
+}
+
+function clipPreviewStatus(
+  asset: ProjectAsset | null | undefined,
+  trackKind: "video" | "audio",
+): "missing" | "generating" | "ready" | "failed" {
+  return clipPreviewEntry(asset, trackKind)?.status ?? "missing";
+}
+
+function assetSupportsClipPreview(
+  asset: ProjectAsset | null | undefined,
+  trackKind: "video" | "audio",
+): boolean {
+  if (!asset) return false;
+  if (trackKind === "video") return asset.kind === "video";
+  return asset.kind === "audio" || asset.has_audio;
+}
+
+function shouldRequestClipPreview(
+  asset: ProjectAsset | null | undefined,
+  trackKind: "video" | "audio",
+): boolean {
+  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, trackKind) === "missing";
+}
+
+function hasGeneratingClipPreview(
+  asset: ProjectAsset | null | undefined,
+  trackKind: "video" | "audio",
+): boolean {
+  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, trackKind) === "generating";
+}
+
+function shouldRequestAnyAssetPreview(asset: ProjectAsset | null | undefined): boolean {
+  if (!asset) return false;
+  return shouldRequestClipPreview(asset, "video") || shouldRequestClipPreview(asset, "audio");
+}
 
 function readPersistedSidebarCollapsed(): boolean {
   if (typeof window === "undefined") return false;
@@ -133,6 +195,245 @@ function containScale(
   }
   return [sourceAspect / targetAspect, 1];
 }
+
+async function loadWaveformData(src: string): Promise<WaveformData> {
+  const cached = waveformDataCache.get(src);
+  if (cached instanceof Promise) return cached;
+  if (cached) return cached;
+  const pending = fetch(src, { cache: "force-cache" })
+    .then(async (response) => {
+      if (!response.ok) throw new Error("Waveform non disponibile");
+      const payload = await response.json() as WaveformData;
+      waveformDataCache.set(src, payload);
+      return payload;
+    })
+    .catch((error) => {
+      waveformDataCache.delete(src);
+      throw error;
+    });
+  waveformDataCache.set(src, pending);
+  return pending;
+}
+
+function metaNumber(meta: Record<string, unknown> | undefined, key: string, fallback: number): number {
+  const value = meta?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+const WaveformClipPreview: Component<{
+  src: string;
+  clip: TimelineClip;
+  assetDuration: number;
+}> = (props) => {
+  const [data, setData] = createSignal<WaveformData | null>(null);
+  const [size, setSize] = createSignal({ width: 0, height: 0 });
+  let canvasRef: HTMLCanvasElement | undefined;
+
+  createEffect(
+    on(
+      () => props.src,
+      (src) => {
+        let cancelled = false;
+        if (!src) {
+          setData(null);
+          return;
+        }
+        void loadWaveformData(src)
+          .then((payload) => {
+            if (!cancelled) setData(payload);
+          })
+          .catch(() => {
+            if (!cancelled) setData(null);
+          });
+        onCleanup(() => {
+          cancelled = true;
+        });
+      },
+    ),
+  );
+
+  createEffect(() => {
+    if (!canvasRef) return;
+    const updateSize = () => setSize({
+      width: Math.round(canvasRef!.clientWidth),
+      height: Math.round(canvasRef!.clientHeight),
+    });
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(canvasRef);
+    onCleanup(() => observer.disconnect());
+  });
+
+  createEffect(() => {
+    const payload = data();
+    const width = size().width;
+    const height = size().height;
+    if (!canvasRef || !payload || width <= 0 || height <= 0) return;
+    const context = canvasRef.getContext("2d");
+    if (!context) return;
+    const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+    canvasRef.width = Math.max(1, Math.round(width * dpr));
+    canvasRef.height = Math.max(1, Math.round(height * dpr));
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, width, height);
+    context.fillStyle = "rgba(139, 231, 164, 0.88)";
+    const values = payload.values;
+    const totalDuration = Math.max(props.assetDuration, payload.duration, 0.01);
+    const start = Math.max(0, Math.min(props.clip.source_in, totalDuration));
+    const end = Math.max(start + 0.001, Math.min(props.clip.source_out, totalDuration));
+    const startIndex = Math.floor((start / totalDuration) * values.length);
+    const endIndex = Math.max(startIndex + 1, Math.ceil((end / totalDuration) * values.length));
+    const midY = height / 2;
+    for (let x = 0; x < width; x += 1) {
+      const from = startIndex + Math.floor((x / width) * (endIndex - startIndex));
+      const to = Math.min(
+        values.length,
+        startIndex + Math.max(
+          Math.ceil(((x + 1) / width) * (endIndex - startIndex)),
+          Math.floor((x / width) * (endIndex - startIndex)) + 1,
+        ),
+      );
+      let peak = 0;
+      for (let index = from; index < to; index += 1) {
+        peak = Math.max(peak, values[index] ?? 0);
+      }
+      if (peak <= 0) continue;
+      const amplitude = peak / 255;
+      const barHeight = Math.max(1, amplitude * (height * 0.5));
+      context.fillRect(x, midY - barHeight, 1, barHeight * 2);
+    }
+  });
+
+  return <canvas ref={canvasRef} class="tl-waveform-canvas" aria-hidden="true" />;
+};
+
+const FilmstripClipPreview: Component<{
+  src: string;
+  clip: TimelineClip;
+  assetDuration: number;
+  entry: AssetPreviewEntry;
+}> = (props) => {
+  const [size, setSize] = createSignal({ width: 0, height: 0 });
+  let containerRef: HTMLDivElement | undefined;
+
+  createEffect(() => {
+    if (!containerRef) return;
+    const updateSize = () => setSize({
+      width: Math.round(containerRef!.clientWidth),
+      height: Math.round(containerRef!.clientHeight),
+    });
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(containerRef);
+    onCleanup(() => observer.disconnect());
+  });
+
+  const frameCount = createMemo(() => Math.max(1, Math.round(metaNumber(props.entry.meta, "frame_count", 1))));
+  const cellWidth = createMemo(() => Math.max(1, metaNumber(props.entry.meta, "cell_width", 96)));
+  const cellHeight = createMemo(() => Math.max(1, metaNumber(props.entry.meta, "cell_height", 72)));
+  const tileCount = createMemo(() => {
+    const width = size().width;
+    const height = size().height;
+    if (width <= 0 || height <= 0) return 1;
+    const desiredTileWidth = Math.max(18, height * (cellWidth() / cellHeight()));
+    return Math.max(1, Math.round(width / desiredTileWidth));
+  });
+  const tiles = createMemo(() => {
+    const count = tileCount();
+    const start = Math.max(0, Math.min(props.clip.source_in, props.assetDuration));
+    const end = Math.max(start + 0.001, Math.min(props.clip.source_out, props.assetDuration));
+    return Array.from({ length: count }, (_, index) => {
+      const time = start + (((index + 0.5) / count) * (end - start));
+      const frameIndex = frameCount() <= 1
+        ? 0
+        : Math.max(
+            0,
+            Math.min(
+              frameCount() - 1,
+              Math.round((time / Math.max(props.assetDuration, 0.001)) * (frameCount() - 1)),
+            ),
+          );
+      return {
+        id: `${index}:${frameIndex}`,
+        backgroundPosition: frameCount() <= 1
+          ? "0% 50%"
+          : `${(frameIndex / (frameCount() - 1)) * 100}% 50%`,
+      };
+    });
+  });
+
+  return (
+    <div
+      ref={containerRef}
+      class="tl-filmstrip-grid"
+      style={{ "grid-template-columns": `repeat(${tileCount()}, minmax(0, 1fr))` }}
+    >
+      <For each={tiles()}>
+        {(tile) => (
+          <div
+            class="tl-filmstrip-tile"
+            style={{
+              "background-image": `url("${props.src}")`,
+              "background-size": `${frameCount() * 100}% 100%`,
+              "background-position": tile.backgroundPosition,
+            }}
+          />
+        )}
+      </For>
+    </div>
+  );
+};
+
+const TimelineClipPreview: Component<{
+  jobId: string;
+  clip: TimelineClip;
+  asset: ProjectAsset;
+  trackKind: "video" | "audio";
+}> = (props) => {
+  const entry = () => clipPreviewEntry(props.asset, props.trackKind);
+  const status = () => entry()?.status ?? "missing";
+  const src = () => {
+    const path = entry()?.status === "ready" ? entry()?.resource_path : null;
+    return path ? fileUrl(props.jobId, path) : null;
+  };
+  const clipDuration = () => Math.max(0.001, props.clip.source_out - props.clip.source_in);
+  const assetDuration = () => Math.max(props.asset.duration, props.clip.source_out, clipDuration());
+
+  return (
+    <div
+      class="tl-clip-preview-body"
+      classList={{
+        "has-media": !!src(),
+        "is-loading": status() === "generating",
+      }}
+      data-status={status()}
+      aria-hidden="true"
+    >
+      <Show when={props.trackKind === "video" && src() && entry()}>
+        <FilmstripClipPreview
+          src={src()!}
+          clip={props.clip}
+          assetDuration={assetDuration()}
+          entry={entry()!}
+        />
+      </Show>
+      <Show when={props.trackKind === "audio" && src()}>
+        {(resolvedSrc) => (
+          <WaveformClipPreview
+            src={resolvedSrc()}
+            clip={props.clip}
+            assetDuration={assetDuration()}
+          />
+        )}
+      </Show>
+      <Show when={!src()}>
+        <div
+          class={`tl-clip-preview-placeholder tl-clip-preview-placeholder--${props.trackKind}${status() === "generating" ? " is-loading" : ""}`}
+        />
+      </Show>
+    </div>
+  );
+};
 
 function formatRulerLabel(seconds: number, labelStep: number): string {
   if (labelStep < 1) return fmtTimePrecise(seconds);
@@ -174,16 +475,32 @@ const Workspace: Component = () => {
 
   createEffect(
     on(
-      () => projectQuery.data?.revision,
-      () => {
-        if (!projectQuery.data) {
+      () => projectQuery.data,
+      (incoming) => {
+        if (!incoming) {
           setDraftProject(null);
           return;
         }
         const normalized = normalizeEditorialProject(
-          JSON.parse(JSON.stringify(projectQuery.data)) as EditorialProject,
+          JSON.parse(JSON.stringify(incoming)) as EditorialProject,
         );
-        setDraftProject(normalized);
+        setDraftProject((current) => {
+          if (!current || current.revision !== normalized.revision) return normalized;
+          const previewByAssetId = new Map(
+            normalized.assets.map((asset) => [asset.id, asset.preview ?? null]),
+          );
+          let changed = false;
+          const mergedAssets = current.assets.map((asset) => {
+            if (!previewByAssetId.has(asset.id)) return asset;
+            const nextPreview = previewByAssetId.get(asset.id) ?? null;
+            if (JSON.stringify(asset.preview ?? null) === JSON.stringify(nextPreview)) {
+              return asset;
+            }
+            changed = true;
+            return { ...asset, preview: nextPreview };
+          });
+          return changed ? normalizeEditorialProject({ ...current, assets: mergedAssets }) : current;
+        });
       },
     ),
   );
@@ -399,6 +716,7 @@ const WorkspaceGrid: Component<{
 
 const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
   const job = useJobQuery(selectedJobId);
+  const requestAssetPreviews = useRequestAssetPreviewsMutation();
   const uploadAsset = useUploadEditorialAssetMutation();
   const [filter, setFilter] = createSignal("");
   const [selectedAssetId, setSelectedAssetId] = createSignal<string | null>(null);
@@ -430,6 +748,9 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
     setPreviewAssetId(asset.id);
     const jobId = selectedJobId();
     if (jobId) setPreviewForJob(jobId, asset.path);
+    if (jobId && job.data?.status !== "running" && shouldRequestAnyAssetPreview(asset)) {
+      requestAssetPreviews.mutate({ jobId, assetIds: [asset.id] });
+    }
   };
   const closeAssetPreview = () => setPreviewAssetId(null);
 
@@ -713,6 +1034,12 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const src = activeVideoSource();
     return clip && src ? `${clip.id}:${src}` : null;
   });
+  const monitorDuration = createMemo(() => Math.max(0, contentDuration()));
+  const monitorPlayhead = createMemo(() => Math.max(0, Math.min(playheadTime(), monitorDuration())));
+  const monitorHasMedia = createMemo(() => monitorDuration() > 0);
+  const monitorProgressPercent = createMemo(() =>
+    monitorDuration() > 0 ? (monitorPlayhead() / monitorDuration()) * 100 : 0
+  );
   const syncClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
     if (!clip || !element) return;
     const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
@@ -850,7 +1177,14 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       playMediaElement(audioRefs.get(clip.id));
     }
   };
-
+  const stepFrame = (direction: -1 | 1) => {
+    pausePlayback();
+    const next = Math.max(0, Math.min(monitorDuration(), playheadTime() + direction / frameRate()));
+    setSeekRequest(next);
+  };
+  const scrubMonitor = (time: number) => {
+    setSeekRequest(Math.max(0, Math.min(monitorDuration(), time)));
+  };
   const initGpu = async () => {
     const gpu = (navigator as Navigator & { gpu?: any }).gpu;
     if (!canvasRef || !gpu) {
@@ -889,7 +1223,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
         vertex: {
           module: gpuDevice.createShaderModule({
             code: `
-              struct Layout {
+              struct FrameLayout {
                 scale: vec2f,
                 pad: vec2f,
               };
@@ -897,7 +1231,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                 @builtin(position) pos: vec4f,
                 @location(0) uv: vec2f,
               };
-              @group(0) @binding(0) var<uniform> layout: Layout;
+              @group(0) @binding(0) var<uniform> frameLayout: FrameLayout;
               @vertex
               fn main(@builtin(vertex_index) i: u32) -> Out {
                 var pos = array<vec2f, 6>(
@@ -909,7 +1243,7 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                   vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0)
                 );
                 var out: Out;
-                out.pos = vec4f(pos[i] * layout.scale, 0.0, 1.0);
+                out.pos = vec4f(pos[i] * frameLayout.scale, 0.0, 1.0);
                 out.uv = uv[i];
                 return out;
               }
@@ -1266,6 +1600,107 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
           </For>
         </div>
       </div>
+      <div class="monitor-controls-shell">
+        <div class="monitor-controls">
+          <div class="monitor-scrubber-row">
+            <input
+              class="monitor-scrubber"
+              type="range"
+              min="0"
+              max={Math.max(monitorDuration(), 0.001)}
+              step="0.01"
+              value={monitorPlayhead()}
+              aria-label="Posizione riproduzione"
+              disabled={!monitorHasMedia()}
+              style={{
+                background: `linear-gradient(to right, var(--accent) 0%, var(--accent) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) 100%)`,
+              }}
+              onInput={(event) => scrubMonitor(Number(event.currentTarget.value))}
+            />
+          </div>
+          <div class="monitor-controls-row">
+            <div class="monitor-timecodes monitor-timecodes--left" aria-live="off">
+              <span class="monitor-timecode">{fmtTimePrecise(monitorPlayhead())}</span>
+            </div>
+            <div class="monitor-transport">
+              <button
+                type="button"
+                class="monitor-control-btn"
+                title="Vai all'inizio"
+                aria-label="Vai all'inizio"
+                disabled={!monitorHasMedia()}
+                onClick={() => scrubMonitor(0)}
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M3 3.5h1.5v9H3zM5.5 8l7 4.5v-9z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="monitor-control-btn"
+                title="Frame precedente"
+                aria-label="Frame precedente"
+                disabled={!monitorHasMedia()}
+                onClick={() => stepFrame(-1)}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12.5 3.5L6 8l6.5 4.5v-9z" />
+                  <path d="M3.5 3.5v9" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="monitor-control-btn monitor-control-btn--primary"
+                title={transportPlaying() ? "Pausa" : "Play"}
+                aria-label={transportPlaying() ? "Pausa" : "Play"}
+                disabled={!monitorHasMedia()}
+                onClick={togglePlayback}
+              >
+                <Show
+                  when={transportPlaying()}
+                  fallback={
+                    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                      <path d="M5 3.25v9.5L12.5 8 5 3.25z" />
+                    </svg>
+                  }
+                >
+                  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z" />
+                  </svg>
+                </Show>
+              </button>
+              <button
+                type="button"
+                class="monitor-control-btn"
+                title="Frame successivo"
+                aria-label="Frame successivo"
+                disabled={!monitorHasMedia()}
+                onClick={() => stepFrame(1)}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3.5 3.5L10 8l-6.5 4.5v-9z" />
+                  <path d="M12.5 3.5v9" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="monitor-control-btn"
+                title="Vai alla fine"
+                aria-label="Vai alla fine"
+                disabled={!monitorHasMedia()}
+                onClick={() => scrubMonitor(monitorDuration())}
+              >
+                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path d="M10.5 8L3.5 3.5v9zM11.5 3.5h1.5v9h-1.5z" />
+                </svg>
+              </button>
+            </div>
+            <div class="monitor-timecodes monitor-timecodes--right" aria-live="off">
+              <span class="monitor-timecode monitor-timecode--total">{fmtTimePrecise(monitorDuration())}</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 };
@@ -1275,7 +1710,10 @@ const TimelinePanel: Component<{
   updateProject: (next: ProjectUpdater) => void;
 }> = (props) => {
   const job = useJobQuery(selectedJobId);
+  const queryClient = useQueryClient();
+  const requestAssetPreviews = useRequestAssetPreviewsMutation();
   const transcribeLaneMut = useTranscribeLaneMutation();
+  const requestedPreviewAssetIds = new Set<string>();
   const [dragPreview, setDragPreview] = createSignal<{
     assetId: string;
     start: number;
@@ -1426,6 +1864,31 @@ const TimelinePanel: Component<{
   const selectedSubtitle = createMemo(() =>
     project() ? getSubtitleBlock(project()!, selectedSubtitleId()) : null
   );
+  const visiblePreviewState = createMemo(() => {
+    const current = project();
+    if (!current) return { assetIds: [] as string[], hasGenerating: false };
+    const visibleStart = viewportLeft();
+    const visibleEnd = visibleStart + viewportWidth();
+    const nextIds = new Set<string>();
+    let hasGenerating = false;
+
+    for (const track of [...assetTracks(), ...audioTracks()]) {
+      const previewKind = track.kind === "audio" ? "audio" : "video";
+      for (const clip of trackClips(current, track.id)) {
+        const clipWidth = Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond());
+        if (clipWidth < CLIP_PREVIEW_MIN_WIDTH_PX) continue;
+        const clipLeft = toPx(clip.start);
+        const clipRight = clipLeft + clipWidth;
+        if (clipRight < visibleStart || clipLeft > visibleEnd) continue;
+        const asset = assetById(current, clip.asset_id);
+        if (!asset) continue;
+        if (shouldRequestClipPreview(asset, previewKind)) nextIds.add(asset.id);
+        if (hasGeneratingClipPreview(asset, previewKind)) hasGenerating = true;
+      }
+    }
+
+    return { assetIds: [...nextIds], hasGenerating };
+  });
   const horizontalViewports = () =>
     [rulerViewportRef, assetViewportRef, audioViewportRef].filter(Boolean) as HTMLDivElement[];
   const syncViewportMetrics = (source?: HTMLDivElement) => {
@@ -1977,7 +2440,10 @@ const TimelinePanel: Component<{
             width: `${Math.max(8, dragPreview()!.duration * pxPerSecond())}px`,
           }}
         >
-          <span class="tl-clip-label">{dragPreview()!.label}</span>
+          <div class="tl-clip-preview-body tl-clip-preview-body--placeholder" aria-hidden="true" />
+          <div class="tl-clip-footer">
+            <span class="tl-clip-label">{dragPreview()!.label}</span>
+          </div>
         </div>
       </Show>
       <Show when={track.kind !== "subtitle"}>
@@ -1998,7 +2464,28 @@ const TimelinePanel: Component<{
                 setSelectedSubtitleId(null);
               }}
             >
-              <span class="tl-clip-label">{assetById(project()!, clip.asset_id)?.label || "Clip"}</span>
+              {(() => {
+                const asset = assetById(project()!, clip.asset_id);
+                const jobId = selectedJobId();
+                const clipWidth = Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond());
+                return (
+                  <>
+                    {asset && jobId && clipWidth >= CLIP_PREVIEW_MIN_WIDTH_PX
+                      ? (
+                          <TimelineClipPreview
+                            jobId={jobId}
+                            clip={clip}
+                            asset={asset}
+                            trackKind={track.kind as "video" | "audio"}
+                          />
+                        )
+                      : <div class="tl-clip-preview-body tl-clip-preview-body--placeholder" aria-hidden="true" />}
+                    <div class="tl-clip-footer">
+                      <span class="tl-clip-label">{asset?.label || "Clip"}</span>
+                    </div>
+                  </>
+                );
+              })()}
               <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
               <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
             </button>
@@ -2087,11 +2574,37 @@ const TimelinePanel: Component<{
     on(
       () => selectedJobId(),
       () => {
+        requestedPreviewAssetIds.clear();
+      },
+    ),
+  );
+  createEffect(
+    on(
+      () => selectedJobId(),
+      () => {
         didInitMirroredVertical = false;
         requestAnimationFrame(initializeMirroredVerticalScroll);
       },
     ),
   );
+  createEffect(() => {
+    const jobId = selectedJobId();
+    if (!jobId || !project() || job.data?.status === "running") return;
+    const nextAssetIds = visiblePreviewState().assetIds.filter(
+      (assetId) => !requestedPreviewAssetIds.has(assetId),
+    );
+    if (!nextAssetIds.length) return;
+    nextAssetIds.forEach((assetId) => requestedPreviewAssetIds.add(assetId));
+    requestAssetPreviews.mutate({ jobId, assetIds: nextAssetIds });
+  });
+  createEffect(() => {
+    const jobId = selectedJobId();
+    if (!jobId || !visiblePreviewState().hasGenerating) return;
+    const handle = window.setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ["editorial-project", jobId] });
+    }, 1500);
+    onCleanup(() => window.clearInterval(handle));
+  });
   onCleanup(() => {
     clearTimeout(zoomWheelResetHandle);
     if (horizontalSyncHandle) cancelAnimationFrame(horizontalSyncHandle);
@@ -2103,30 +2616,6 @@ const TimelinePanel: Component<{
       <div class="panel-header">
         <span class="panel-title">Timeline</span>
         <div class="timeline-toolbar">
-          <button
-            type="button"
-            class="btn btn-ghost btn-xs"
-            title="Frame precedente (Freccia sinistra)"
-            onClick={() => setFrameStepRequest(-1)}
-          >
-            ←
-          </button>
-          <button
-            type="button"
-            class="btn btn-ghost btn-xs"
-            title="Play/Pause (Space)"
-            onClick={() => setPlayPauseRequest((value) => value + 1)}
-          >
-            Space
-          </button>
-          <button
-            type="button"
-            class="btn btn-ghost btn-xs"
-            title="Frame successivo (Freccia destra)"
-            onClick={() => setFrameStepRequest(1)}
-          >
-            →
-          </button>
           <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
           <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
             Follow
@@ -2146,15 +2635,6 @@ const TimelinePanel: Component<{
               Split
             </button>
           </Show>
-          <span class="timeline-selection-readout">
-            {selectedClip()
-              ? `Clip ${assetById(project()!, selectedClip()!.asset_id)?.label || ""}`
-              : selectedSubtitle()
-                ? "Subtitle block"
-                : selectedTrackId()
-                  ? `Lane ${getTrack(project()!, selectedTrackId())?.name || ""}`
-                  : "Nessuna selezione"}
-          </span>
         </div>
       </div>
       <Show when={project()} fallback={<div class="placeholder">Timeline non disponibile</div>}>

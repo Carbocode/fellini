@@ -13,15 +13,18 @@ class JobWorkspace:
         self.output_dir = self.job_dir / "output"
         self.project_dir = self.job_dir / "project"
         self.temp_dir = self.job_dir / "temp"
+        self.preview_dir = self.artifacts_dir / "previews"
         self.snapshot_path = self.job_dir / "job.json"
         self.state_path = self.temp_dir / "pipeline_state.json"
         self.editorial_project_path = self.project_dir / "editorial_project.json"
+        self.asset_preview_state_path = self.project_dir / "asset_previews.json"
 
     def bootstrap(self) -> None:
         for path in (
             self.job_dir,
             self.uploads_dir,
             self.artifacts_dir,
+            self.preview_dir,
             self.output_dir,
             self.project_dir,
             self.temp_dir,
@@ -33,6 +36,9 @@ class JobWorkspace:
 
     def artifact_path(self, name: str) -> Path:
         return self.artifacts_dir / name
+
+    def preview_artifact_path(self, name: str) -> Path:
+        return self.preview_dir / name
 
     def output_path(self, name: str) -> Path:
         return self.output_dir / name

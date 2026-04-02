@@ -546,6 +546,78 @@ def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatc
     assert len(project["clips"]) == 0
 
 
+def test_asset_preview_request_marks_asset_as_generating(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Preview request job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+    monkeypatch.setattr(app.state.asset_previews, "_launch_generation", lambda job_id, asset: None)
+
+    project = client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    asset_id = project["assets"][0]["id"]
+
+    response = client.post(
+        f"/api/jobs/{created_job['id']}/asset-previews",
+        json={"asset_ids": [asset_id]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    preview = payload["assets"][0]["preview"]
+    assert preview["filmstrip"]["status"] == "generating"
+    assert preview["waveform"]["status"] == "generating"
+
+
 def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monkeypatch):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     app = create_app(settings)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 import json
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+from array import array
 from pathlib import Path
 
 from fellini.domain.models import (
@@ -157,6 +160,120 @@ class FFmpegAdapter:
         ]
         self._run(args)
         logger.info("ffmpeg.extract_audio.done target=%s", target)
+
+    def generate_filmstrip(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        duration_seconds: float,
+        interval_seconds: float = 2.0,
+        max_frames: int = 120,
+        cell_width: int = 48,
+        cell_height: int = 36,
+    ) -> dict[str, int | float]:
+        frame_count = max(1, min(max_frames, math.ceil(max(duration_seconds, 0.01) / interval_seconds)))
+        fps = max(frame_count / max(duration_seconds, interval_seconds), 0.01)
+        logger.info(
+            "ffmpeg.generate_filmstrip source=%s target=%s frames=%s fps=%.4f",
+            source,
+            target,
+            frame_count,
+            fps,
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        args = [
+            self.settings.ffmpeg_bin,
+            "-y",
+            "-i",
+            str(source),
+            "-vf",
+            (
+                f"fps={fps:.6f},"
+                f"scale={cell_width}:{cell_height}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+                f"pad={cell_width}:{cell_height}:(ow-iw)/2:(oh-ih)/2:black,"
+                f"tile={frame_count}x1"
+            ),
+            "-frames:v",
+            "1",
+            str(target),
+        ]
+        self._run(args)
+        return {
+            "frame_count": frame_count,
+            "cell_width": cell_width,
+            "cell_height": cell_height,
+            "interval_seconds": interval_seconds,
+        }
+
+    def build_waveform_peaks(
+        self,
+        source: Path,
+        *,
+        duration_seconds: float,
+        bucket_count: int,
+        sample_rate: int = 8000,
+    ) -> list[int]:
+        logger.info(
+            "ffmpeg.build_waveform_peaks source=%s buckets=%s sample_rate=%s",
+            source,
+            bucket_count,
+            sample_rate,
+        )
+        args = [
+            self.settings.ffmpeg_bin,
+            "-v",
+            "error",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "s16le",
+            "-",
+        ]
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            msg = "ffmpeg waveform pipe could not be opened."
+            raise FFmpegError(msg)
+
+        total_samples = max(1, math.ceil(max(duration_seconds, 0.01) * sample_rate))
+        peaks = [0] * max(1, bucket_count)
+        sample_index = 0
+        try:
+            while True:
+                chunk = process.stdout.read(32768)
+                if not chunk:
+                    break
+                samples = array("h")
+                samples.frombytes(chunk[: len(chunk) - (len(chunk) % 2)])
+                if sys.byteorder != "little":
+                    samples.byteswap()
+                for sample in samples:
+                    bucket_index = min(
+                        len(peaks) - 1,
+                        (sample_index * len(peaks)) // total_samples,
+                    )
+                    amplitude = min(255, round((abs(sample) / 32767) * 255))
+                    if amplitude > peaks[bucket_index]:
+                        peaks[bucket_index] = amplitude
+                    sample_index += 1
+        finally:
+            if process.stdout:
+                process.stdout.close()
+
+        stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+        if process.stderr:
+            process.stderr.close()
+        return_code = process.wait()
+        if return_code != 0:
+            msg = stderr or f"ffmpeg waveform decode failed for {source}"
+            raise FFmpegError(msg)
+        return peaks
 
     def render_from_edl(self, source: Path, edl: EditDecisionList, output_dir: Path) -> Path:
         logger.info(

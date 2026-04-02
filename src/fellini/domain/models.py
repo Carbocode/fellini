@@ -64,6 +64,13 @@ class ProjectAssetKind(StrEnum):
     audio = "audio"
 
 
+class AssetPreviewStatus(StrEnum):
+    missing = "missing"
+    generating = "generating"
+    ready = "ready"
+    failed = "failed"
+
+
 class TimelineTrackKind(StrEnum):
     video = "video"
     audio = "audio"
@@ -123,6 +130,20 @@ class ProjectAsset(BaseModel):
     sample_rate: int | None = None
     has_audio: bool = False
     transcript_ref: str | None = None
+    preview: AssetPreviewBundle | None = None
+
+
+class AssetPreviewEntry(BaseModel):
+    status: AssetPreviewStatus = AssetPreviewStatus.missing
+    resource_path: str | None = None
+    version: int = 1
+    error: str | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssetPreviewBundle(BaseModel):
+    filmstrip: AssetPreviewEntry | None = None
+    waveform: AssetPreviewEntry | None = None
 
 
 class TimelineTrack(BaseModel):

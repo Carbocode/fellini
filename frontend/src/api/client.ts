@@ -107,6 +107,19 @@ export async function transcribeAudioLane(
   );
 }
 
+export async function requestAssetPreviews(
+  jobId: string,
+  assetIds: string[],
+): Promise<EditorialProject> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/asset-previews`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ asset_ids: assetIds }),
+    }),
+  );
+}
+
 export async function fetchArtifact(
   jobId: string,
   path: string,

@@ -214,6 +214,17 @@ export function useTranscribeLaneMutation() {
   }));
 }
 
+export function useRequestAssetPreviewsMutation() {
+  const qc = useQueryClient();
+  return createMutation(() => ({
+    mutationFn: (vars: { jobId: string; assetIds: string[] }) =>
+      api.requestAssetPreviews(vars.jobId, vars.assetIds),
+    onSuccess: (project, vars) => {
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(project));
+    },
+  }));
+}
+
 /**
  * Smart polling hook. Only refetches when the selected job is running.
  * Compares the response fingerprint before invalidating to avoid

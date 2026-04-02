@@ -1,8 +1,15 @@
+import json
+
 from fellini.domain.models import (
+    AssetPreviewBundle,
+    AssetPreviewEntry,
+    AssetPreviewStatus,
     AudioTrackRole,
     ClipOrigin,
     EditorialProject,
     LaneTranscription,
+    ProjectAsset,
+    ProjectAssetKind,
     ProjectSelection,
     ProjectSequence,
     SourceWordRef,
@@ -17,6 +24,36 @@ from fellini.domain.models import (
 from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+
+
+def test_save_strips_runtime_asset_preview_fields(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    store = EditorialProjectStore(settings)
+    workspace = JobWorkspace(settings.jobs_root, "job_preview_strip")
+    workspace.bootstrap()
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        assets=[
+            ProjectAsset(
+                id="asset_source",
+                kind=ProjectAssetKind.video,
+                label="clip.mp4",
+                path="uploads/clip.mp4",
+                duration=5.0,
+                preview=AssetPreviewBundle(
+                    filmstrip=AssetPreviewEntry(
+                        status=AssetPreviewStatus.ready,
+                        resource_path="artifacts/previews/asset_source.filmstrip.png",
+                    )
+                ),
+            )
+        ],
+    )
+
+    store.save(workspace, project)
+
+    payload = json.loads(workspace.editorial_project_path.read_text(encoding="utf-8"))
+    assert payload["assets"][0]["preview"] is None
 
 
 def test_normalize_linked_clip_groups_pairs_matching_video_and_audio(tmp_path):

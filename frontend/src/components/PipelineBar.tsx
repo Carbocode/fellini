@@ -3,20 +3,14 @@ import {
   useEditorialProjectQuery,
   useJobQuery,
   useRunStepMutation,
-  useTranscribeLaneMutation,
 } from "../api/queries";
 import { selectedJobId, selectedTrackId } from "../store";
 import { getTrack, isAudioTrack } from "../lib/editorial";
 import { canRunStep, capitalize } from "../lib/utils";
 
-type ToolStep = "transcription" | "editorial" | "render";
+type ToolStep = "editorial" | "render";
 
 const TOOL_CONFIG: Array<{ step: ToolStep; label: string; hint: string }> = [
-  {
-    step: "transcription",
-    label: "Sottotitoli",
-    hint: "Genera blocchi testo dalla lane audio selezionata",
-  },
   {
     step: "editorial",
     label: "Editorial",
@@ -33,7 +27,6 @@ const PipelineBar: Component = () => {
   const job = useJobQuery(selectedJobId);
   const project = useEditorialProjectQuery(selectedJobId);
   const runStepMut = useRunStepMutation();
-  const transcribeLaneMut = useTranscribeLaneMutation();
 
   const selectedAudioLane = createMemo(() => {
     const currentProject = project.data ?? null;
@@ -49,18 +42,10 @@ const PipelineBar: Component = () => {
     () => (job.data?.steps ?? []).find((step) => step.status === "running") ?? null,
   );
 
-  const canUseTool = (name: ToolStep) => {
-    if (!job.data || job.data.status === "running") return false;
-    if (name === "transcription") {
-      return !!selectedAudioLane() && canRunStep(job.data, name);
-    }
-    return canRunStep(job.data, name);
-  };
+  const canUseTool = (name: ToolStep) =>
+    !!job.data && job.data.status !== "running" && canRunStep(job.data, name);
 
   const toolMeta = (name: ToolStep) => {
-    if (name === "transcription") {
-      return selectedAudioLane()?.name ?? "Seleziona una lane audio";
-    }
     if (name === "editorial") {
       const storyLane = project.data?.tracks.find(
         (track) => track.kind === "audio" && track.role === "story",
@@ -73,20 +58,13 @@ const PipelineBar: Component = () => {
   const triggerTool = (name: ToolStep) => {
     const currentJob = job.data;
     if (!currentJob || !canUseTool(name)) return;
-    if (name === "transcription") {
-      const laneId = selectedAudioLane()?.id;
-      if (!laneId) return;
-      transcribeLaneMut.mutate({ jobId: currentJob.id, laneId });
-      return;
-    }
     runStepMut.mutate({ jobId: currentJob.id, stepName: name });
   };
 
-  const buttonLabel = (name: ToolStep) => {
-    if (name === "transcription" && transcribeLaneMut.isPending) return "Trascrizione...";
-    if (runStepMut.isPending && runningStep()?.name === name) return "In esecuzione...";
-    return TOOL_CONFIG.find((tool) => tool.step === name)?.label ?? capitalize(name);
-  };
+  const buttonLabel = (name: ToolStep) =>
+    runStepMut.isPending && runningStep()?.name === name
+      ? "In esecuzione..."
+      : TOOL_CONFIG.find((tool) => tool.step === name)?.label ?? capitalize(name);
 
   return (
     <div class="pipeline-bar">

@@ -113,6 +113,7 @@ export type TimelineTrackKind = "video" | "audio" | "subtitle";
 export type AudioTrackRole = "story" | "support";
 export type ClipOrigin = "generated" | "manual";
 export type LaneTranscriptionStatus = "idle" | "running" | "completed" | "failed";
+export type AssetPreviewStatus = "missing" | "generating" | "ready" | "failed";
 
 export interface ClipCrop {
   left: number;
@@ -137,6 +138,19 @@ export interface ClipAudio {
   fade_out_ms: number;
 }
 
+export interface AssetPreviewEntry {
+  status: AssetPreviewStatus;
+  resource_path: string | null;
+  version: number;
+  error: string | null;
+  meta: Record<string, unknown>;
+}
+
+export interface AssetPreviewBundle {
+  filmstrip: AssetPreviewEntry | null;
+  waveform: AssetPreviewEntry | null;
+}
+
 export interface ProjectAsset {
   id: string;
   origin: string;
@@ -150,6 +164,7 @@ export interface ProjectAsset {
   sample_rate: number | null;
   has_audio: boolean;
   transcript_ref: string | null;
+  preview: AssetPreviewBundle | null;
 }
 
 export interface TimelineTrack {
