@@ -1,6 +1,8 @@
 import json
 
 from fellini.domain.models import (
+    AssetTranscription,
+    AssetTranscriptionWord,
     AssetPreviewBundle,
     AssetPreviewEntry,
     AssetPreviewStatus,
@@ -313,6 +315,16 @@ def test_normalize_generated_subtitles_upgrades_segment_blocks_to_word_level(tmp
     store = EditorialProjectStore(AppSettings(workspace_root=tmp_path / "workspace"))
     project = EditorialProject(
         sequence=ProjectSequence(),
+        assets=[
+            ProjectAsset(
+                id="asset_source",
+                kind=ProjectAssetKind.audio,
+                label="Audio source",
+                path="uploads/source.wav",
+                duration=1.0,
+                has_audio=True,
+            )
+        ],
         tracks=[
             TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
             TimelineTrack(id="track_audio_1", kind=TimelineTrackKind.audio, name="Audio 1", order=1),
@@ -336,6 +348,17 @@ def test_normalize_generated_subtitles_upgrades_segment_blocks_to_word_level(tmp
                     SourceWordRef(segment_id="seg_1", word_index=0),
                     SourceWordRef(segment_id="seg_1", word_index=1),
                 ],
+            )
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_audio_1",
+                asset_id="asset_source",
+                track_id="track_audio_1",
+                start=0.0,
+                source_in=0.0,
+                source_out=0.8,
+                origin=ClipOrigin.manual,
             )
         ],
         lane_transcriptions=[
@@ -363,3 +386,89 @@ def test_normalize_generated_subtitles_upgrades_segment_blocks_to_word_level(tmp
     assert changed is True
     assert [caption.text for caption in normalized.captions] == ["ciao", "lane"]
     assert [len(caption.source_word_refs) for caption in normalized.captions] == [1, 1]
+    assert [caption.source_asset_id for caption in normalized.captions] == ["asset_source", "asset_source"]
+    assert [caption.source_clip_id for caption in normalized.captions] == ["clip_audio_1", "clip_audio_1"]
+
+
+def test_normalize_generated_subtitles_materializes_same_asset_for_multiple_clips(tmp_path):
+    store = EditorialProjectStore(AppSettings(workspace_root=tmp_path / "workspace"))
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        assets=[
+            ProjectAsset(
+                id="asset_source",
+                kind=ProjectAssetKind.audio,
+                label="Audio source",
+                path="uploads/source.wav",
+                duration=4.0,
+                has_audio=True,
+                transcript_ref="asset_source",
+            )
+        ],
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(id="track_audio_1", kind=TimelineTrackKind.audio, name="Audio 1", order=1),
+            TimelineTrack(id="track_audio_2", kind=TimelineTrackKind.audio, name="Audio 2", order=2),
+            TimelineTrack(
+                id="track_subtitle_1",
+                kind=TimelineTrackKind.subtitle,
+                name="Subtitles",
+                order=3,
+            ),
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_audio_1",
+                asset_id="asset_source",
+                track_id="track_audio_1",
+                start=0.0,
+                source_in=0.0,
+                source_out=1.0,
+                origin=ClipOrigin.manual,
+            ),
+            TimelineClip(
+                id="clip_audio_2",
+                asset_id="asset_source",
+                track_id="track_audio_2",
+                start=5.0,
+                source_in=0.0,
+                source_out=1.0,
+                origin=ClipOrigin.manual,
+            ),
+        ],
+        asset_transcriptions=[
+            AssetTranscription(
+                asset_id="asset_source",
+                language="it",
+                words=[
+                    AssetTranscriptionWord(
+                        id="asset_word_asset_source_00000000_00000400_ciao",
+                        start=0.0,
+                        end=0.4,
+                        text="ciao",
+                        source_word_refs=[SourceWordRef(segment_id="seg_1", word_index=0)],
+                    ),
+                    AssetTranscriptionWord(
+                        id="asset_word_asset_source_00000420_00000800_lane",
+                        start=0.42,
+                        end=0.8,
+                        text="lane",
+                        source_word_refs=[SourceWordRef(segment_id="seg_1", word_index=1)],
+                    ),
+                ],
+                source_lane_id="track_audio_1",
+                source_audio_path="temp/lane_track_audio_1_bounce.wav",
+            )
+        ],
+    )
+
+    normalized, changed = store._normalize_generated_subtitles(project)
+
+    assert changed is True
+    assert [caption.text for caption in normalized.captions] == ["ciao", "lane", "ciao", "lane"]
+    assert [caption.source_clip_id for caption in normalized.captions] == [
+        "clip_audio_1",
+        "clip_audio_1",
+        "clip_audio_2",
+        "clip_audio_2",
+    ]

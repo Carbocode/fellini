@@ -46,6 +46,7 @@ import type {
   EditorialProject,
   JobSnapshot,
   ProjectAsset,
+  SubtitleBlock,
   TimelineClip,
   TimelineTrack,
 } from "../types";
@@ -56,9 +57,11 @@ import {
   getClip,
   getSubtitleBlock,
   getTrack,
+  generatedSubtitleGroupsForLane,
   laneContentRange,
   linkedClips,
   normalizeEditorialProject,
+  patchSubtitle,
   projectDuration,
   retargetClipGroup,
   resolveClipGroupStart,
@@ -67,10 +70,13 @@ import {
   sortedTracks,
   splitClip,
   subtitleTrack,
+  syncGeneratedSubtitlesWithMovedAudioClips,
   trackClips,
   trackHeight,
   trackSubtitles,
+  type SubtitleVisualGroup,
   upsertClips,
+  visibleTimelineCaptions,
 } from "../lib/editorial";
 import {
   baseName,
@@ -101,6 +107,7 @@ const AUDIO_PREWARM_LEAD_SECONDS = 0.8;
 const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
 const CLIP_PREVIEW_MIN_WIDTH_PX = 32;
+const MIN_SUBTITLE_DURATION = 0.02;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
 type WaveformData = {
@@ -434,6 +441,155 @@ const TimelineClipPreview: Component<{
     </div>
   );
 };
+
+const TimelineSubtitleSegment: Component<{
+  caption: SubtitleBlock;
+  left: number;
+  width: number;
+  selected: boolean;
+  editing: boolean;
+  editText: string;
+  segmentClass?: string;
+  onPointerDown: (event: PointerEvent, caption: SubtitleBlock) => void;
+  onTrimPointerDown: (event: PointerEvent, caption: SubtitleBlock, edge: "start" | "end") => void;
+  onSelect: (caption: SubtitleBlock) => void;
+  onBeginEdit: (caption: SubtitleBlock) => void;
+  onEditTextChange: (value: string) => void;
+  onCommitEdit: () => void;
+  onCancelEdit: () => void;
+}> = (props) => {
+  let inputRef: HTMLInputElement | undefined;
+  const segmentWidth = () => Math.max(props.editing ? 48 : 8, props.width);
+  const segmentClassName = () =>
+    `tl-seg tl-seg--subtitle${props.segmentClass ? ` ${props.segmentClass}` : ""}${props.selected ? " is-active" : ""}${props.editing ? " tl-seg--subtitle-editing" : ""}`;
+
+  createEffect(() => {
+    if (!props.editing || !inputRef) return;
+    requestAnimationFrame(() => {
+      inputRef?.focus();
+      inputRef?.select();
+    });
+  });
+
+  return (
+    <Show
+      when={!props.editing}
+      fallback={
+        <div
+          class={segmentClassName()}
+          style={{
+            left: `${props.left}px`,
+            width: `${segmentWidth()}px`,
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <input
+            ref={inputRef}
+            type="text"
+            class="tl-subtitle-inline-input"
+            value={props.editText}
+            onInput={(event) => props.onEditTextChange(event.currentTarget.value)}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.stopPropagation();
+                props.onCommitEdit();
+                return;
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                event.stopPropagation();
+                props.onCancelEdit();
+              }
+            }}
+            onBlur={() => props.onCommitEdit()}
+          />
+        </div>
+      }
+    >
+      <button
+        type="button"
+        class={segmentClassName()}
+        style={{
+          left: `${props.left}px`,
+          width: `${segmentWidth()}px`,
+        }}
+        onPointerDown={(event) => props.onPointerDown(event, props.caption)}
+        onClick={(event) => {
+          event.stopPropagation();
+          props.onSelect(props.caption);
+        }}
+        onDblClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          props.onBeginEdit(props.caption);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "F2") return;
+          event.preventDefault();
+          event.stopPropagation();
+          props.onBeginEdit(props.caption);
+        }}
+      >
+        <span>{props.caption.text}</span>
+        <div
+          class="tl-subtitle-handle tl-subtitle-handle--start"
+          onPointerDown={(event) => props.onTrimPointerDown(event, props.caption, "start")}
+        />
+        <div
+          class="tl-subtitle-handle tl-subtitle-handle--end"
+          onPointerDown={(event) => props.onTrimPointerDown(event, props.caption, "end")}
+        />
+      </button>
+    </Show>
+  );
+};
+
+const AudioSubtitleVisualGroup: Component<{
+  group: SubtitleVisualGroup;
+  pxPerSecond: number;
+  selectedSubtitleId: string | null;
+  editingSubtitleId: string | null;
+  editingSubtitleText: string;
+  onPointerDown: (event: PointerEvent, caption: SubtitleBlock) => void;
+  onTrimPointerDown: (event: PointerEvent, caption: SubtitleBlock, edge: "start" | "end") => void;
+  onSelect: (caption: SubtitleBlock) => void;
+  onBeginEdit: (caption: SubtitleBlock) => void;
+  onEditTextChange: (value: string) => void;
+  onCommitEdit: () => void;
+  onCancelEdit: () => void;
+}> = (props) => (
+  <div
+    class={`tl-audio-subtitle-group${props.group.isFallback ? " is-fallback" : ""}`}
+    style={{
+      left: `${props.group.start * props.pxPerSecond}px`,
+      width: `${Math.max(12, (props.group.end - props.group.start) * props.pxPerSecond)}px`,
+    }}
+  >
+    <For each={props.group.captions}>
+      {(caption) => (
+        <TimelineSubtitleSegment
+          caption={caption}
+          left={Math.max(0, (caption.start - props.group.start) * props.pxPerSecond)}
+          width={Math.max(8, (caption.end - caption.start) * props.pxPerSecond)}
+          selected={props.selectedSubtitleId === caption.id}
+          editing={props.editingSubtitleId === caption.id}
+          editText={props.editingSubtitleId === caption.id ? props.editingSubtitleText : caption.text}
+          segmentClass="tl-audio-subtitle-word"
+          onPointerDown={props.onPointerDown}
+          onTrimPointerDown={props.onTrimPointerDown}
+          onSelect={props.onSelect}
+          onBeginEdit={props.onBeginEdit}
+          onEditTextChange={props.onEditTextChange}
+          onCommitEdit={props.onCommitEdit}
+          onCancelEdit={props.onCancelEdit}
+        />
+      )}
+    </For>
+  </div>
+);
 
 function formatRulerLabel(seconds: number, labelStep: number): string {
   if (labelStep < 1) return fmtTimePrecise(seconds);
@@ -1721,6 +1877,8 @@ const TimelinePanel: Component<{
     duration: number;
     trackIds: string[];
   } | null>(null);
+  const [editingSubtitleId, setEditingSubtitleId] = createSignal<string | null>(null);
+  const [editingSubtitleText, setEditingSubtitleText] = createSignal("");
   const project = () => props.project();
   const [zoomIdx, setZoomIdx] = createSignal(1);
   const zoom = () => ZOOM_STEPS[zoomIdx()];
@@ -1770,8 +1928,7 @@ const TimelinePanel: Component<{
   ));
   const pendingSubtitleRanges = createMemo(() => {
     const current = project();
-    const hostTrackId = captionHostTrackId();
-    if (!current || !hostTrackId) return [];
+    if (!current) return [];
     return current.lane_transcriptions.flatMap((lane) => {
       if (lane.status !== "running") return [];
       const range = laneContentRange(current, lane.lane_id);
@@ -1779,21 +1936,57 @@ const TimelinePanel: Component<{
       const sourceTrack = getTrack(current, lane.lane_id);
       return [{
         id: `subtitle_pending_${lane.lane_id}`,
-        trackId: hostTrackId,
+        trackId: lane.lane_id,
         start: range.start,
         end: range.end,
         label: sourceTrack ? `AI TRANSCRIPTION / ${sourceTrack.name}` : "AI TRANSCRIPTION",
       }];
     });
   });
-  const visibleTrackSubtitles = (trackId: string) =>
-    trackSubtitles(project()!, trackId).filter((caption) => !(
-      runningSubtitleLaneIds().has(caption.source_lane_id) && caption.origin === "generated"
-    ));
+  const visibleStandaloneSubtitles = (trackId: string) =>
+    trackSubtitles(project()!, trackId).filter((caption) => caption.origin !== "generated");
+  const pendingTrackSubtitleRanges = (trackId: string) =>
+    pendingSubtitleRanges().filter((item) => item.trackId === trackId);
+  const generatedTrackSubtitleGroups = (trackId: string) =>
+    runningSubtitleLaneIds().has(trackId)
+      ? []
+      : generatedSubtitleGroupsForLane(project()!, trackId);
+  const cancelSubtitleEditing = () => {
+    setEditingSubtitleId(null);
+    setEditingSubtitleText("");
+  };
   const selectTrack = (trackId: string) => {
     setSelectedTrackId(trackId);
     setSelectedClipId(null);
     setSelectedSubtitleId(null);
+    cancelSubtitleEditing();
+  };
+  const selectSubtitle = (caption: SubtitleBlock, trackId: string) => {
+    setSelectedSubtitleId(caption.id);
+    setSelectedTrackId(trackId);
+    setSelectedClipId(null);
+    if (editingSubtitleId() && editingSubtitleId() !== caption.id) cancelSubtitleEditing();
+  };
+  const beginSubtitleEditing = (caption: SubtitleBlock, trackId: string) => {
+    selectSubtitle(caption, trackId);
+    setEditingSubtitleId(caption.id);
+    setEditingSubtitleText(caption.text);
+  };
+  const commitSubtitleEditing = () => {
+    const current = project();
+    const subtitleId = editingSubtitleId();
+    if (!current || !subtitleId) {
+      cancelSubtitleEditing();
+      return;
+    }
+    const target = getSubtitleBlock(current, subtitleId);
+    const nextText = editingSubtitleText().trim();
+    if (!target || !nextText || nextText === target.text) {
+      cancelSubtitleEditing();
+      return;
+    }
+    props.updateProject((value) => patchSubtitle(value, subtitleId, { text: nextText }));
+    cancelSubtitleEditing();
   };
   const updateTrack = (trackId: string, patch: Partial<TimelineTrack>) => {
     props.updateProject((current) => ({
@@ -1863,6 +2056,71 @@ const TimelinePanel: Component<{
   const selectedLinkedGroupId = createMemo(() => selectedClip()?.linked_group_id ?? null);
   const selectedSubtitle = createMemo(() =>
     project() ? getSubtitleBlock(project()!, selectedSubtitleId()) : null
+  );
+  const overviewClips = createMemo(() => {
+    const current = project();
+    if (!current) return [] as Array<{
+      id: string;
+      kind: "video" | "audio";
+      start: number;
+      end: number;
+    }>;
+
+    const grouped = new Map<string, TimelineClip[]>();
+    const standalone: Array<{
+      id: string;
+      kind: "video" | "audio";
+      start: number;
+      end: number;
+    }> = [];
+
+    for (const clip of current.clips) {
+      const track = getTrack(current, clip.track_id);
+      if (!track || (track.kind !== "video" && track.kind !== "audio")) continue;
+      if (!clip.linked_group_id) {
+        standalone.push({
+          id: clip.id,
+          kind: track.kind,
+          start: clip.start,
+          end: clip.start + (clip.source_out - clip.source_in),
+        });
+        continue;
+      }
+      const group = grouped.get(clip.linked_group_id) ?? [];
+      group.push(clip);
+      grouped.set(clip.linked_group_id, group);
+    }
+
+    const linked = [...grouped.entries()].map(([groupId, clips]) => {
+      const kinds = clips.map((clip) => getTrack(current, clip.track_id)?.kind).filter((kind) => (
+        kind === "video" || kind === "audio"
+      ));
+      return {
+        id: groupId,
+        kind: kinds.includes("video") ? "video" as const : "audio" as const,
+        start: Math.min(...clips.map((clip) => clip.start)),
+        end: Math.max(...clips.map((clip) => clip.start + (clip.source_out - clip.source_in))),
+      };
+    });
+
+    return [...standalone, ...linked].sort((a, b) => (a.start - b.start) || a.id.localeCompare(b.id));
+  });
+  const overviewSubtitles = createMemo(() =>
+    project()
+      ? visibleTimelineCaptions(project()!).filter((caption) => !caption.source_clip_id)
+      : []
+  );
+  createEffect(() => {
+    const current = project();
+    const editingId = editingSubtitleId();
+    if (!editingId) return;
+    if (!current || !getSubtitleBlock(current, editingId)) cancelSubtitleEditing();
+  });
+  createEffect(
+    on(selectedSubtitleId, (subtitleId) => {
+      const editingId = editingSubtitleId();
+      if (editingId && subtitleId !== editingId) cancelSubtitleEditing();
+    }),
   );
   const visiblePreviewState = createMemo(() => {
     const current = project();
@@ -2182,7 +2440,12 @@ const TimelinePanel: Component<{
             track_id: nextTrackIds.get(item.id) ?? origin.trackId,
           }];
         });
-        return upsertClips(current, updates);
+        const nextProject = upsertClips(current, updates);
+        return syncGeneratedSubtitlesWithMovedAudioClips(
+          current,
+          nextProject,
+          updates.map((item) => item.id),
+        );
       });
     };
     const onUp = () => {
@@ -2191,6 +2454,39 @@ const TimelinePanel: Component<{
       const current = project();
       const movedClip = current ? getClip(current, clip.id) : null;
       if (movedClip) setSelectedTrackId(movedClip.track_id);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  const beginSubtitleDrag = (event: PointerEvent, caption: SubtitleBlock, trackId: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (editingSubtitleId() === caption.id) return;
+    const currentProject = project();
+    if (!currentProject) return;
+    selectSubtitle(caption, trackId);
+    const ownerClip = caption.source_clip_id ? getClip(currentProject, caption.source_clip_id) : null;
+    const clipStart = ownerClip?.start ?? 0;
+    const clipEnd = ownerClip ? ownerClip.start + (ownerClip.source_out - ownerClip.source_in) : Number.POSITIVE_INFINITY;
+    const startX = event.clientX;
+    const originStart = caption.start;
+    const durationSec = Math.max(MIN_SUBTITLE_DURATION, caption.end - caption.start);
+    const onMove = (moveEvent: PointerEvent) => {
+      const deltaSec = (moveEvent.clientX - startX) / pxPerSecond();
+      const desiredStart = originStart + deltaSec;
+      const maxStart = Number.isFinite(clipEnd)
+        ? Math.max(clipStart, clipEnd - durationSec)
+        : Number.POSITIVE_INFINITY;
+      const nextStart = Math.max(clipStart, Math.min(maxStart, desiredStart));
+      props.updateProject((current) => patchSubtitle(current, caption.id, {
+        start: nextStart,
+        end: nextStart + durationSec,
+      }));
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
     };
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
@@ -2256,6 +2552,44 @@ const TimelinePanel: Component<{
           }];
         });
         return upsertClips(current, updates);
+      });
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  const beginSubtitleTrim = (
+    event: PointerEvent,
+    caption: SubtitleBlock,
+    edge: "start" | "end",
+    trackId: string,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (editingSubtitleId() === caption.id) return;
+    const currentProject = project();
+    if (!currentProject) return;
+    selectSubtitle(caption, trackId);
+    const ownerClip = caption.source_clip_id ? getClip(currentProject, caption.source_clip_id) : null;
+    const clipStart = ownerClip?.start ?? 0;
+    const clipEnd = ownerClip ? ownerClip.start + (ownerClip.source_out - ownerClip.source_in) : Number.POSITIVE_INFINITY;
+    const onMove = (moveEvent: PointerEvent) => {
+      const pointerTime = getTimeFromPointer(moveEvent.clientX);
+      props.updateProject((current) => {
+        const currentCaption = getSubtitleBlock(current, caption.id);
+        if (!currentCaption) return current;
+        if (edge === "start") {
+          const maxStart = currentCaption.end - MIN_SUBTITLE_DURATION;
+          const nextStart = Math.max(clipStart, Math.min(maxStart, pointerTime));
+          return patchSubtitle(current, caption.id, { start: nextStart });
+        }
+        const minEnd = currentCaption.start + MIN_SUBTITLE_DURATION;
+        const nextEnd = Math.max(minEnd, Math.min(clipEnd, pointerTime));
+        return patchSubtitle(current, caption.id, { end: nextEnd });
       });
     };
     const onUp = () => {
@@ -2393,9 +2727,22 @@ const TimelinePanel: Component<{
       </div>
     </div>
   );
-  const renderTrackRow = (track: TimelineTrack) => (
+  const renderTrackRow = (track: TimelineTrack) => {
+    const pendingRanges = track.kind === "audio" ? pendingTrackSubtitleRanges(track.id) : [];
+    const generatedGroups = track.kind === "audio" ? generatedTrackSubtitleGroups(track.id) : [];
+    const splitAudioClipIds = new Set<string>();
+    if (track.kind === "audio") {
+      for (const group of generatedGroups) {
+        if (group.sourceClipId) splitAudioClipIds.add(group.sourceClipId);
+      }
+      if (pendingRanges.length) {
+        for (const clip of trackClips(project()!, track.id)) splitAudioClipIds.add(clip.id);
+      }
+    }
+    const hasAudioSubtitleBand = pendingRanges.length > 0 || generatedGroups.length > 0;
+    return (
     <div
-      class={`tl-track tl-track--project tl-track--${track.kind}`}
+      class={`tl-track tl-track--project tl-track--${track.kind}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}`}
       style={{ height: `${trackHeight(track.kind)}px` }}
       onDragOver={(e) => {
         e.preventDefault();
@@ -2431,6 +2778,48 @@ const TimelinePanel: Component<{
         setSelectedSubtitleId(null);
       }}
     >
+      <Show when={track.kind === "audio" && hasAudioSubtitleBand}>
+        <div class="tl-audio-subtitle-band">
+          <For each={pendingRanges}>
+            {(pending) => (
+              <div
+                class="tl-audio-subtitle-group tl-audio-subtitle-pending-group tl-seg tl-seg--subtitle-pending"
+                style={{
+                  left: `${toPx(pending.start)}px`,
+                  width: `${Math.max(18, (pending.end - pending.start) * pxPerSecond())}px`,
+                }}
+              >
+                <div class="tl-subtitle-pending-core">
+                  <span>{pending.label}</span>
+                  <div class="tl-subtitle-pending-dots" aria-hidden="true">
+                    <i />
+                    <i />
+                    <i />
+                  </div>
+                </div>
+              </div>
+            )}
+          </For>
+          <For each={generatedGroups}>
+            {(group) => (
+              <AudioSubtitleVisualGroup
+                group={group}
+                pxPerSecond={pxPerSecond()}
+                selectedSubtitleId={selectedSubtitleId()}
+                editingSubtitleId={editingSubtitleId()}
+                editingSubtitleText={editingSubtitleText()}
+                onPointerDown={(event, caption) => beginSubtitleDrag(event, caption, track.id)}
+                onTrimPointerDown={(event, caption, edge) => beginSubtitleTrim(event, caption, edge, track.id)}
+                onSelect={(caption) => selectSubtitle(caption, track.id)}
+                onBeginEdit={(caption) => beginSubtitleEditing(caption, track.id)}
+                onEditTextChange={setEditingSubtitleText}
+                onCommitEdit={commitSubtitleEditing}
+                onCancelEdit={cancelSubtitleEditing}
+              />
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={dragPreview() && dragPreview()!.trackIds.includes(track.id)}>
         <div class="tl-drop-caret" style={{ left: `${toPx(dragPreview()!.start)}px` }} />
         <div
@@ -2451,7 +2840,7 @@ const TimelinePanel: Component<{
           {(clip) => (
             <button
               type="button"
-              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
+              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${track.kind === "audio" && splitAudioClipIds.has(clip.id) ? " tl-seg--audio-split" : ""}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
               style={{
                 left: `${toPx(clip.start)}px`,
                 width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
@@ -2493,49 +2882,29 @@ const TimelinePanel: Component<{
         </For>
       </Show>
       <Show when={track.id === captionHostTrackId() || track.kind === "subtitle"}>
-        <For each={pendingSubtitleRanges().filter((item) => item.trackId === track.id)}>
-          {(pending) => (
-            <div
-              class="tl-seg tl-seg--clip tl-seg--video tl-seg--subtitle-pending"
-              style={{
-                left: `${toPx(pending.start)}px`,
-                width: `${Math.max(18, (pending.end - pending.start) * pxPerSecond())}px`,
-              }}
-            >
-              <div class="tl-subtitle-pending-core">
-                <span>{pending.label}</span>
-                <div class="tl-subtitle-pending-dots" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                </div>
-              </div>
-            </div>
-          )}
-        </For>
-        <For each={visibleTrackSubtitles(track.id)}>
+        <For each={visibleStandaloneSubtitles(track.id)}>
           {(caption) => (
-            <button
-              type="button"
-              class={`tl-seg tl-seg--subtitle${selectedSubtitleId() === caption.id ? " is-active" : ""}`}
-              style={{
-                left: `${toPx(caption.start)}px`,
-                width: `${Math.max(8, (caption.end - caption.start) * pxPerSecond())}px`,
-              }}
-              onClick={(e) => {
-                e.stopPropagation();
-                setSelectedSubtitleId(caption.id);
-                setSelectedTrackId(track.id);
-                setSelectedClipId(null);
-              }}
-            >
-              <span>{caption.text}</span>
-            </button>
+            <TimelineSubtitleSegment
+              caption={caption}
+              left={toPx(caption.start)}
+              width={Math.max(8, (caption.end - caption.start) * pxPerSecond())}
+              selected={selectedSubtitleId() === caption.id}
+              editing={editingSubtitleId() === caption.id}
+              editText={editingSubtitleId() === caption.id ? editingSubtitleText() : caption.text}
+              onPointerDown={(event, currentCaption) => beginSubtitleDrag(event, currentCaption, track.id)}
+              onTrimPointerDown={(event, currentCaption, edge) => beginSubtitleTrim(event, currentCaption, edge, track.id)}
+              onSelect={(currentCaption) => selectSubtitle(currentCaption, track.id)}
+              onBeginEdit={(currentCaption) => beginSubtitleEditing(currentCaption, track.id)}
+              onEditTextChange={setEditingSubtitleText}
+              onCommitEdit={commitSubtitleEditing}
+              onCancelEdit={cancelSubtitleEditing}
+            />
           )}
         </For>
       </Show>
     </div>
   );
+  };
 
   createEffect(() => {
     const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
@@ -2733,21 +3102,18 @@ const TimelinePanel: Component<{
           <div class="tl-minimap" style={{ display: "grid" }}>
             <div class="tl-minimap-label">Overview</div>
             <div class="tl-minimap-content" onPointerDown={onMinimapPointerDown}>
-              <For each={project()!.clips}>
-                {(clip) => {
-                  const track = getTrack(project()!, clip.track_id);
-                  return (
-                    <div
-                      class={`tl-mini-seg tl-mini-seg--${track?.kind ?? "video"}`}
-                      style={{
-                        left: `${(clip.start / duration()) * 100}%`,
-                        width: `${Math.max(0.5, ((clip.source_out - clip.source_in) / duration()) * 100)}%`,
-                      }}
-                    />
-                  );
-                }}
+              <For each={overviewClips()}>
+                {(clip) => (
+                  <div
+                    class={`tl-mini-seg tl-mini-seg--${clip.kind}`}
+                    style={{
+                      left: `${(clip.start / duration()) * 100}%`,
+                      width: `${Math.max(0.5, ((clip.end - clip.start) / duration()) * 100)}%`,
+                    }}
+                  />
+                )}
               </For>
-              <For each={project()!.captions}>
+              <For each={overviewSubtitles()}>
                 {(caption) => (
                   <div
                     class="tl-mini-seg tl-mini-seg--subtitle"

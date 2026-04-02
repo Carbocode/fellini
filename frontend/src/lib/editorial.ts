@@ -1,4 +1,6 @@
 import type {
+  AssetTranscription,
+  AssetTranscriptionWord,
   AudioTrackRole,
   EditorialProject,
   ProjectAsset,
@@ -10,6 +12,7 @@ import type {
 
 const MIN_TRACK_PAIR_COUNT = 2;
 const CAPTION_TRACK_ID = "track_subtitle_1";
+const MIN_SUBTITLE_DURATION = 0.02;
 
 function clipDuration(clip: Pick<TimelineClip, "source_in" | "source_out">): number {
   return Math.max(0, clip.source_out - clip.source_in);
@@ -20,7 +23,10 @@ export function projectDuration(project: EditorialProject): number {
     (max, clip) => Math.max(max, clip.start + clipDuration(clip)),
     0,
   );
-  const subtitleEnd = project.captions.reduce((max, caption) => Math.max(max, caption.end), 0);
+  const subtitleEnd = visibleTimelineCaptions(project).reduce(
+    (max, caption) => Math.max(max, caption.end),
+    0,
+  );
   return Math.max(clipEnd, subtitleEnd, 0);
 }
 
@@ -35,72 +41,273 @@ function subtitleTrackForProject(project: EditorialProject): TimelineTrack | und
     ?? orderedTracks.find((track) => track.kind === "subtitle");
 }
 
-function replaceGeneratedSubtitlesForLane(
-  project: EditorialProject,
-  laneId: string,
-  trackId: string,
-): SubtitleBlock[] {
-  const captions = project.captions.filter((caption) => (
-    caption.source_lane_id !== laneId || caption.origin !== "generated"
-  ));
+function clipContainsTime(clip: TimelineClip, time: number): boolean {
+  return clip.start <= time && time <= clip.start + clipDuration(clip);
+}
+
+function clipIntersectsRange(clip: TimelineClip, start: number, end: number): boolean {
+  return clip.start < end && (clip.start + clipDuration(clip)) > start;
+}
+
+function clipForLaneRange(
+  laneClips: TimelineClip[],
+  start: number,
+  end: number,
+): TimelineClip | null {
+  const midpoint = start + ((end - start) / 2);
+  return laneClips.find((clip) => clipContainsTime(clip, midpoint))
+    ?? laneClips.find((clip) => clipIntersectsRange(clip, start, end))
+    ?? null;
+}
+
+function assetWordId(assetId: string, start: number, end: number, text: string): string {
+  const startMs = Math.round(Math.max(0, start) * 1000);
+  const endMs = Math.round(Math.max(start, end) * 1000);
+  const slug = [...text.toLowerCase()].filter((char) => /[a-z0-9]/.test(char)).join("").slice(0, 24) || "word";
+  return `asset_word_${assetId}_${startMs.toString().padStart(8, "0")}_${endMs.toString().padStart(8, "0")}_${slug}`;
+}
+
+function assetWordFromLaneRange(
+  clip: TimelineClip,
+  text: string,
+  start: number,
+  end: number,
+  sourceWordRefs: SubtitleBlock["source_word_refs"],
+): AssetTranscriptionWord {
+  const assetStart = Math.max(0, clip.source_in + (start - clip.start));
+  const assetEnd = Math.max(assetStart + 0.02, clip.source_in + (end - clip.start));
+  return {
+    id: assetWordId(clip.asset_id, assetStart, assetEnd, text),
+    start: assetStart,
+    end: assetEnd,
+    text,
+    source_word_refs: sourceWordRefs,
+  };
+}
+
+function rangesIntersect(leftStart: number, leftEnd: number, rightStart: number, rightEnd: number): boolean {
+  return leftStart < rightEnd && leftEnd > rightStart;
+}
+
+function fallbackAssetForLaneTranscription(project: EditorialProject): ProjectAsset | undefined {
+  return project.assets.find((asset) => asset.has_audio);
+}
+
+function mergeAssetTranscriptionsFromLane(project: EditorialProject, laneId: string): EditorialProject {
   const lane = project.lane_transcriptions.find((item) => item.lane_id === laneId);
-  if (!lane) return captions;
+  if (!lane || !lane.segments.length) return project;
+  const laneClips = trackClips(project, laneId);
+  const fallbackAsset = laneClips.length ? undefined : fallbackAssetForLaneTranscription(project);
+  if (!laneClips.length && !fallbackAsset) return project;
+
+  const nextWordsByAsset = new Map<string, Map<string, AssetTranscriptionWord>>();
+  const touchedRangesByAsset = new Map<string, Array<{ start: number; end: number }>>();
   for (const [segmentIndex, segment] of lane.segments.entries()) {
     if (segment.words.length > 0) {
       for (const [wordIndex, word] of segment.words.entries()) {
-        captions.push({
-          id: `subtitle_${laneId}_${segmentIndex.toString().padStart(4, "0")}_${wordIndex.toString().padStart(4, "0")}`,
-          track_id: trackId,
-          source_lane_id: laneId,
-          start: word.start,
-          end: Math.max(word.end, word.start + 0.02),
-          text: word.text,
-          origin: "generated",
-          source_word_refs: [{ segment_id: segment.id, word_index: wordIndex }],
-        });
+        const wordEnd = Math.max(word.end, word.start + 0.02);
+        const ownerClip = clipForLaneRange(laneClips, word.start, wordEnd);
+        if (!ownerClip && fallbackAsset) {
+          const assetWord = {
+            id: assetWordId(fallbackAsset.id, word.start, wordEnd, word.text),
+            start: word.start,
+            end: wordEnd,
+            text: word.text,
+            source_word_refs: [{ segment_id: segment.id, word_index: wordIndex }],
+          } satisfies AssetTranscriptionWord;
+          if (!nextWordsByAsset.has(fallbackAsset.id)) nextWordsByAsset.set(fallbackAsset.id, new Map());
+          nextWordsByAsset.get(fallbackAsset.id)!.set(assetWord.id, assetWord);
+          if (!touchedRangesByAsset.has(fallbackAsset.id)) touchedRangesByAsset.set(fallbackAsset.id, []);
+          touchedRangesByAsset.get(fallbackAsset.id)!.push({ start: assetWord.start, end: assetWord.end });
+          continue;
+        }
+        if (!ownerClip) continue;
+        const assetWord = assetWordFromLaneRange(
+          ownerClip,
+          word.text,
+          word.start,
+          wordEnd,
+          [{ segment_id: segment.id, word_index: wordIndex }],
+        );
+        if (!nextWordsByAsset.has(ownerClip.asset_id)) nextWordsByAsset.set(ownerClip.asset_id, new Map());
+        nextWordsByAsset.get(ownerClip.asset_id)!.set(assetWord.id, assetWord);
+        if (!touchedRangesByAsset.has(ownerClip.asset_id)) touchedRangesByAsset.set(ownerClip.asset_id, []);
+        touchedRangesByAsset.get(ownerClip.asset_id)!.push({ start: assetWord.start, end: assetWord.end });
       }
       continue;
     }
-    captions.push({
-      id: `subtitle_${laneId}_${segmentIndex.toString().padStart(4, "0")}`,
-      track_id: trackId,
+    const segmentEnd = Math.max(segment.end, segment.start + 0.02);
+    const ownerClip = clipForLaneRange(laneClips, segment.start, segmentEnd);
+    if (!ownerClip && fallbackAsset) {
+      const assetWord = {
+        id: assetWordId(fallbackAsset.id, segment.start, segmentEnd, segment.text),
+        start: segment.start,
+        end: segmentEnd,
+        text: segment.text,
+        source_word_refs: [{ segment_id: segment.id, word_index: segmentIndex }],
+      } satisfies AssetTranscriptionWord;
+      if (!nextWordsByAsset.has(fallbackAsset.id)) nextWordsByAsset.set(fallbackAsset.id, new Map());
+      nextWordsByAsset.get(fallbackAsset.id)!.set(assetWord.id, assetWord);
+      if (!touchedRangesByAsset.has(fallbackAsset.id)) touchedRangesByAsset.set(fallbackAsset.id, []);
+      touchedRangesByAsset.get(fallbackAsset.id)!.push({ start: assetWord.start, end: assetWord.end });
+      continue;
+    }
+    if (!ownerClip) continue;
+    const assetWord = assetWordFromLaneRange(
+      ownerClip,
+      segment.text,
+      segment.start,
+      segmentEnd,
+      [{ segment_id: segment.id, word_index: segmentIndex }],
+    );
+    if (!nextWordsByAsset.has(ownerClip.asset_id)) nextWordsByAsset.set(ownerClip.asset_id, new Map());
+    nextWordsByAsset.get(ownerClip.asset_id)!.set(assetWord.id, assetWord);
+    if (!touchedRangesByAsset.has(ownerClip.asset_id)) touchedRangesByAsset.set(ownerClip.asset_id, []);
+    touchedRangesByAsset.get(ownerClip.asset_id)!.push({ start: assetWord.start, end: assetWord.end });
+  }
+
+  if (!nextWordsByAsset.size) return project;
+
+  const existingByAsset = new Map(project.asset_transcriptions.map((item) => [item.asset_id, item]));
+  const updatedAssetTranscriptions: AssetTranscription[] = [];
+  for (const item of project.asset_transcriptions) {
+    const nextWords = nextWordsByAsset.get(item.asset_id);
+    if (!nextWords) {
+      updatedAssetTranscriptions.push(item);
+      continue;
+    }
+    const touchedRanges = touchedRangesByAsset.get(item.asset_id) ?? [];
+    const preservedWords = item.words.filter((word) => !touchedRanges.some((range) => (
+      rangesIntersect(word.start, word.end, range.start, range.end)
+    )));
+    updatedAssetTranscriptions.push({
+      ...item,
+      language: lane.language,
+      words: [...preservedWords, ...nextWords.values()].sort((a, b) => (
+        (a.start - b.start) || (a.end - b.end) || a.text.localeCompare(b.text) || a.id.localeCompare(b.id)
+      )),
       source_lane_id: laneId,
-      start: segment.start,
-      end: Math.max(segment.end, segment.start + 0.02),
-      text: segment.text,
-      origin: "generated",
-      source_word_refs: [],
+      source_audio_path: lane.source_audio_path,
+      updated_at: new Date().toISOString(),
+      error: null,
     });
   }
-  return captions;
+  for (const [assetId, words] of nextWordsByAsset.entries()) {
+    if (existingByAsset.has(assetId)) continue;
+    updatedAssetTranscriptions.push({
+      asset_id: assetId,
+      language: lane.language,
+      words: [...words.values()].sort((a, b) => (
+        (a.start - b.start) || (a.end - b.end) || a.text.localeCompare(b.text) || a.id.localeCompare(b.id)
+      )),
+      source_lane_id: laneId,
+      source_audio_path: lane.source_audio_path,
+      updated_at: new Date().toISOString(),
+      error: null,
+    });
+  }
+
+  return {
+    ...project,
+    assets: project.assets.map((asset) => (
+      nextWordsByAsset.has(asset.id)
+        ? { ...asset, transcript_ref: asset.id }
+        : asset
+    )),
+    asset_transcriptions: updatedAssetTranscriptions,
+  };
+}
+
+function materializedGeneratedSubtitles(project: EditorialProject, subtitleTrackId: string): SubtitleBlock[] {
+  const wordsByAsset = new Map(project.asset_transcriptions.map((item) => [item.asset_id, item.words]));
+  const clipCaptions = project.clips
+    .filter((clip) => {
+      const track = getTrack(project, clip.track_id);
+      return clip.enabled && clip.captions_enabled && track?.kind === "audio";
+    })
+    .sort((a, b) => (a.start - b.start) || a.id.localeCompare(b.id))
+    .flatMap((clip) => (
+      (wordsByAsset.get(clip.asset_id) ?? [])
+        .filter((word) => word.end > clip.source_in && word.start < clip.source_out)
+        .map((word) => {
+          const visibleStart = Math.max(word.start, clip.source_in);
+          const visibleEnd = Math.min(word.end, clip.source_out);
+          const start = clip.start + (visibleStart - clip.source_in);
+          const end = clip.start + (visibleEnd - clip.source_in);
+          return {
+            id: `subtitle_${clip.id}_${word.id}`,
+            track_id: subtitleTrackId,
+            source_lane_id: clip.track_id,
+            source_clip_id: clip.id,
+            source_asset_id: clip.asset_id,
+            source_asset_start: word.start,
+            source_asset_end: word.end,
+            start,
+            end: Math.max(start + 0.02, end),
+            text: word.text,
+            origin: "generated" as const,
+            source_word_refs: [...word.source_word_refs],
+          } satisfies SubtitleBlock;
+        })
+    ))
+    .sort((a, b) => (a.start - b.start) || (a.end - b.end) || a.id.localeCompare(b.id));
+  const materializedAssets = new Set(clipCaptions.map((caption) => caption.source_asset_id).filter(Boolean));
+  const fallbackLaneId = sortedTracks(project).find((track) => track.kind === "audio")?.id ?? subtitleTrackId;
+  const standaloneCaptions = project.asset_transcriptions
+    .filter((transcription) => !materializedAssets.has(transcription.asset_id))
+    .flatMap((transcription) => transcription.words.map((word) => ({
+      id: `subtitle_standalone_${transcription.asset_id}_${word.id}`,
+      track_id: subtitleTrackId,
+      source_lane_id: transcription.source_lane_id ?? fallbackLaneId,
+      source_clip_id: null,
+      source_asset_id: transcription.asset_id,
+      source_asset_start: word.start,
+      source_asset_end: word.end,
+      start: word.start,
+      end: Math.max(word.start + 0.02, word.end),
+      text: word.text,
+      origin: "generated" as const,
+      source_word_refs: [...word.source_word_refs],
+    } satisfies SubtitleBlock)));
+  return [...clipCaptions, ...standaloneCaptions]
+    .sort((a, b) => (a.start - b.start) || (a.end - b.end) || a.id.localeCompare(b.id));
 }
 
 export function normalizeGeneratedSubtitles(project: EditorialProject): EditorialProject {
   const subtitleTrack = subtitleTrackForProject(project);
   if (!subtitleTrack) return project;
 
-  let captions = project.captions;
-  let changed = false;
-  for (const lane of project.lane_transcriptions) {
-    const totalWords = lane.segments.reduce((sum, segment) => sum + segment.words.length, 0);
-    if (totalWords <= 0) continue;
-    const generated = captions.filter((caption) => (
-      caption.source_lane_id === lane.lane_id && caption.origin === "generated"
-    ));
-    const isWordLevel = (
-      generated.length === totalWords
-      && generated.every((caption) => caption.source_word_refs.length === 1)
-    );
-    if (isWordLevel) continue;
-    captions = replaceGeneratedSubtitlesForLane(
-      { ...project, captions },
-      lane.lane_id,
-      subtitleTrack.id,
-    );
-    changed = true;
+  let updated = project;
+  const hasStructuralGenerated = updated.asset_transcriptions.length > 0 || updated.captions.some((caption) => (
+    caption.origin === "generated" && !!caption.source_asset_id
+  ));
+  if (!hasStructuralGenerated) {
+    for (const lane of updated.lane_transcriptions) {
+      if (!lane.segments.length) continue;
+      updated = mergeAssetTranscriptionsFromLane(updated, lane.lane_id);
+    }
   }
 
-  return changed ? { ...project, captions } : project;
+  const manualCaptions = updated.captions.filter((caption) => caption.origin !== "generated");
+  const legacyGeneratedCaptions = updated.captions.filter((caption) => (
+    caption.origin === "generated" && !caption.source_asset_id
+  ));
+  const generatedCaptions = materializedGeneratedSubtitles(updated, subtitleTrack.id);
+  if (
+    manualCaptions.length === updated.captions.length
+    && !generatedCaptions.length
+    && updated === project
+  ) {
+    return project;
+  }
+  return {
+    ...updated,
+    captions: [
+      ...manualCaptions,
+      ...(updated.asset_transcriptions.length ? [] : legacyGeneratedCaptions),
+      ...generatedCaptions,
+    ],
+  };
 }
 
 export function getTrack(project: EditorialProject, trackId: string | null): TimelineTrack | null {
@@ -132,9 +339,76 @@ export function trackClips(project: EditorialProject, trackId: string): Timeline
 }
 
 export function trackSubtitles(project: EditorialProject, trackId: string): SubtitleBlock[] {
-  return project.captions
+  return visibleTimelineCaptions(project)
     .filter((caption) => caption.track_id === trackId)
     .sort((a, b) => a.start - b.start);
+}
+
+export interface SubtitleVisualGroup {
+  id: string;
+  sourceLaneId: string;
+  sourceClipId: string | null;
+  assetId: string | null;
+  linkedGroupId: string | null;
+  start: number;
+  end: number;
+  captions: SubtitleBlock[];
+  isFallback: boolean;
+}
+
+export function visibleTimelineCaptions(project: EditorialProject): SubtitleBlock[] {
+  return project.captions.filter((caption) => (
+    caption.origin !== "generated"
+    || !caption.source_clip_id
+    || !!getClip(project, caption.source_clip_id)
+  ));
+}
+
+export function generatedSubtitleGroupsForLane(
+  project: EditorialProject,
+  laneId: string,
+): SubtitleVisualGroup[] {
+  const laneCaptions = visibleTimelineCaptions(project)
+    .filter((caption) => caption.source_lane_id === laneId && caption.origin === "generated")
+    .sort((a, b) => (a.start - b.start) || (a.end - b.end));
+
+  const grouped = new Map<string, { clip: TimelineClip | null; captions: SubtitleBlock[] }>();
+  for (const caption of laneCaptions) {
+    const ownerClip = caption.source_clip_id ? getClip(project, caption.source_clip_id) : null;
+    const key = ownerClip?.id ?? `standalone:${caption.id}`;
+    const entry = grouped.get(key) ?? { clip: ownerClip, captions: [] };
+    entry.captions.push(caption);
+    grouped.set(key, entry);
+  }
+
+  return [...grouped.entries()]
+    .map(([key, entry]) => {
+      const captions = [...entry.captions].sort((a, b) => (a.start - b.start) || (a.end - b.end));
+      const visualStart = entry.clip?.start ?? Math.min(...captions.map((caption) => caption.start));
+      const visualEnd = entry.clip
+        ? entry.clip.start + clipDuration(entry.clip)
+        : Math.max(...captions.map((caption) => caption.end));
+      return {
+        id: `subtitle_group_${laneId}_${key}`,
+        sourceLaneId: laneId,
+        sourceClipId: entry.clip?.id ?? null,
+        assetId: entry.clip?.asset_id ?? null,
+        linkedGroupId: entry.clip?.linked_group_id ?? null,
+        start: visualStart,
+        end: visualEnd,
+        captions,
+        isFallback: !entry.clip,
+      } satisfies SubtitleVisualGroup;
+    })
+    .sort((a, b) => (a.start - b.start) || (a.end - b.end));
+}
+
+export function syncGeneratedSubtitlesWithMovedAudioClips(
+  _previousProject: EditorialProject,
+  nextProject: EditorialProject,
+  _clipIds: string[],
+): EditorialProject {
+  return nextProject;
 }
 
 export function laneContentRange(
@@ -609,6 +883,33 @@ export function removeClip(project: EditorialProject, clipId: string): Editorial
   return normalizeTrackLayout({ ...project, clips: project.clips.filter((clip) => !ids.has(clip.id)) });
 }
 
+export function removeSubtitle(project: EditorialProject, subtitleId: string): EditorialProject {
+  const target = getSubtitleBlock(project, subtitleId);
+  if (!target) return project;
+
+  if (target.origin === "generated" && target.source_asset_id) {
+    return {
+      ...project,
+      asset_transcriptions: project.asset_transcriptions.map((transcription) => {
+        if (transcription.asset_id !== target.source_asset_id) return transcription;
+        return {
+          ...transcription,
+          words: transcription.words.filter((word) => !(
+            word.start === (target.source_asset_start ?? word.start)
+            && word.end === (target.source_asset_end ?? word.end)
+            && word.text === target.text
+          )),
+        };
+      }),
+    };
+  }
+
+  return {
+    ...project,
+    captions: project.captions.filter((caption) => caption.id !== subtitleId),
+  };
+}
+
 export function splitClip(project: EditorialProject, clipId: string, atTime: number): EditorialProject {
   const clip = getClip(project, clipId);
   if (!clip) return project;
@@ -647,6 +948,50 @@ export function patchSubtitle(
   subtitleId: string,
   patch: Partial<Pick<SubtitleBlock, "text" | "start" | "end">>,
 ): EditorialProject {
+  const target = getSubtitleBlock(project, subtitleId);
+  if (target?.origin === "generated" && target.source_asset_id) {
+    const ownerClip = target.source_clip_id ? getClip(project, target.source_clip_id) : null;
+    const nextAssetStart = patch.start !== undefined
+      ? ownerClip
+        ? Math.max(0, ownerClip.source_in + (patch.start - ownerClip.start))
+        : Math.max(0, patch.start)
+      : target.source_asset_start ?? null;
+    const nextAssetEnd = patch.end !== undefined
+      ? ownerClip
+        ? Math.max(
+            (nextAssetStart ?? 0) + MIN_SUBTITLE_DURATION,
+            ownerClip.source_in + (patch.end - ownerClip.start),
+          )
+        : Math.max(
+            (nextAssetStart ?? target.source_asset_start ?? Math.max(0, patch.end - MIN_SUBTITLE_DURATION))
+              + MIN_SUBTITLE_DURATION,
+            patch.end,
+          )
+      : target.source_asset_end ?? null;
+    return {
+      ...project,
+      asset_transcriptions: project.asset_transcriptions.map((transcription) => {
+        if (transcription.asset_id !== target.source_asset_id) return transcription;
+        return {
+          ...transcription,
+          words: transcription.words.map((word) => {
+            const matches = (
+              word.start === (target.source_asset_start ?? word.start)
+              && word.end === (target.source_asset_end ?? word.end)
+              && word.text === target.text
+            );
+            if (!matches) return word;
+            return {
+              ...word,
+              text: patch.text ?? word.text,
+              start: nextAssetStart ?? word.start,
+              end: nextAssetEnd ?? word.end,
+            };
+          }),
+        };
+      }),
+    };
+  }
   return {
     ...project,
     captions: project.captions.map((caption) =>

@@ -1,5 +1,11 @@
 import { Show, createMemo, type Accessor, type Component } from "solid-js";
-import { selectedClipId, selectedSubtitleId, selectedTrackId } from "../store";
+import {
+  selectedClipId,
+  selectedSubtitleId,
+  selectedTrackId,
+  setSelectedClipId,
+  setSelectedSubtitleId,
+} from "../store";
 import type { EditorialProject } from "../types";
 import {
   assetById,
@@ -7,6 +13,8 @@ import {
   getSubtitleBlock,
   getTrack,
   patchSubtitle,
+  removeClip,
+  removeSubtitle,
   setStoryLane,
 } from "../lib/editorial";
 import { fmtTimePrecise } from "../lib/utils";
@@ -33,6 +41,18 @@ const ParamsInspector: Component<{
     if (!project || !lane || lane.kind !== "audio") return null;
     return project.lane_transcriptions.find((item) => item.lane_id === lane.id) ?? null;
   });
+  const deleteSelectedClip = () => {
+    const clip = currentClip();
+    if (!clip) return;
+    props.updateProject((project) => removeClip(project, clip.id));
+    setSelectedClipId(null);
+  };
+  const deleteSelectedSubtitle = () => {
+    const subtitle = currentSubtitle();
+    if (!subtitle) return;
+    props.updateProject((project) => removeSubtitle(project, subtitle.id));
+    setSelectedSubtitleId(null);
+  };
 
   return (
     <div class="panel inspector-panel">
@@ -100,6 +120,15 @@ const ParamsInspector: Component<{
                   <span>Link</span>
                   <span>{clip().linked_group_id ? "A/V linked" : "Independent"}</span>
                 </div>
+                <div class="inspector-card-actions">
+                  <button
+                    type="button"
+                    class="btn btn-xs btn-danger"
+                    onClick={deleteSelectedClip}
+                  >
+                    Elimina clip
+                  </button>
+                </div>
               </div>
             )}
           </Show>
@@ -142,6 +171,15 @@ const ParamsInspector: Component<{
                       )}
                   />
                 </label>
+                <div class="inspector-card-actions">
+                  <button
+                    type="button"
+                    class="btn btn-xs btn-danger"
+                    onClick={deleteSelectedSubtitle}
+                  >
+                    Elimina blocco
+                  </button>
+                </div>
               </div>
             )}
           </Show>

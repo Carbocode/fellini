@@ -204,11 +204,33 @@ export interface SubtitleBlock {
   id: string;
   track_id: string;
   source_lane_id: string;
+  source_clip_id: string | null;
+  source_asset_id: string | null;
+  source_asset_start: number | null;
+  source_asset_end: number | null;
   start: number;
   end: number;
   text: string;
   origin: ClipOrigin;
   source_word_refs: SourceWordRef[];
+}
+
+export interface AssetTranscriptionWord {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  source_word_refs: SourceWordRef[];
+}
+
+export interface AssetTranscription {
+  asset_id: string;
+  language: string;
+  words: AssetTranscriptionWord[];
+  source_lane_id: string | null;
+  source_audio_path: string | null;
+  updated_at: string;
+  error: string | null;
 }
 
 export interface WordTiming {
@@ -258,6 +280,7 @@ export interface EditorialProject {
   tracks: TimelineTrack[];
   clips: TimelineClip[];
   captions: SubtitleBlock[];
+  asset_transcriptions: AssetTranscription[];
   lane_transcriptions: LaneTranscription[];
   selection: ProjectSelection;
   updated_at: string;

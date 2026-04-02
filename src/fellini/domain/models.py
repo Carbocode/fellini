@@ -199,11 +199,33 @@ class SubtitleBlock(BaseModel):
     id: str
     track_id: str
     source_lane_id: str
+    source_clip_id: str | None = None
+    source_asset_id: str | None = None
+    source_asset_start: float | None = None
+    source_asset_end: float | None = None
     start: float
     end: float
     text: str
     origin: ClipOrigin = ClipOrigin.generated
     source_word_refs: list[SourceWordRef] = Field(default_factory=list)
+
+
+class AssetTranscriptionWord(BaseModel):
+    id: str
+    start: float
+    end: float
+    text: str
+    source_word_refs: list[SourceWordRef] = Field(default_factory=list)
+
+
+class AssetTranscription(BaseModel):
+    asset_id: str
+    language: str = "it"
+    words: list[AssetTranscriptionWord] = Field(default_factory=list)
+    source_lane_id: str | None = None
+    source_audio_path: str | None = None
+    updated_at: datetime = Field(default_factory=utcnow)
+    error: str | None = None
 
 
 class LaneTranscription(BaseModel):
@@ -245,6 +267,7 @@ class EditorialProject(BaseModel):
     tracks: list[TimelineTrack] = Field(default_factory=list)
     clips: list[TimelineClip] = Field(default_factory=list)
     captions: list[SubtitleBlock] = Field(default_factory=list)
+    asset_transcriptions: list[AssetTranscription] = Field(default_factory=list)
     lane_transcriptions: list[LaneTranscription] = Field(default_factory=list)
     selection: ProjectSelection = Field(default_factory=ProjectSelection)
     updated_at: datetime = Field(default_factory=utcnow)

@@ -7,6 +7,8 @@ from uuid import uuid4
 
 from fellini.adapters.ffmpeg import FFmpegAdapter, FFmpegError
 from fellini.domain.models import (
+    AssetTranscription,
+    AssetTranscriptionWord,
     AudioTrackRole,
     ClipOrigin,
     EditorialProject,
@@ -50,8 +52,14 @@ class EditorialProjectStore:
         payload = json.loads(workspace.editorial_project_path.read_text(encoding="utf-8"))
         return EditorialProject.model_validate(payload)
 
+    def normalize_project(self, project: EditorialProject) -> EditorialProject:
+        normalized, _ = self._normalize_linked_clip_groups(project)
+        normalized, _ = self._normalize_track_layout(normalized)
+        normalized, _ = self._normalize_generated_subtitles(normalized)
+        return normalized
+
     def save(self, workspace: JobWorkspace, project: EditorialProject) -> EditorialProject:
-        project, _ = self._normalize_track_layout(project)
+        project = self.normalize_project(project)
         current_revision = 0
         if workspace.editorial_project_path.exists():
             current_revision = self.load(workspace).revision
@@ -110,9 +118,9 @@ class EditorialProjectStore:
             ):
                 project = self._bootstrap_from_context(context)
                 return self.save(workspace, project)
-            project, linked_migrated = self._normalize_linked_clip_groups(project)
-            project, tracks_migrated = self._normalize_track_layout(project)
-            hydrated = self._hydrate_legacy_captions(workspace, project)
+            linked_normalized, linked_migrated = self._normalize_linked_clip_groups(project)
+            track_normalized, tracks_migrated = self._normalize_track_layout(linked_normalized)
+            hydrated = self._hydrate_legacy_captions(workspace, track_normalized)
             hydrated, source_labels_migrated = self._normalize_source_asset_labels(
                 hydrated,
                 context.request.input_assets,
@@ -124,6 +132,7 @@ class EditorialProjectStore:
                 or source_labels_migrated
                 or subtitles_migrated
                 or len(hydrated.captions) != len(project.captions)
+                or len(hydrated.asset_transcriptions) != len(project.asset_transcriptions)
             ):
                 return self.save(workspace, hydrated)
             return hydrated
@@ -170,7 +179,13 @@ class EditorialProjectStore:
             lane for lane in project.lane_transcriptions if lane.lane_id != lane_id
         ]
         project.lane_transcriptions.append(next_lane)
-        self._replace_generated_subtitle_blocks(project, lane_id, transcript)
+        self._merge_asset_transcriptions_from_lane(
+            project,
+            lane_id,
+            transcript,
+            source_audio_path=source_audio_path,
+        )
+        project, _ = self._normalize_generated_subtitles(project)
         return self.save(workspace, project)
 
     def story_lane(self, project: EditorialProject) -> TimelineTrack | None:
@@ -216,6 +231,9 @@ class EditorialProjectStore:
 
     def track_clips(self, project: EditorialProject, track_id: str) -> list[TimelineClip]:
         return [clip for clip in project.clips if clip.track_id == track_id and clip.enabled]
+
+    def asset_by_id(self, project: EditorialProject, asset_id: str) -> ProjectAsset | None:
+        return next((asset for asset in project.assets if asset.id == asset_id), None)
 
     def set_story_lane(self, project: EditorialProject, lane_id: str) -> EditorialProject:
         updated = project.model_copy(deep=True)
@@ -583,81 +601,344 @@ class EditorialProjectStore:
                 has_audio=kind == ProjectAssetKind.audio,
             )
 
-    def _replace_generated_subtitle_blocks(
+    def _clip_contains_time(self, clip: TimelineClip, time: float) -> bool:
+        return clip.start <= time <= clip.end
+
+    def _clip_intersects_range(self, clip: TimelineClip, start: float, end: float) -> bool:
+        return clip.start < end and clip.end > start
+
+    def _clip_for_lane_range(
+        self,
+        lane_clips: list[TimelineClip],
+        start: float,
+        end: float,
+    ) -> TimelineClip | None:
+        midpoint = start + ((end - start) / 2)
+        return next(
+            (
+                clip
+                for clip in lane_clips
+                if self._clip_contains_time(clip, midpoint)
+            ),
+            next(
+                (
+                    clip
+                    for clip in lane_clips
+                    if self._clip_intersects_range(clip, start, end)
+                ),
+                None,
+            ),
+        )
+
+    def _asset_word_id(self, asset_id: str, start: float, end: float, text: str) -> str:
+        start_ms = round(max(0.0, start) * 1000)
+        end_ms = round(max(start, end) * 1000)
+        slug = "".join(char.lower() for char in text if char.isalnum())[:24] or "word"
+        return f"asset_word_{asset_id}_{start_ms:08d}_{end_ms:08d}_{slug}"
+
+    def _asset_word_from_lane_range(
+        self,
+        clip: TimelineClip,
+        *,
+        text: str,
+        start: float,
+        end: float,
+        source_word_refs: list[SourceWordRef],
+    ) -> AssetTranscriptionWord:
+        asset_start = max(0.0, clip.source_in + (start - clip.start))
+        asset_end = max(asset_start + 0.02, clip.source_in + (end - clip.start))
+        return AssetTranscriptionWord(
+            id=self._asset_word_id(clip.asset_id, asset_start, asset_end, text),
+            start=asset_start,
+            end=asset_end,
+            text=text,
+            source_word_refs=source_word_refs,
+        )
+
+    def _ranges_intersect(
+        self,
+        left_start: float,
+        left_end: float,
+        right_start: float,
+        right_end: float,
+    ) -> bool:
+        return left_start < right_end and left_end > right_start
+
+    def _fallback_asset_for_lane_transcription(
+        self,
+        project: EditorialProject,
+    ) -> ProjectAsset | None:
+        return next(
+            (
+                asset
+                for asset in project.assets
+                if asset.has_audio
+            ),
+            None,
+        )
+
+    def _merge_asset_transcriptions_from_lane(
         self,
         project: EditorialProject,
         lane_id: str,
         transcript: TranscriptArtifact,
-    ) -> None:
-        subtitle_track = self.subtitle_track(project)
-        captions = [
-            caption
-            for caption in project.captions
-            if not (
-                caption.source_lane_id == lane_id
-                and caption.origin == ClipOrigin.generated
-            )
-        ]
+        *,
+        source_audio_path: str | None,
+    ) -> bool:
+        lane_clips = self.track_clips(project, lane_id)
+        fallback_asset = self._fallback_asset_for_lane_transcription(project) if not lane_clips else None
+        if not lane_clips and fallback_asset is None:
+            return False
+
+        next_words_by_asset: dict[str, dict[str, AssetTranscriptionWord]] = {}
+        touched_ranges_by_asset: dict[str, list[tuple[float, float]]] = {}
+
         for segment_index, segment in enumerate(transcript.segments):
             if segment.words:
                 for word_index, word in enumerate(segment.words):
-                    captions.append(
-                        SubtitleBlock(
-                            id=f"subtitle_{lane_id}_{segment_index:04d}_{word_index:04d}",
-                            track_id=subtitle_track.id,
-                            source_lane_id=lane_id,
+                    word_end = max(word.end, word.start + 0.02)
+                    owner_clip = self._clip_for_lane_range(lane_clips, word.start, word_end)
+                    if owner_clip is None and fallback_asset is not None:
+                        asset_word = AssetTranscriptionWord(
+                            id=self._asset_word_id(fallback_asset.id, word.start, word_end, word.text),
                             start=word.start,
-                            end=max(word.end, word.start + 0.02),
+                            end=word_end,
                             text=word.text,
-                            origin=ClipOrigin.generated,
-                            source_word_refs=[
-                                SourceWordRef(segment_id=segment.id, word_index=word_index)
-                            ],
+                            source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=word_index)],
                         )
+                        next_words_by_asset.setdefault(fallback_asset.id, {})[asset_word.id] = asset_word
+                        touched_ranges_by_asset.setdefault(fallback_asset.id, []).append(
+                            (asset_word.start, asset_word.end)
+                        )
+                        continue
+                    if owner_clip is None:
+                        continue
+                    asset_word = self._asset_word_from_lane_range(
+                        owner_clip,
+                        text=word.text,
+                        start=word.start,
+                        end=word_end,
+                        source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=word_index)],
+                    )
+                    next_words_by_asset.setdefault(owner_clip.asset_id, {})[asset_word.id] = asset_word
+                    touched_ranges_by_asset.setdefault(owner_clip.asset_id, []).append(
+                        (asset_word.start, asset_word.end)
                     )
                 continue
-            captions.append(
-                SubtitleBlock(
-                    id=f"subtitle_{lane_id}_{segment_index:04d}",
-                    track_id=subtitle_track.id,
-                    source_lane_id=lane_id,
+
+            segment_end = max(segment.end, segment.start + 0.02)
+            owner_clip = self._clip_for_lane_range(lane_clips, segment.start, segment_end)
+            if owner_clip is None and fallback_asset is not None:
+                asset_word = AssetTranscriptionWord(
+                    id=self._asset_word_id(fallback_asset.id, segment.start, segment_end, segment.text),
                     start=segment.start,
-                    end=max(segment.end, segment.start + 0.02),
+                    end=segment_end,
                     text=segment.text,
-                    origin=ClipOrigin.generated,
-                    source_word_refs=[],
+                    source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=0)],
+                )
+                next_words_by_asset.setdefault(fallback_asset.id, {})[asset_word.id] = asset_word
+                touched_ranges_by_asset.setdefault(fallback_asset.id, []).append(
+                    (asset_word.start, asset_word.end)
+                )
+                continue
+            if owner_clip is None:
+                continue
+            asset_word = self._asset_word_from_lane_range(
+                owner_clip,
+                text=segment.text,
+                start=segment.start,
+                end=segment_end,
+                source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=0)],
+            )
+            next_words_by_asset.setdefault(owner_clip.asset_id, {})[asset_word.id] = asset_word
+            touched_ranges_by_asset.setdefault(owner_clip.asset_id, []).append(
+                (asset_word.start, asset_word.end)
+            )
+
+        if not next_words_by_asset:
+            return False
+
+        changed = False
+        existing_by_asset = {item.asset_id: item for item in project.asset_transcriptions}
+        updated_asset_transcriptions: list[AssetTranscription] = []
+        processed_assets = set(next_words_by_asset)
+        for item in project.asset_transcriptions:
+            if item.asset_id not in processed_assets:
+                updated_asset_transcriptions.append(item)
+                continue
+
+            ranges = touched_ranges_by_asset[item.asset_id]
+            preserved = [
+                word
+                for word in item.words
+                if not any(
+                    self._ranges_intersect(word.start, word.end, range_start, range_end)
+                    for range_start, range_end in ranges
+                )
+            ]
+            merged_words = sorted(
+                [*preserved, *next_words_by_asset[item.asset_id].values()],
+                key=lambda word: (word.start, word.end, word.text, word.id),
+            )
+            updated_asset_transcriptions.append(
+                item.model_copy(
+                    update={
+                        "language": transcript.language,
+                        "words": merged_words,
+                        "source_lane_id": lane_id,
+                        "source_audio_path": source_audio_path,
+                        "updated_at": utcnow(),
+                        "error": None,
+                    },
+                    deep=True,
                 )
             )
-        project.captions = captions
+            if item.words != merged_words or item.source_lane_id != lane_id:
+                changed = True
+
+        for asset_id, words in next_words_by_asset.items():
+            if asset_id in existing_by_asset:
+                continue
+            updated_asset_transcriptions.append(
+                AssetTranscription(
+                    asset_id=asset_id,
+                    language=transcript.language,
+                    words=sorted(words.values(), key=lambda word: (word.start, word.end, word.text, word.id)),
+                    source_lane_id=lane_id,
+                    source_audio_path=source_audio_path,
+                    error=None,
+                )
+            )
+            changed = True
+
+        if not changed:
+            # Asset may still need transcript_ref hydration even when words were identical.
+            for asset in project.assets:
+                if asset.id in next_words_by_asset and asset.transcript_ref != asset.id:
+                    asset.transcript_ref = asset.id
+                    changed = True
+            if changed:
+                project.asset_transcriptions = updated_asset_transcriptions
+            return changed
+
+        project.asset_transcriptions = updated_asset_transcriptions
+        for asset in project.assets:
+            if asset.id in next_words_by_asset:
+                asset.transcript_ref = asset.id
+        return True
+
+    def _materialized_generated_subtitle_blocks(
+        self,
+        project: EditorialProject,
+    ) -> list[SubtitleBlock]:
+        subtitle_track = self.subtitle_track(project)
+        asset_words_by_asset = {
+            item.asset_id: item.words
+            for item in project.asset_transcriptions
+            if item.words
+        }
+        captions: list[SubtitleBlock] = []
+        materialized_assets: set[str] = set()
+        audio_clips = sorted(
+            (
+                clip
+                for clip in project.clips
+                if clip.enabled
+                and clip.captions_enabled
+                and (track := next((item for item in project.tracks if item.id == clip.track_id), None))
+                and track.kind == TimelineTrackKind.audio
+            ),
+            key=lambda clip: (clip.start, clip.id),
+        )
+        for clip in audio_clips:
+            materialized_assets.add(clip.asset_id)
+            for word in asset_words_by_asset.get(clip.asset_id, []):
+                if word.end <= clip.source_in or word.start >= clip.source_out:
+                    continue
+                visible_start = max(word.start, clip.source_in)
+                visible_end = min(word.end, clip.source_out)
+                start = clip.start + (visible_start - clip.source_in)
+                end = clip.start + (visible_end - clip.source_in)
+                captions.append(
+                    SubtitleBlock(
+                        id=f"subtitle_{clip.id}_{word.id}",
+                        track_id=subtitle_track.id,
+                        source_lane_id=clip.track_id,
+                        source_clip_id=clip.id,
+                        source_asset_id=clip.asset_id,
+                        source_asset_start=word.start,
+                        source_asset_end=word.end,
+                        start=start,
+                        end=max(start + 0.02, end),
+                        text=word.text,
+                        origin=ClipOrigin.generated,
+                        source_word_refs=list(word.source_word_refs),
+                    )
+                )
+        fallback_lane_id = next(
+            (track.id for track in sorted(project.tracks, key=lambda item: item.order) if track.kind == TimelineTrackKind.audio),
+            subtitle_track.id,
+        )
+        for transcription in project.asset_transcriptions:
+            if transcription.asset_id in materialized_assets:
+                continue
+            for word in transcription.words:
+                captions.append(
+                    SubtitleBlock(
+                        id=f"subtitle_standalone_{transcription.asset_id}_{word.id}",
+                        track_id=subtitle_track.id,
+                        source_lane_id=transcription.source_lane_id or fallback_lane_id,
+                        source_clip_id=None,
+                        source_asset_id=transcription.asset_id,
+                        source_asset_start=word.start,
+                        source_asset_end=word.end,
+                        start=word.start,
+                        end=max(word.start + 0.02, word.end),
+                        text=word.text,
+                        origin=ClipOrigin.generated,
+                        source_word_refs=list(word.source_word_refs),
+                    )
+                )
+        return captions
 
     def _normalize_generated_subtitles(
         self, project: EditorialProject
     ) -> tuple[EditorialProject, bool]:
         updated = project.model_copy(deep=True)
         changed = False
-        for lane in updated.lane_transcriptions:
-            total_words = sum(len(segment.words) for segment in lane.segments if segment.words)
-            if total_words <= 0:
-                continue
-            generated = [
-                caption
-                for caption in updated.captions
-                if caption.source_lane_id == lane.lane_id and caption.origin == ClipOrigin.generated
-            ]
-            is_word_level = (
-                len(generated) == total_words
-                and all(len(caption.source_word_refs) == 1 for caption in generated)
-            )
-            if is_word_level:
-                continue
-            self._replace_generated_subtitle_blocks(
-                updated,
-                lane.lane_id,
-                TranscriptArtifact(
-                    language=lane.language,
-                    source=f"lane:{lane.lane_id}",
-                    segments=lane.segments,
-                ),
-            )
+        has_structural_generated = bool(updated.asset_transcriptions) or any(
+            caption.origin == ClipOrigin.generated and caption.source_asset_id
+            for caption in updated.captions
+        )
+        if not has_structural_generated:
+            for lane in updated.lane_transcriptions:
+                if not lane.segments:
+                    continue
+                if self._merge_asset_transcriptions_from_lane(
+                    updated,
+                    lane.lane_id,
+                    TranscriptArtifact(
+                        language=lane.language,
+                        source=f"lane:{lane.lane_id}",
+                        segments=lane.segments,
+                    ),
+                    source_audio_path=lane.source_audio_path,
+                ):
+                    changed = True
+
+        materialized = self._materialized_generated_subtitle_blocks(updated)
+        manual = [caption for caption in updated.captions if caption.origin != ClipOrigin.generated]
+        legacy_generated = [
+            caption
+            for caption in updated.captions
+            if caption.origin == ClipOrigin.generated and not caption.source_asset_id
+        ]
+        next_captions = [
+            *manual,
+            *(legacy_generated if not updated.asset_transcriptions else []),
+            *sorted(materialized, key=lambda caption: (caption.start, caption.end, caption.id)),
+        ]
+        if updated.captions != next_captions:
+            updated.captions = next_captions
             changed = True
         return updated, changed

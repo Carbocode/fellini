@@ -206,6 +206,8 @@ video, audio { display: block; width: 100%; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .btn-primary { background: var(--accent); color: #fff; }
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-danger { background: var(--red-dim); color: var(--red); border: 1px solid rgba(232,84,84,0.26); }
+.btn-danger:hover:not(:disabled) { background: rgba(232,84,84,0.22); border-color: rgba(232,84,84,0.4); }
 .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-light); }
 .btn-sm { padding: 4px 10px; font-size: 11px; }
@@ -1225,7 +1227,53 @@ textarea { resize: vertical; min-height: 36px; }
 .tl-track--project { background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0)); }
 .tl-track--video { height: 64px; }
 .tl-track--audio { height: 64px; }
+.tl-track--audio::before {
+  display: none;
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  pointer-events: none;
+  z-index: 1;
+}
+.tl-track--audio.has-audio-subtitles::before {
+  display: block;
+}
 .tl-track--subtitle { height: 64px; }
+.tl-audio-subtitle-band {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 50%;
+  pointer-events: none;
+  z-index: 2;
+}
+.tl-audio-subtitle-group {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  border-radius: 6px 6px 0 0;
+  border: none;
+  background: #5e4a19;
+  box-shadow: none;
+  overflow: hidden;
+  pointer-events: none;
+}
+.tl-audio-subtitle-group.is-fallback {
+  border: 1px dashed rgba(246,211,127,0.22);
+  border-style: dashed;
+  background: rgba(94,74,25,0.76);
+}
+.tl-audio-subtitle-pending-group {
+  top: 2px;
+  bottom: 2px;
+  height: auto;
+  border-radius: 6px 6px 0 0;
+  z-index: 1;
+}
 
 /* Segments */
 .tl-seg { position: absolute; display: flex; align-items: center; justify-content: center; border-radius: 6px; overflow: hidden; cursor: default; transition: opacity 80ms, filter 80ms, box-shadow 80ms, border-color 80ms; }
@@ -1309,7 +1357,6 @@ textarea { resize: vertical; min-height: 36px; }
   padding: 0;
   cursor: grab;
 }
-.tl-seg--clip:active { cursor: grabbing; }
 .tl-clip-preview-body {
   position: relative;
   flex: 1;
@@ -1408,14 +1455,64 @@ textarea { resize: vertical; min-height: 36px; }
   border: none;
 }
 .tl-seg--clip.tl-seg--audio span { color: #8be7a4; }
+.tl-seg--clip.tl-seg--audio.tl-seg--audio-split {
+  top: calc(50% + 1px);
+  height: calc(50% - 1px);
+  border-radius: 0 0 6px 6px;
+  z-index: 2;
+}
+.tl-seg--clip.tl-seg--audio.tl-seg--audio-split .tl-clip-preview-body {
+  padding-top: 2px;
+  padding-bottom: 1px;
+}
+.tl-seg--clip.tl-seg--audio.tl-seg--audio-split .tl-clip-footer {
+  flex-basis: 14px;
+  min-height: 14px;
+}
+.tl-seg--clip.tl-seg--audio.tl-seg--audio-split .tl-clip-label {
+  padding: 2px 6px 1px;
+}
 .tl-seg--subtitle {
   top: 0;
   height: 100%;
   background: #7f6423;
   border: none;
   border-radius: 6px;
+  cursor: grab;
 }
 .tl-seg--subtitle span { color: #f6d37f; }
+.tl-seg--subtitle.tl-seg--subtitle-editing {
+  cursor: text;
+  padding: 0 2px;
+  background: #8b6d24;
+}
+.tl-subtitle-inline-input {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  color: #fff4cd;
+  font-size: 8px;
+  line-height: 1;
+  outline: none;
+}
+.tl-subtitle-inline-input::selection {
+  background: rgba(255, 233, 176, 0.28);
+}
+.tl-audio-subtitle-word {
+  top: 2px;
+  bottom: 2px;
+  height: auto;
+  border-radius: 4px;
+  background: #7f6423;
+  pointer-events: auto;
+  z-index: 2;
+}
+.tl-audio-subtitle-word span {
+  padding: 0 6px;
+}
 .tl-seg--subtitle-pending {
   pointer-events: none;
   justify-content: flex-start;
@@ -1499,7 +1596,8 @@ textarea { resize: vertical; min-height: 36px; }
   pointer-events: none;
   z-index: 3;
 }
-.tl-clip-handle {
+.tl-clip-handle,
+.tl-subtitle-handle {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -1510,7 +1608,12 @@ textarea { resize: vertical; min-height: 36px; }
   --tl-handle-line: rgba(147,200,255,0.92);
   --tl-handle-glow: rgba(147,200,255,0.34);
 }
-.tl-clip-handle::after {
+.tl-subtitle-handle {
+  --tl-handle-line: rgba(246,211,127,0.92);
+  --tl-handle-glow: rgba(246,211,127,0.28);
+}
+.tl-clip-handle::after,
+.tl-subtitle-handle::after {
   content: "";
   position: absolute;
   top: 2px;
@@ -1522,14 +1625,21 @@ textarea { resize: vertical; min-height: 36px; }
 }
 .tl-seg--clip:hover .tl-clip-handle,
 .tl-seg--clip.is-active .tl-clip-handle,
-.tl-clip-handle:hover { opacity: 1; }
-.tl-clip-handle--start { left: 0; cursor: ew-resize; }
-.tl-clip-handle--end { right: 0; cursor: ew-resize; }
-.tl-clip-handle--start::after {
+.tl-clip-handle:hover,
+.tl-seg--subtitle:hover .tl-subtitle-handle,
+.tl-seg--subtitle.is-active .tl-subtitle-handle,
+.tl-subtitle-handle:hover { opacity: 1; }
+.tl-clip-handle--start,
+.tl-subtitle-handle--start { left: 0; cursor: ew-resize; }
+.tl-clip-handle--end,
+.tl-subtitle-handle--end { right: 0; cursor: ew-resize; }
+.tl-clip-handle--start::after,
+.tl-subtitle-handle--start::after {
   left: 2px;
   background: var(--tl-handle-line);
 }
-.tl-clip-handle--end::after {
+.tl-clip-handle--end::after,
+.tl-subtitle-handle--end::after {
   right: 2px;
   background: var(--tl-handle-line);
 }
@@ -1539,12 +1649,17 @@ textarea { resize: vertical; min-height: 36px; }
 }
 .tl-seg--clip:hover .tl-clip-handle::after,
 .tl-seg--clip.is-active .tl-clip-handle::after,
-.tl-clip-handle:hover::after {
+.tl-clip-handle:hover::after,
+.tl-seg--subtitle:hover .tl-subtitle-handle::after,
+.tl-seg--subtitle.is-active .tl-subtitle-handle::after,
+.tl-subtitle-handle:hover::after {
   opacity: 0.92;
   box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 0 8px var(--tl-handle-glow);
 }
 .tl-clip-handle--start:hover::after,
-.tl-clip-handle--end:hover::after {
+.tl-clip-handle--end:hover::after,
+.tl-subtitle-handle--start:hover::after,
+.tl-subtitle-handle--end:hover::after {
   opacity: 1;
 }
 
@@ -1673,6 +1788,14 @@ textarea { resize: vertical; min-height: 36px; }
   gap: 8px;
   font-size: 11px;
   margin-bottom: 6px;
+}
+.inspector-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255,255,255,0.06);
 }
 .inspector-card textarea { min-height: 84px; resize: vertical; }
 
