@@ -9,29 +9,35 @@ Local-first pipeline for AI-assisted social video editing. Takes raw video, runs
 ## Commands
 
 ```bash
+# Fresh clone bootstrap from repo root
+make setup
+
+# Fresh clone bootstrap with full AI stack
+make setup-full
+
 # Install (dev only)
-poetry install --with dev
+cd backend && poetry install --with dev
 
 # Install (full AI stack: faster-whisper, whisperx, torch, transformers)
-poetry install --with dev,asr,llm
+cd backend && poetry install --with dev,asr,llm
 
 # Run tests
-poetry run pytest
+cd backend && poetry run pytest
 
 # Run a single test
-poetry run pytest tests/test_decision_engine.py::test_filler_removal -x
+cd backend && poetry run pytest tests/test_decision_engine.py::test_filler_removal -x
 
 # Lint
-poetry run ruff check .
+cd backend && poetry run ruff check .
 
 # Dev server with hot reload
-poetry run uvicorn fellini.app:create_app --factory --reload
+cd backend && poetry run uvicorn fellini.app:create_app --factory --reload
 
 # Production server
-poetry run fellini serve
+cd backend && poetry run fellini serve
 
 # CLI single run
-poetry run fellini run ./clip.mp4 --title "Test" --profile balanced
+cd backend && poetry run fellini run ./clip.mp4 --title "Test" --profile balanced
 ```
 
 ## Architecture
@@ -58,20 +64,20 @@ Five sequential steps, each producing numbered JSON artifacts in `workspace/jobs
 
 ### Layer responsibilities
 
-- **`domain/models.py`** - All Pydantic models: `JobSnapshot`, `PipelineState`, `JobRequest` with nested configs (`TranscriptionConfig`, `SubtitleConfig`, `RenderConfig`, `DecisionConfig`), transcript/EDL/caption types. `JobRequest.with_profile()` applies preset overrides for fast/balanced/quality profiles.
-- **`adapters/`** - Wrappers around external tools. Each checks dependency availability at runtime via `importlib.util.find_spec`. `FFmpegAdapter` shells out to ffmpeg/ffprobe. `RuleBasedDecisionEngine` is pure Python (no external deps). `LocalLLMRefiner` is a stub/extension point.
-- **`pipeline/`** - `PipelineOrchestrator` runs steps sequentially, `PipelineContext` holds state and adapter instances, `steps/base.py` defines the `PipelineStep` ABC (each step returns a list of relative artifact paths).
-- **`services/`** - `JobStore` handles JSON persistence with a thread lock, `JobWorkspace` manages the per-job directory layout, `JobManager` coordinates creation and execution.
-- **`app.py`** - FastAPI app factory. Multipart form for job creation, JSON body for config updates. Serves the UI from `ui/templates/` and `ui/static/`.
+- **`backend/src/fellini/domain/models.py`** - All Pydantic models: `JobSnapshot`, `PipelineState`, `JobRequest` with nested configs (`TranscriptionConfig`, `SubtitleConfig`, `RenderConfig`, `DecisionConfig`), transcript/EDL/caption types. `JobRequest.with_profile()` applies preset overrides for fast/balanced/quality profiles.
+- **`backend/src/fellini/adapters/`** - Wrappers around external tools. Each checks dependency availability at runtime via `importlib.util.find_spec`. `FFmpegAdapter` shells out to ffmpeg/ffprobe. `RuleBasedDecisionEngine` is pure Python (no external deps). `LocalLLMRefiner` is a stub/extension point.
+- **`backend/src/fellini/pipeline/`** - `PipelineOrchestrator` runs steps sequentially, `PipelineContext` holds state and adapter instances, `steps/base.py` defines the `PipelineStep` ABC (each step returns a list of relative artifact paths).
+- **`backend/src/fellini/services/`** - `JobStore` handles JSON persistence with a thread lock, `JobWorkspace` manages the per-job directory layout, `JobManager` coordinates creation and execution.
+- **`backend/src/fellini/app.py`** - FastAPI app factory. Multipart form for job creation, JSON body for config updates. Serves the bundled frontend from `frontend/dist` when available.
 
 ## Configuration
 
-Runtime config via `fellini.yaml` (optional, see `fellini.example.yaml`). Parsed into `AppSettings` Pydantic model. Python/Poetry config is separate.
+Runtime config via `backend/fellini.yaml` (optional, see `backend/fellini.example.yaml`). Parsed into `AppSettings` Pydantic model. Python/Poetry config is separate.
 
 ## Tech stack
 
 - Python 3.12 (strict, no 3.13+)
-- Poetry with in-project virtualenv (`.venv/`)
+- Poetry with in-project virtualenv (`backend/.venv/`)
 - FastAPI + Uvicorn + Jinja2
 - Pydantic v2 for all models
 - Ruff for linting (line-length 100, rules: E, F, I, B, UP, N, S, RUF)

@@ -27,15 +27,39 @@ La pipeline segue la specifica del file `Agent.md`:
 5. generazione subtitle ASS
 6. render finale clean e captioned
 
+## Struttura repository
+
+- `backend/`: progetto Python gestito con Poetry (`pyproject.toml`, `src/`, `tests/`, `fellini.example.yaml`)
+- `frontend/`: UI Solid/Vite
+- `workspace/`: dati runtime dei job, mantenuti in root repository
+
 ## Setup
 
 1. Installa `Python 3.12.x`
 2. Installa `Poetry`
 3. Entra nella root del progetto
-4. Se il tuo Python di default non e' `3.12`, punta Poetry all'interprete giusto:
+4. Spostati nel backend Python:
+
+```bash
+cd backend
+```
+
+5. Se il tuo Python di default non e' `3.12`, punta Poetry all'interprete giusto:
 
 ```bash
 poetry env use python3.12
+```
+
+Per un clone fresco del repository, il comando consigliato dalla root e':
+
+```bash
+make setup
+```
+
+Se vuoi installare subito anche la stack AI completa:
+
+```bash
+make setup-full
 ```
 
 Installazione base per sviluppo applicativo:
@@ -50,20 +74,20 @@ Installazione completa della stack AI:
 poetry install --with dev,asr,llm
 ```
 
-L'ambiente virtuale viene creato in `.venv/` dentro il repository tramite [poetry.toml](/home/prisco/Documents/fellini/poetry.toml).
+L'ambiente virtuale viene creato in `backend/.venv/` tramite `backend/poetry.toml`.
 
 ## Quickstart
 
 Avvia la UI locale:
 
 ```bash
-poetry run fellini serve
+cd backend && poetry run fellini serve
 ```
 
 Il comando abilita il backend hot reload di default. Se vuoi un processo stabile senza reload:
 
 ```bash
-poetry run fellini serve --no-reload
+cd backend && poetry run fellini serve --no-reload
 ```
 
 Apri `http://127.0.0.1:8123`.
@@ -71,7 +95,7 @@ Apri `http://127.0.0.1:8123`.
 Run singolo da terminale:
 
 ```bash
-poetry run fellini run ./clip.mp4 --title "Test clip" --profile balanced
+cd backend && poetry run fellini run ./clip.mp4 --title "Test clip" --profile balanced
 ```
 
 ## Modalita' custom e debug
@@ -100,17 +124,23 @@ Fellini persiste anche uno snapshot dello stato pipeline in `temp/pipeline_state
 
 ## Makefile
 
-Il `Makefile` resta come wrapper leggero dei comandi Poetry:
+Il `Makefile` in root delega i target Python a `backend/` e lascia invariati i comandi piu' comuni:
 
 ```bash
+make setup
+make setup-full
 make install
 make install-full
 make dev
+make dev-all
 make test
 make lint
 make lock
 make check
 ```
+
+Se preferisci usare Poetry direttamente, esegui i comandi da `backend/`.
+`make setup` installa backend e frontend. `make install` resta backend-only.
 
 ## Modelli e dipendenze AI
 
@@ -153,15 +183,15 @@ Questa cartella e' runtime-only: non viene usata per il packaging Python o per i
 
 ## Configurazione
 
-Copia `fellini.example.yaml` in `fellini.yaml` se vuoi cambiare porta, workspace o directory font.
+Copia `backend/fellini.example.yaml` in `backend/fellini.yaml` se vuoi cambiare porta, workspace o directory font.
 
-La configurazione YAML gestisce il runtime dell'app, non il setup Python o Poetry.
+La configurazione YAML gestisce il runtime dell'app, non il setup Python o Poetry. Di default il backend continua a usare `workspace/` nella root del repository.
 
 ## Verifica
 
 ```bash
-poetry check
-poetry run ruff check .
-poetry run pytest
-poetry run python -c "from fellini.app import create_app; print(create_app().title)"
+cd backend && poetry check
+cd backend && poetry run ruff check .
+cd backend && poetry run pytest
+cd backend && poetry run python -c "from fellini.app import create_app; print(create_app().title)"
 ```

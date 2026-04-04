@@ -1,39 +1,48 @@
-POETRY ?= poetry
+BACKEND_DIR ?= backend
+BUN ?= bun
 
-.PHONY: install install-full dev dev-all test lint lock check fe-install fe-dev fe-build
+.PHONY: setup setup-full install install-full dev dev-all test lint lock check fe-install fe-dev fe-build
+
+setup:
+	$(MAKE) install
+	$(MAKE) fe-install
+
+setup-full:
+	$(MAKE) install-full
+	$(MAKE) fe-install
 
 install:
-	$(POETRY) install --with dev
+	$(MAKE) -C $(BACKEND_DIR) install
 
 install-full:
-	$(POETRY) install --with dev,asr,llm
+	$(MAKE) -C $(BACKEND_DIR) install-full
 
 dev:
-	$(POETRY) run uvicorn fellini.app:create_app --factory --reload
+	$(MAKE) -C $(BACKEND_DIR) dev
 
 dev-all:
 	@trap 'kill 0' EXIT; \
-	$(POETRY) run uvicorn fellini.app:create_app --factory --reload --port 8000 & \
-	cd frontend && bun run dev & \
+	$(MAKE) -C $(BACKEND_DIR) dev PORT=8000 & \
+	cd frontend && $(BUN) run dev & \
 	wait
 
 test:
-	$(POETRY) run pytest
+	$(MAKE) -C $(BACKEND_DIR) test
 
 lint:
-	$(POETRY) run ruff check .
+	$(MAKE) -C $(BACKEND_DIR) lint
 
 lock:
-	$(POETRY) lock
+	$(MAKE) -C $(BACKEND_DIR) lock
 
 check:
-	$(POETRY) check
+	$(MAKE) -C $(BACKEND_DIR) check
 
 fe-install:
-	cd frontend && bun install
+	cd frontend && $(BUN) install
 
 fe-dev:
-	cd frontend && bun run dev
+	cd frontend && $(BUN) run dev
 
 fe-build:
-	cd frontend && bun run build
+	cd frontend && $(BUN) run build

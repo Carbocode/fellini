@@ -27,7 +27,7 @@ from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
-from fellini.settings import AppSettings, load_settings
+from fellini.settings import AppSettings, load_settings, project_root
 
 logger = get_logger(__name__)
 
@@ -99,7 +99,7 @@ def _validate_step_run(snapshot, step_name: StepName) -> None:
 
 
 def _resolve_frontend_dist() -> Path | None:
-    candidate = Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
+    candidate = project_root() / "frontend" / "dist"
     if candidate.is_dir() and (candidate / "index.html").is_file():
         return candidate
     return None
