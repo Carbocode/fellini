@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [project]
 name = "fellini"
 version = "0.1.0"
-description = "Local-first pipeline for AI-assisted social video editing."
+description = "Local-first non-destructive video editor with AI-assisted tools."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = "MIT"

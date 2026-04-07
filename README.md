@@ -1,6 +1,31 @@
 # Fellini
 
-Pipeline locale per ingest, trascrizione, auto-editing e render di video verticali per social.
+Editor video locale, non distruttivo e editor-first, con timeline multitraccia, asset library, subtitle block e tool AI richiamabili dall'interfaccia.
+
+La descrizione canonica del prodotto e' in `Agent.md`. Questo README resta allineato a quella fonte e usa la stessa terminologia: `editor`, `workspace`, `timeline`, `lane`, `clip`, `subtitle block`, `tool`, `export`.
+
+## Cosa e' Fellini oggi
+
+Fellini non e' piu' da raccontare come una pipeline automatica end-to-end. Il prodotto attuale e':
+
+- un editor locale con progetto persistito
+- una timeline non distruttiva con lane video e audio
+- una library di asset con preview audio/video
+- un inspector per contesto e modifica della selezione
+- una serie di tool richiamabili quando servono, come trascrizione lane, editorial assistito e render
+
+Il modello applicativo principale e' `EditorialProject`, che contiene:
+
+- `sequence`
+- `assets`
+- `tracks`
+- `clips`
+- `captions`
+- `asset_transcriptions`
+- `lane_transcriptions`
+- `selection`
+
+`JobSnapshot`, `StepName` e l'orchestrazione a step restano dettagli interni per esecuzioni asincrone e caching di tool pesanti.
 
 ## Baseline ambiente
 
@@ -8,30 +33,31 @@ Fellini usa `Poetry` come package manager standard e supporta ufficialmente solo
 
 La ragione pratica e' `whisperx`: le release recenti non supportano `Python 3.14`, quindi l'installazione della stack ASR completa fallisce se usi il Python di sistema piu' nuovo.
 
-## Perche' questa architettura
+## Architettura reale
 
-Il progetto e' diviso in layer chiari:
+Il repository e' organizzato in layer chiari, ma il centro del prodotto e' l'editor:
 
-- `domain`: modelli tipizzati per job, transcript, spans, EDL e render plan
+- `domain`: modelli tipizzati del progetto editoriale, dei job e degli artefatti
 - `adapters`: integrazione con `ffmpeg`, `ffprobe`, ASR, alignment e ASS
-- `pipeline`: runner step-by-step con artefatti intermedi persistiti su disco
-- `services`: job store, workspace per-job e orchestrazione di esecuzione
-- `ui`: interfaccia web locale servita direttamente dal backend
+- `services`: project store, asset previews, workspace per-job e coordinamento esecuzioni
+- `pipeline`: meccanismo interno legacy per orchestrare tool pesanti in background
+- `frontend`: interfaccia `Solid/Vite` con workspace unica, timeline, preview e inspector
 
-La pipeline segue la specifica del file `Agent.md`:
+Da un punto di vista prodotto, Fellini va letto cosi':
 
-1. ingest e normalizzazione
-2. trascrizione VAD-aware
-3. alignment parola-per-parola
-4. labeling editoriale ed EDL
-5. generazione subtitle ASS
-6. render finale clean e captioned
+1. crei un progetto e scegli il canvas
+2. carichi asset nella library
+3. apri preview e trascini clip in timeline
+4. selezioni una `story lane` audio quando vuoi lavorare sul parlato
+5. trascrivi una lane o aggiorni i subtitle block
+6. usi i tool `Editorial` e `Render`
+7. esporti il progetto finale
 
 ## Struttura repository
 
 - `backend/`: progetto Python gestito con Poetry (`pyproject.toml`, `src/`, `tests/`, `fellini.example.yaml`)
-- `frontend/`: UI Solid/Vite
-- `workspace/`: dati runtime dei job, mantenuti in root repository
+- `frontend/`: UI `Solid/Vite`
+- `workspace/`: dati runtime dei job/progetti, mantenuti in root repository
 
 ## Setup
 
@@ -78,49 +104,110 @@ L'ambiente virtuale viene creato in `backend/.venv/` tramite `backend/poetry.tom
 
 ## Quickstart
 
-Avvia la UI locale:
+Avvia l'app locale:
 
 ```bash
 cd backend && poetry run fellini serve
 ```
 
-Il comando abilita il backend hot reload di default. Se vuoi un processo stabile senza reload:
-
-```bash
-cd backend && poetry run fellini serve --no-reload
-```
-
 Apri `http://127.0.0.1:8123`.
 
-Run singolo da terminale:
+Workflow consigliato:
+
+1. crea un nuovo progetto
+2. imposta il canvas
+3. carica il primo asset sorgente
+4. aggiungi asset secondari alla library
+5. trascina clip nelle lane della timeline
+6. marca una audio lane come `story`
+7. usa la trascrizione lane quando serve
+8. modifica clip e subtitle block nell'editor
+9. lancia `Editorial` e `Render` dai tool dell'interfaccia
+
+Per sviluppo separato backend + frontend:
 
 ```bash
-cd backend && poetry run fellini run ./clip.mp4 --title "Test clip" --profile balanced
+make dev-all
 ```
 
-## Modalita' custom e debug
+## Operazioni disponibili nell'editor
 
-La UI supporta due modalita' di esecuzione:
+Oggi la UI e il backend supportano gia' queste superfici principali:
 
-- `automatic`: crea il job e lancia tutta la pipeline
-- `step_by_step`: crea il job, ma ti lascia eseguire o ripetere ogni step manualmente
+- creazione progetto con preset canvas o dimensioni custom
+- library di asset audio/video
+- preview media, filmstrip e waveform
+- timeline multitraccia con lane video e audio
+- clip linked A/V, trim non distruttivo, transform, crop, gain e fade
+- scelta della `story lane`
+- trascrizione di audio lane
+- generazione e sincronizzazione di subtitle block
+- tool editoriale e tool di render
+- export finale del progetto
 
-Se scegli il profilo `custom`, la form espone il fine tuning di:
+## Tool asincroni e dettagli interni
 
-- trascrizione
-- decisione editoriale
-- sottotitoli
-- render
+Alcune operazioni usano ancora internamente `job`, `step`, `PipelineOrchestrator` e artefatti intermedi. Questo e' un dettaglio di implementazione, non il framing del prodotto.
 
-Per fare debug su un job esistente:
+In pratica:
 
-1. selezionalo nella control room
-2. usa `Carica job nel form`
-3. modifica la config
-4. usa `Salva tuning sul job`
-5. lancia `Esegui prossimo step` o `Ripeti step`
+- l'editor rimane la UX principale
+- i task pesanti vengono eseguiti in background
+- backend e UI mostrano stato, progresso, log e output
+- il primo asset puo' attivare un ingest interno per creare il mezzanine sorgente del progetto
+- endpoint e nomi legacy come `/steps/...` o `PipelineBar` non cambiano il modello mentale pubblico
 
-Fellini persiste anche uno snapshot dello stato pipeline in `temp/pipeline_state.json`, cosi' i rerun di uno step possono ripartire dagli artefatti gia' prodotti.
+## Modelli e dipendenze AI
+
+Se installi i gruppi `asr` e `llm`, i componenti principali vengono scaricati al primo uso.
+
+- `faster-whisper` gestisce la trascrizione
+- `WhisperX` gestisce alignment e timing piu' accurati
+- la parte LLM locale resta un extension point per tool editoriali assistiti
+
+Se le dipendenze AI non sono installate, Fellini continua a funzionare in modalita' degradata:
+
+- l'editor resta utilizzabile
+- il render del progetto continua a funzionare
+- le feature transcript-derived diventano piu' limitate o indisponibili
+
+Sul lato video, se la build locale di `ffmpeg` non include `libx264`, Fellini prova in automatico `libopenh264` e poi `mpeg4`.
+
+## Workspace su disco
+
+Ogni progetto/job viene salvato in `workspace/jobs/<job_id>/`:
+
+- `uploads/`: file originali caricati nel progetto
+- `project/editorial_project.json`: stato persistito dell'editor
+- `project/asset_previews.json`: stato preview per asset
+- `artifacts/`: artefatti intermedi e preview generate
+- `artifacts/previews/`: filmstrip e waveform
+- `output/`: export del progetto
+- `temp/`: file di lavoro e stato runtime
+- `job.json`: stato del wrapper backend per esecuzioni asincrone
+
+Questa cartella e' runtime-only: non viene usata per il packaging Python o per il lock delle dipendenze.
+
+## API locali
+
+Endpoint principali:
+
+- `GET /` UI
+- `GET /api/jobs` lista progetti/job recenti
+- `POST /api/jobs` creazione progetto
+- `GET /api/jobs/{job_id}` dettaglio stato job
+- `DELETE /api/jobs/{job_id}` eliminazione progetto
+- `PUT /api/jobs/{job_id}/request` aggiornamento impostazioni progetto
+- `GET /api/jobs/{job_id}/editorial-project` caricamento progetto editoriale
+- `PUT /api/jobs/{job_id}/editorial-project` salvataggio progetto editoriale
+- `POST /api/jobs/{job_id}/assets` upload asset nella library
+- `POST /api/jobs/{job_id}/asset-previews` richiesta preview media
+- `POST /api/jobs/{job_id}/audio-lanes/{lane_id}/transcribe` trascrizione di una audio lane
+- `PUT /api/jobs/{job_id}/transcript` modifica transcript persistiti
+- `POST /api/jobs/{job_id}/steps/{step_name}/run` trigger di tool interni pesanti
+- `GET /jobs/{job_id}/files/{relative_path}` download di artefatti e output
+
+Gli endpoint `/steps/...` sono interni alla gestione asincrona dei tool e non vanno trattati come interfaccia prodotto primaria.
 
 ## Makefile
 
@@ -141,45 +228,6 @@ make check
 
 Se preferisci usare Poetry direttamente, esegui i comandi da `backend/`.
 `make setup` installa backend e frontend. `make install` resta backend-only.
-
-## Modelli e dipendenze AI
-
-Se installi i gruppi `asr` e `llm`, i modelli principali vengono scaricati automaticamente al primo run.
-
-- `faster-whisper` scarica il modello `large-v3`
-- `WhisperX` scarica i componenti di alignment necessari
-- il refinement LLM locale e' ancora predisposto come extension point
-
-Se le dipendenze AI non sono installate, Fellini continua in modalita' degradata:
-
-- mantiene il workflow step-by-step
-- produce comunque il render verticale
-- salta transcript-derived edits e subtitles avanzati
-
-Sul lato video, se la build locale di `ffmpeg` non include `libx264`, Fellini prova in automatico
-`libopenh264` e poi `mpeg4`, invece di fallire all'ingest.
-
-## Workspace
-
-Ogni job viene salvato in `workspace/jobs/<job_id>/`:
-
-- `uploads/`: file sorgente
-- `artifacts/`: JSON intermedi e `08_subtitles.ass`
-- `output/`: `edited_master`, export clean e export captioned
-- `temp/`: file di lavoro
-- `job.json`: stato del job per UI e API
-
-Questa cartella e' runtime-only: non viene usata per il packaging Python o per il lock delle dipendenze.
-
-## API locali
-
-- `GET /` UI
-- `GET /api/jobs` lista job recenti
-- `GET /api/jobs/{job_id}` dettaglio job
-- `POST /api/jobs` creazione job via form multipart
-- `PUT /api/jobs/{job_id}/request` aggiornamento tuning di un job esistente
-- `POST /api/jobs/{job_id}/steps/{step_name}/run` esecuzione o rerun di un singolo step
-- `GET /jobs/{job_id}/files/{relative_path}` download di artefatti e output
 
 ## Configurazione
 
