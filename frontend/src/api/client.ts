@@ -96,6 +96,31 @@ export async function uploadEditorialAsset(
   );
 }
 
+export async function startAssetBackgroundRemoval(
+  jobId: string,
+  assetId: string,
+): Promise<EditorialProject> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/assets/${assetId}/background-removal`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function setAssetBackgroundRemovalVariant(
+  jobId: string,
+  assetId: string,
+  activeVariant: "original" | "cutout",
+): Promise<EditorialProject> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/assets/${assetId}/background-removal`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active_variant: activeVariant }),
+    }),
+  );
+}
+
 export async function transcribeAudioLane(
   jobId: string,
   laneId: string,

@@ -1,7 +1,8 @@
 BACKEND_DIR ?= backend
 BUN ?= bun
+ARGS ?=
 
-.PHONY: setup setup-full install install-full dev dev-all test lint lock check fe-install fe-dev fe-build
+.PHONY: setup setup-full install install-full dev dev-all test lint lock check mps-test matanyone-benchmark matanyone-run fe-install fe-dev fe-build
 
 setup:
 	$(MAKE) install
@@ -37,6 +38,15 @@ lock:
 
 check:
 	$(MAKE) -C $(BACKEND_DIR) check
+
+mps-test:
+	$(MAKE) -C $(BACKEND_DIR) mps-test
+
+matanyone-benchmark:
+	$(MAKE) -C $(BACKEND_DIR) matanyone-benchmark ARGS='$(ARGS)'
+
+matanyone-run:
+	$(MAKE) -C $(BACKEND_DIR) matanyone-run ARGS='$(ARGS)'
 
 fe-install:
 	cd frontend && $(BUN) install

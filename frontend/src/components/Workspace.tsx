@@ -42,6 +42,7 @@ import {
   updateTabLabel,
 } from "../store";
 import type {
+  AssetPreviewBundle,
   AssetPreviewEntry,
   EditorialProject,
   JobSnapshot,
@@ -60,6 +61,7 @@ import {
   generatedSubtitleGroupsForLane,
   laneContentRange,
   linkedClips,
+  mediaPathForClip,
   normalizeEditorialProject,
   patchSubtitle,
   projectDuration,
@@ -93,16 +95,17 @@ const MIN_TIMELINE_HEIGHT = 180;
 const MIN_TOP_WORKSPACE_HEIGHT = 220;
 const MIN_BROWSER_WIDTH = 220;
 const MAX_BROWSER_WIDTH = 440;
-const MIN_PX_PER_SEC = 60;
-const ZOOM_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 12, 16];
+const BASE_PX_PER_SEC = 30;
+const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32];
+const DEFAULT_ZOOM_INDEX = 3;
 const ZOOM_WHEEL_THRESHOLD = 18;
 const TIMELINE_TAIL_RATIO = 0.5;
 const TIMELINE_TAIL_MIN_SECONDS = 60;
 const TIMELINE_TAIL_MAX_SECONDS = 600;
-const RULER_MINOR_STEPS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
-const RULER_MINOR_TARGET_PX = 18;
-const RULER_LABEL_EVERY_N_TICKS = 4;
-const TIMELINE_RULER_HEIGHT = 20;
+const RULER_MINOR_STEPS = [0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+const RULER_MINOR_TARGET_PX = 10;
+const RULER_LABEL_EVERY_N_TICKS = 10;
+const TIMELINE_RULER_HEIGHT = 28;
 const AUDIO_PREWARM_LEAD_SECONDS = 0.8;
 const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
@@ -121,24 +124,37 @@ type WaveformData = {
 
 const waveformDataCache = new Map<string, Promise<WaveformData> | WaveformData>();
 
+function previewBundleForClip(
+  asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
+  trackKind: "video" | "audio",
+): AssetPreviewBundle | null {
+  if (!asset?.preview) return null;
+  const variant = trackKind === "video" ? clip.asset_variant ?? "original" : "original";
+  return variant === "cutout" ? asset.preview.cutout ?? null : asset.preview.original ?? null;
+}
+
 function clipPreviewEntry(
   asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
   trackKind: "video" | "audio",
 ): AssetPreviewEntry | null {
   if (!asset) return null;
+  const bundle = previewBundleForClip(asset, clip, trackKind);
   if (trackKind === "video") {
     if (asset.kind !== "video") return null;
-    return asset.preview?.filmstrip ?? null;
+    return bundle?.filmstrip ?? null;
   }
   if (asset.kind !== "audio" && !asset.has_audio) return null;
-  return asset.preview?.waveform ?? null;
+  return bundle?.waveform ?? null;
 }
 
 function clipPreviewStatus(
   asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
   trackKind: "video" | "audio",
 ): "missing" | "generating" | "ready" | "failed" {
-  return clipPreviewEntry(asset, trackKind)?.status ?? "missing";
+  return clipPreviewEntry(asset, clip, trackKind)?.status ?? "missing";
 }
 
 function assetSupportsClipPreview(
@@ -152,21 +168,78 @@ function assetSupportsClipPreview(
 
 function shouldRequestClipPreview(
   asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
   trackKind: "video" | "audio",
 ): boolean {
-  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, trackKind) === "missing";
+  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, clip, trackKind) === "missing";
 }
 
 function hasGeneratingClipPreview(
   asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
   trackKind: "video" | "audio",
 ): boolean {
-  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, trackKind) === "generating";
+  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, clip, trackKind) === "generating";
 }
 
 function shouldRequestAnyAssetPreview(asset: ProjectAsset | null | undefined): boolean {
   if (!asset) return false;
-  return shouldRequestClipPreview(asset, "video") || shouldRequestClipPreview(asset, "audio");
+  const needsVideoOriginal = asset.kind === "video"
+    && ((asset.preview?.original?.filmstrip?.status ?? "missing") === "missing");
+  const needsVideoCutout = asset.kind === "video"
+    && !!asset.background_removal?.cutout_path
+    && ((asset.preview?.cutout?.filmstrip?.status ?? "missing") === "missing");
+  const needsAudioOriginal = (asset.kind === "audio" || asset.has_audio)
+    && ((asset.preview?.original?.waveform?.status ?? "missing") === "missing");
+  const needsAudioCutout = asset.kind === "video"
+    && !!asset.background_removal?.cutout_path
+    && asset.has_audio
+    && ((asset.preview?.cutout?.waveform?.status ?? "missing") === "missing");
+  return needsVideoOriginal || needsVideoCutout || needsAudioOriginal || needsAudioCutout;
+}
+
+function projectShapeFingerprint(project: EditorialProject): string {
+  return JSON.stringify({
+    assetIds: project.assets.map((asset) => asset.id),
+    trackIds: project.tracks.map((track) => track.id),
+    clipRefs: project.clips.map((clip) => ({
+      id: clip.id,
+      asset_id: clip.asset_id,
+      track_id: clip.track_id,
+      linked_group_id: clip.linked_group_id,
+    })),
+    captionIds: project.captions.map((caption) => caption.id),
+    assetTranscriptionIds: project.asset_transcriptions.map((item) => item.asset_id),
+    laneTranscriptionIds: project.lane_transcriptions.map((item) => item.lane_id),
+  });
+}
+
+function mergeRuntimeAssetState(
+  current: EditorialProject,
+  incoming: EditorialProject,
+): EditorialProject {
+  const incomingById = new Map(incoming.assets.map((asset) => [asset.id, asset]));
+  return normalizeEditorialProject({
+    ...current,
+    revision: incoming.revision,
+    updated_at: incoming.updated_at,
+    assets: current.assets.map((asset) => {
+      const nextAsset = incomingById.get(asset.id);
+      if (!nextAsset) return asset;
+      return {
+        ...asset,
+        path: nextAsset.path,
+        duration: nextAsset.duration,
+        width: nextAsset.width,
+        height: nextAsset.height,
+        fps: nextAsset.fps,
+        sample_rate: nextAsset.sample_rate,
+        has_audio: nextAsset.has_audio,
+        preview: nextAsset.preview,
+        background_removal: nextAsset.background_removal,
+      };
+    }),
+  });
 }
 
 function readPersistedSidebarCollapsed(): boolean {
@@ -309,6 +382,13 @@ const WaveformClipPreview: Component<{
       const barHeight = Math.max(1, amplitude * (height * 0.5));
       context.fillRect(x, midY - barHeight, 1, barHeight * 2);
     }
+    context.beginPath();
+    context.strokeStyle = "rgba(203, 255, 214, 0.42)";
+    context.lineWidth = 1;
+    const lineY = Math.floor(midY) + 0.5;
+    context.moveTo(0, lineY);
+    context.lineTo(width, lineY);
+    context.stroke();
   });
 
   return <canvas ref={canvasRef} class="tl-waveform-canvas" aria-hidden="true" />;
@@ -397,11 +477,12 @@ const TimelineClipPreview: Component<{
   asset: ProjectAsset;
   trackKind: "video" | "audio";
 }> = (props) => {
-  const entry = () => clipPreviewEntry(props.asset, props.trackKind);
+  const entry = () => clipPreviewEntry(props.asset, props.clip, props.trackKind);
   const status = () => entry()?.status ?? "missing";
   const src = () => {
-    const path = entry()?.status === "ready" ? entry()?.resource_path : null;
-    return path ? fileUrl(props.jobId, path) : null;
+    const preview = entry();
+    const path = preview?.status === "ready" ? preview.resource_path : null;
+    return path && preview ? `${fileUrl(props.jobId, path)}?v=${preview.version}` : null;
   };
   const clipDuration = () => Math.max(0.001, props.clip.source_out - props.clip.source_in);
   const assetDuration = () => Math.max(props.asset.duration, props.clip.source_out, clipDuration());
@@ -592,8 +673,20 @@ const AudioSubtitleVisualGroup: Component<{
 );
 
 function formatRulerLabel(seconds: number, labelStep: number): string {
-  if (labelStep < 1) return fmtTimePrecise(seconds);
-  return fmtTime(seconds);
+  if (labelStep < 1) {
+    // Sub-second: show seconds with decimals
+    const s = Math.abs(seconds);
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    if (m > 0) return `${m}:${sec.toFixed(2).padStart(5, "0")}`;
+    return `${sec.toFixed(2)}s`;
+  }
+  const totalSec = Math.round(seconds);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const sec = totalSec % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 const Workspace: Component = () => {
@@ -641,19 +734,37 @@ const Workspace: Component = () => {
           JSON.parse(JSON.stringify(incoming)) as EditorialProject,
         );
         setDraftProject((current) => {
-          if (!current || current.revision !== normalized.revision) return normalized;
+          if (!current) return normalized;
+          if (
+            current.revision !== normalized.revision
+            && projectShapeFingerprint(current) === projectShapeFingerprint(normalized)
+          ) {
+            return mergeRuntimeAssetState(current, normalized);
+          }
+          if (current.revision !== normalized.revision) return normalized;
           const previewByAssetId = new Map(
             normalized.assets.map((asset) => [asset.id, asset.preview ?? null]),
+          );
+          const backgroundRemovalByAssetId = new Map(
+            normalized.assets.map((asset) => [asset.id, asset.background_removal ?? null]),
           );
           let changed = false;
           const mergedAssets = current.assets.map((asset) => {
             if (!previewByAssetId.has(asset.id)) return asset;
             const nextPreview = previewByAssetId.get(asset.id) ?? null;
-            if (JSON.stringify(asset.preview ?? null) === JSON.stringify(nextPreview)) {
+            const nextBackgroundRemoval = backgroundRemovalByAssetId.get(asset.id) ?? null;
+            if (
+              JSON.stringify(asset.preview ?? null) === JSON.stringify(nextPreview)
+              && JSON.stringify(asset.background_removal ?? null) === JSON.stringify(nextBackgroundRemoval)
+            ) {
               return asset;
             }
             changed = true;
-            return { ...asset, preview: nextPreview };
+            return {
+              ...asset,
+              preview: nextPreview,
+              background_removal: nextBackgroundRemoval,
+            };
           });
           return changed ? normalizeEditorialProject({ ...current, assets: mergedAssets }) : current;
         });
@@ -1164,8 +1275,8 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     const current = project();
     const jobId = selectedJobId();
     if (!current || !jobId || !clip) return null;
-    const asset = assetById(current, clip.asset_id);
-    return asset ? fileUrl(jobId, asset.path) : null;
+    const path = mediaPathForClip(current, clip);
+    return path ? fileUrl(jobId, path) : null;
   };
   const mediaSourceForClip = (clip: TimelineClip) => mediaSource(clip);
   const normalizeMediaSource = (src: string) => {
@@ -1669,7 +1780,6 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
           />
           <video
             ref={playbackVideoRef}
-            controls
             preload="auto"
             muted
             playsinline
@@ -1880,9 +1990,9 @@ const TimelinePanel: Component<{
   const [editingSubtitleId, setEditingSubtitleId] = createSignal<string | null>(null);
   const [editingSubtitleText, setEditingSubtitleText] = createSignal("");
   const project = () => props.project();
-  const [zoomIdx, setZoomIdx] = createSignal(1);
+  const [zoomIdx, setZoomIdx] = createSignal(DEFAULT_ZOOM_INDEX);
   const zoom = () => ZOOM_STEPS[zoomIdx()];
-  const pxPerSecond = () => MIN_PX_PER_SEC * zoom();
+  const pxPerSecond = () => BASE_PX_PER_SEC * zoom();
   const [viewportLeft, setViewportLeft] = createSignal(0);
   const [viewportWidth, setViewportWidth] = createSignal(1);
   let zoomWheelAccumulator = 0;
@@ -2038,16 +2148,18 @@ const TimelinePanel: Component<{
     };
   });
   const rulerTicks = createMemo(() => {
-    const ticks: Array<{ time: number; labeled: boolean; label: string | null }> = [];
+    const ticks: Array<{ time: number; kind: "major" | "medium" | "minor"; label: string | null }> = [];
     const { minorStep, labelStep } = rulerScale();
     const count = Math.ceil(duration() / minorStep);
     for (let index = 0; index <= count; index += 1) {
       const time = Number((index * minorStep).toFixed(4));
-      const labeled = index % RULER_LABEL_EVERY_N_TICKS === 0;
+      const isLabel = index % RULER_LABEL_EVERY_N_TICKS === 0;
+      const isMedium = !isLabel && index % (RULER_LABEL_EVERY_N_TICKS / 2) === 0;
+      const kind: "major" | "medium" | "minor" = isLabel ? "major" : isMedium ? "medium" : "minor";
       ticks.push({
         time,
-        labeled,
-        label: labeled ? formatRulerLabel(time, labelStep) : null,
+        kind,
+        label: isLabel ? formatRulerLabel(time, labelStep) : null,
       });
     }
     return ticks;
@@ -2140,8 +2252,8 @@ const TimelinePanel: Component<{
         if (clipRight < visibleStart || clipLeft > visibleEnd) continue;
         const asset = assetById(current, clip.asset_id);
         if (!asset) continue;
-        if (shouldRequestClipPreview(asset, previewKind)) nextIds.add(asset.id);
-        if (hasGeneratingClipPreview(asset, previewKind)) hasGenerating = true;
+        if (shouldRequestClipPreview(asset, clip, previewKind)) nextIds.add(asset.id);
+        if (hasGeneratingClipPreview(asset, clip, previewKind)) hasGenerating = true;
       }
     }
 
@@ -2294,7 +2406,7 @@ const TimelinePanel: Component<{
     const clamped = Math.max(0, Math.min(ZOOM_STEPS.length - 1, nextIdx));
     if (clamped === zoomIdx()) return;
     const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
-    const nextPxPerSecond = MIN_PX_PER_SEC * ZOOM_STEPS[clamped];
+    const nextPxPerSecond = BASE_PX_PER_SEC * ZOOM_STEPS[clamped];
     const anchorOffset = viewport && anchorClientX !== undefined
       ? anchorClientX - viewport.getBoundingClientRect().left
       : null;
@@ -2974,6 +3086,19 @@ const TimelinePanel: Component<{
     }, 1500);
     onCleanup(() => window.clearInterval(handle));
   });
+  createEffect(() => {
+    const jobId = selectedJobId();
+    const current = project();
+    if (!jobId || !current) return;
+    const hasRunningBackgroundRemoval = current.assets.some(
+      (asset) => asset.background_removal?.status === "running",
+    );
+    if (!hasRunningBackgroundRemoval) return;
+    const handle = window.setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ["editorial-project", jobId] });
+    }, 1200);
+    onCleanup(() => window.clearInterval(handle));
+  });
   onCleanup(() => {
     clearTimeout(zoomWheelResetHandle);
     if (horizontalSyncHandle) cancelAnimationFrame(horizontalSyncHandle);
@@ -3026,8 +3151,8 @@ const TimelinePanel: Component<{
                   <For each={rulerTicks()}>
                     {(tick) => (
                       <>
-                        <div class={`tl-ruler-tick${tick.labeled ? " major" : ""}`} style={{ left: `${toPx(tick.time)}px` }} />
-                        <Show when={tick.labeled}>
+                        <div class={`tl-ruler-tick ${tick.kind}`} style={{ left: `${toPx(tick.time)}px` }} />
+                        <Show when={tick.label}>
                           <span class="tl-ruler-label" style={{ left: `${toPx(tick.time)}px` }}>{tick.label}</span>
                         </Show>
                       </>

@@ -50,6 +50,7 @@ class EditorialProjectStore:
 
     def load(self, workspace: JobWorkspace) -> EditorialProject:
         payload = json.loads(workspace.editorial_project_path.read_text(encoding="utf-8"))
+        payload = self._migrate_legacy_clip_asset_variants(payload)
         return EditorialProject.model_validate(payload)
 
     def normalize_project(self, project: EditorialProject) -> EditorialProject:
@@ -92,6 +93,51 @@ class EditorialProjectStore:
         for asset in stripped.assets:
             asset.preview = None
         return stripped
+
+    def _migrate_legacy_clip_asset_variants(self, payload: dict) -> dict:
+        assets = payload.get("assets")
+        clips = payload.get("clips")
+        tracks = payload.get("tracks")
+        if not isinstance(assets, list) or not isinstance(clips, list):
+            return payload
+
+        tracks_by_id = {
+            track.get("id"): track
+            for track in tracks or []
+            if isinstance(track, dict) and isinstance(track.get("id"), str)
+        }
+        assets_by_id = {
+            asset.get("id"): asset
+            for asset in assets
+            if isinstance(asset, dict) and isinstance(asset.get("id"), str)
+        }
+
+        for asset in assets_by_id.values():
+            background = asset.get("background_removal")
+            if not isinstance(background, dict):
+                continue
+            original_path = background.get("original_path")
+            if isinstance(original_path, str) and original_path:
+                asset["path"] = original_path
+
+        for clip in clips:
+            if not isinstance(clip, dict) or "asset_variant" in clip:
+                continue
+            track = tracks_by_id.get(clip.get("track_id"))
+            if not isinstance(track, dict) or track.get("kind") != "video":
+                clip["asset_variant"] = "original"
+                continue
+            asset = assets_by_id.get(clip.get("asset_id"))
+            background = asset.get("background_removal") if isinstance(asset, dict) else None
+            if (
+                isinstance(background, dict)
+                and background.get("cutout_path")
+                and background.get("active_variant") == "cutout"
+            ):
+                clip["asset_variant"] = "cutout"
+            else:
+                clip["asset_variant"] = "original"
+        return payload
 
     def save_with_revision_check(
         self, workspace: JobWorkspace, project: EditorialProject

@@ -71,6 +71,18 @@ class AssetPreviewStatus(StrEnum):
     failed = "failed"
 
 
+class AssetVariantKind(StrEnum):
+    original = "original"
+    cutout = "cutout"
+
+
+class AssetProcessingStatus(StrEnum):
+    idle = "idle"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
 class TimelineTrackKind(StrEnum):
     video = "video"
     audio = "audio"
@@ -130,7 +142,8 @@ class ProjectAsset(BaseModel):
     sample_rate: int | None = None
     has_audio: bool = False
     transcript_ref: str | None = None
-    preview: AssetPreviewBundle | None = None
+    preview: AssetPreviewVariants | None = None
+    background_removal: AssetBackgroundRemoval | None = None
 
 
 class AssetPreviewEntry(BaseModel):
@@ -144,6 +157,27 @@ class AssetPreviewEntry(BaseModel):
 class AssetPreviewBundle(BaseModel):
     filmstrip: AssetPreviewEntry | None = None
     waveform: AssetPreviewEntry | None = None
+
+
+class AssetPreviewVariants(BaseModel):
+    original: AssetPreviewBundle | None = None
+    cutout: AssetPreviewBundle | None = None
+
+
+class AssetBackgroundRemoval(BaseModel):
+    status: AssetProcessingStatus = AssetProcessingStatus.idle
+    active_variant: AssetVariantKind = AssetVariantKind.original
+    phase: str | None = None
+    progress: float = 0.0
+    message: str = ""
+    error: str | None = None
+    original_path: str | None = None
+    cutout_path: str | None = None
+    alpha_path: str | None = None
+    compare_path: str | None = None
+    benchmark_path: str | None = None
+    progress_path: str | None = None
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class TimelineTrack(BaseModel):
@@ -177,6 +211,7 @@ class TimelineClip(BaseModel):
     z_index: int = 0
     enabled: bool = True
     origin: ClipOrigin = ClipOrigin.manual
+    asset_variant: AssetVariantKind = AssetVariantKind.original
     transform: ClipTransform = Field(default_factory=ClipTransform)
     audio: ClipAudio = Field(default_factory=ClipAudio)
     captions_enabled: bool = True

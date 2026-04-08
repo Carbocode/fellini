@@ -1,11 +1,14 @@
 import json
 
 from fellini.domain.models import (
+    AssetBackgroundRemoval,
     AssetTranscription,
     AssetTranscriptionWord,
     AssetPreviewBundle,
     AssetPreviewEntry,
     AssetPreviewStatus,
+    AssetPreviewVariants,
+    AssetVariantKind,
     AudioTrackRole,
     ClipOrigin,
     EditorialProject,
@@ -42,10 +45,12 @@ def test_save_strips_runtime_asset_preview_fields(tmp_path):
                 label="clip.mp4",
                 path="uploads/clip.mp4",
                 duration=5.0,
-                preview=AssetPreviewBundle(
-                    filmstrip=AssetPreviewEntry(
-                        status=AssetPreviewStatus.ready,
-                        resource_path="artifacts/previews/asset_source.filmstrip.png",
+                preview=AssetPreviewVariants(
+                    original=AssetPreviewBundle(
+                        filmstrip=AssetPreviewEntry(
+                            status=AssetPreviewStatus.ready,
+                            resource_path="artifacts/previews/asset_source.original.filmstrip.png",
+                        )
                     )
                 ),
             )
@@ -56,6 +61,69 @@ def test_save_strips_runtime_asset_preview_fields(tmp_path):
 
     payload = json.loads(workspace.editorial_project_path.read_text(encoding="utf-8"))
     assert payload["assets"][0]["preview"] is None
+
+
+def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    store = EditorialProjectStore(settings)
+    workspace = JobWorkspace(settings.jobs_root, "job_variant_migration")
+    workspace.bootstrap()
+    workspace.editorial_project_path.write_text(
+        json.dumps(
+            {
+                "sequence": ProjectSequence().model_dump(mode="json"),
+                "revision": 1,
+                "updated_at": "2026-04-08T12:00:00Z",
+                "tracks": [
+                    TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1").model_dump(mode="json"),
+                    TimelineTrack(id="track_audio_1", kind=TimelineTrackKind.audio, name="Audio 1").model_dump(mode="json"),
+                ],
+                "assets": [
+                    ProjectAsset(
+                        id="asset_source",
+                        kind=ProjectAssetKind.video,
+                        label="clip.mp4",
+                        path="artifacts/background-removal/asset_source/cutout.mp4",
+                        duration=5.0,
+                        background_removal=AssetBackgroundRemoval(
+                            active_variant=AssetVariantKind.cutout,
+                            original_path="uploads/clip.mp4",
+                            cutout_path="artifacts/background-removal/asset_source/cutout.mp4",
+                        ),
+                    ).model_dump(mode="json"),
+                ],
+                "clips": [
+                    TimelineClip(
+                        id="clip_video",
+                        asset_id="asset_source",
+                        track_id="track_video_1",
+                        start=0.0,
+                        source_in=0.0,
+                        source_out=5.0,
+                    ).model_dump(mode="json", exclude={"asset_variant"}),
+                    TimelineClip(
+                        id="clip_audio",
+                        asset_id="asset_source",
+                        track_id="track_audio_1",
+                        start=0.0,
+                        source_in=0.0,
+                        source_out=5.0,
+                    ).model_dump(mode="json", exclude={"asset_variant"}),
+                ],
+                "captions": [],
+                "asset_transcriptions": [],
+                "lane_transcriptions": [],
+                "selection": ProjectSelection().model_dump(mode="json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    project = store.load(workspace)
+
+    assert project.assets[0].path == "uploads/clip.mp4"
+    assert project.clips[0].asset_variant == AssetVariantKind.cutout
+    assert project.clips[1].asset_variant == AssetVariantKind.original
 
 
 def test_normalize_linked_clip_groups_pairs_matching_video_and_audio(tmp_path):

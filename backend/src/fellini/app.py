@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from fellini.domain.models import (
+    AssetVariantKind,
     EditorialProject,
     InputAsset,
     JobRequest,
@@ -23,6 +24,7 @@ from fellini.domain.models import (
 from fellini.log import configure_logging, get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.services.asset_previews import AssetPreviewService
+from fellini.services.background_removal import BackgroundRemovalError, BackgroundRemovalService
 from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
@@ -112,6 +114,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     manager = JobManager(app_settings, store=store)
     editorial_projects = EditorialProjectStore(app_settings)
     asset_previews = AssetPreviewService(app_settings)
+    background_removal = BackgroundRemovalService(
+        app_settings,
+        store=store,
+        editorial_projects=editorial_projects,
+        asset_previews=asset_previews,
+    )
     logger.info(
         "app.create settings workspace_root=%s jobs_root=%s host=%s port=%s log_level=%s",
         app_settings.workspace_root,
@@ -127,6 +135,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.manager = manager
     app.state.editorial_projects = editorial_projects
     app.state.asset_previews = asset_previews
+    app.state.background_removal = background_removal
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -686,6 +695,33 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         enriched_project = asset_previews.enrich_project(workspace, project)
         enriched_asset = next((item for item in enriched_project.assets if item.id == asset.id), asset)
         return {"asset": enriched_asset, "project": enriched_project}
+
+    @app.post("/api/jobs/{job_id}/assets/{asset_id}/background-removal")
+    async def start_background_removal(job_id: str, asset_id: str):
+        _require_job(store, job_id)
+        try:
+            return background_removal.start(job_id, asset_id)
+        except BackgroundRemovalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/jobs/{job_id}/assets/{asset_id}/background-removal")
+    async def set_background_removal_variant(
+        job_id: str,
+        asset_id: str,
+        payload: dict[str, str] = Body(...),
+    ):
+        _require_job(store, job_id)
+        variant = payload.get("active_variant")
+        if variant not in {"original", "cutout"}:
+            raise HTTPException(status_code=400, detail="active_variant must be 'original' or 'cutout'.")
+        try:
+            return background_removal.set_active_variant(
+                job_id,
+                asset_id,
+                AssetVariantKind(variant),
+            )
+        except BackgroundRemovalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/jobs/{job_id}/audio-lanes/{lane_id}/transcribe")
     async def transcribe_audio_lane(job_id: str, lane_id: str):

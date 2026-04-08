@@ -1,5 +1,6 @@
 import { Show, createMemo, type Accessor, type Component } from "solid-js";
 import {
+  selectedJobId,
   selectedClipId,
   selectedSubtitleId,
   selectedTrackId,
@@ -7,6 +8,9 @@ import {
   setSelectedSubtitleId,
 } from "../store";
 import type { EditorialProject } from "../types";
+import {
+  useStartBackgroundRemovalMutation,
+} from "../api/queries";
 import {
   assetById,
   getClip,
@@ -23,6 +27,7 @@ const ParamsInspector: Component<{
   project: Accessor<EditorialProject | null>;
   updateProject: (next: EditorialProject | ((current: EditorialProject) => EditorialProject)) => void;
 }> = (props) => {
+  const startBackgroundRemoval = useStartBackgroundRemovalMutation();
   const currentTrack = createMemo(() => {
     const project = props.project();
     return project ? getTrack(project, selectedTrackId()) : null;
@@ -35,6 +40,12 @@ const ParamsInspector: Component<{
     const project = props.project();
     return project ? getSubtitleBlock(project, selectedSubtitleId()) : null;
   });
+  const currentAsset = createMemo(() => {
+    const project = props.project();
+    const clip = currentClip();
+    return project && clip ? assetById(project, clip.asset_id) ?? null : null;
+  });
+  const backgroundRemoval = createMemo(() => currentAsset()?.background_removal ?? null);
   const currentLaneTranscription = createMemo(() => {
     const project = props.project();
     const lane = currentTrack();
@@ -52,6 +63,27 @@ const ParamsInspector: Component<{
     if (!subtitle) return;
     props.updateProject((project) => removeSubtitle(project, subtitle.id));
     setSelectedSubtitleId(null);
+  };
+  const runBackgroundRemoval = () => {
+    const jobId = selectedJobId();
+    const asset = currentAsset();
+    if (!jobId || !asset || asset.kind !== "video") return;
+    startBackgroundRemoval.mutate({ jobId, assetId: asset.id });
+  };
+  const switchClipVariant = (variant: "original" | "cutout") => {
+    const clip = currentClip();
+    const asset = currentAsset();
+    const track = currentTrack();
+    if (!clip || !asset || asset.kind !== "video" || track?.kind !== "video") return;
+    if (variant === "cutout" && !asset.background_removal?.cutout_path) return;
+    props.updateProject((project) => ({
+      ...project,
+      clips: project.clips.map((item) => (
+        item.id === clip.id
+          ? { ...item, asset_variant: variant }
+          : item
+      )),
+    }));
   };
 
   return (
@@ -101,7 +133,7 @@ const ParamsInspector: Component<{
               <div class="inspector-card">
                 <div class="inspector-card-title">Clip selezionata</div>
                 <div class="inspector-card-row">
-                  <span>{assetById(props.project()!, clip().asset_id)?.label || "Clip"}</span>
+                  <span>{currentAsset()?.label || "Clip"}</span>
                   <span>{fmtTimePrecise(clip().start)} - {fmtTimePrecise(clip().start + (clip().source_out - clip().source_in))}</span>
                 </div>
                 <div class="inspector-card-row">
@@ -120,6 +152,67 @@ const ParamsInspector: Component<{
                   <span>Link</span>
                   <span>{clip().linked_group_id ? "A/V linked" : "Independent"}</span>
                 </div>
+                <Show when={currentAsset()?.kind === "video" && currentTrack()?.kind === "video"}>
+                  <div class="inspector-card-row">
+                    <span>Background removal</span>
+                    <span>{backgroundRemoval()?.status ?? "idle"}</span>
+                  </div>
+                  <Show when={backgroundRemoval()}>
+                    {(cutout) => (
+                      <>
+                        <div class="inspector-card-row">
+                          <span>Variante clip</span>
+                          <span>{clip().asset_variant === "cutout" ? "Scontornato" : "Originale"}</span>
+                        </div>
+                        <Show when={cutout().message}>
+                          <div class="inspector-card-row">
+                            <span>Stato</span>
+                            <span>{cutout().message}</span>
+                          </div>
+                        </Show>
+                        <Show when={cutout().status === "running"}>
+                          <div class="inspector-card-row">
+                            <span>Progresso</span>
+                            <span>{Math.round((cutout().progress ?? 0) * 100)}%</span>
+                          </div>
+                        </Show>
+                        <Show when={cutout().error}>
+                          <div class="step-message">{cutout().error}</div>
+                        </Show>
+                      </>
+                    )}
+                  </Show>
+                  <div class="inspector-card-actions inspector-card-actions--spread">
+                    <button
+                      type="button"
+                      class="btn btn-xs btn-primary"
+                      disabled={startBackgroundRemoval.isPending || backgroundRemoval()?.status === "running"}
+                      onClick={runBackgroundRemoval}
+                    >
+                      {backgroundRemoval()?.cutout_path ? "Rigenera scontorno" : "Scontorna video"}
+                    </button>
+                    <div class="inspector-segmented" role="group" aria-label="Variante clip">
+                      <button
+                        type="button"
+                        class={`inspector-segmented__option ${clip().asset_variant === "original" ? "is-active" : ""}`}
+                        aria-pressed={clip().asset_variant === "original"}
+                        disabled={backgroundRemoval()?.status === "running" || !backgroundRemoval()?.original_path}
+                        onClick={() => switchClipVariant("original")}
+                      >
+                        Originale
+                      </button>
+                      <button
+                        type="button"
+                        class={`inspector-segmented__option ${clip().asset_variant === "cutout" ? "is-active" : ""}`}
+                        aria-pressed={clip().asset_variant === "cutout"}
+                        disabled={backgroundRemoval()?.status === "running" || !backgroundRemoval()?.cutout_path}
+                        onClick={() => switchClipVariant("cutout")}
+                      >
+                        Scontornato
+                      </button>
+                    </div>
+                  </div>
+                </Show>
                 <div class="inspector-card-actions">
                   <button
                     type="button"

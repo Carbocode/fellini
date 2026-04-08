@@ -1,6 +1,7 @@
 import type {
   AssetTranscription,
   AssetTranscriptionWord,
+  AssetVariantKind,
   AudioTrackRole,
   EditorialProject,
   ProjectAsset,
@@ -16,6 +17,37 @@ const MIN_SUBTITLE_DURATION = 0.02;
 
 function clipDuration(clip: Pick<TimelineClip, "source_in" | "source_out">): number {
   return Math.max(0, clip.source_out - clip.source_in);
+}
+
+function defaultClipVariant(
+  project: EditorialProject,
+  clip: TimelineClip,
+): AssetVariantKind {
+  const track = getTrack(project, clip.track_id);
+  if (track?.kind !== "video") return "original";
+  const asset = assetById(project, clip.asset_id);
+  if (asset?.background_removal?.cutout_path && asset.background_removal.active_variant === "cutout") {
+    return "cutout";
+  }
+  return "original";
+}
+
+function normalizeClipAssetVariants(project: EditorialProject): EditorialProject {
+  let assetsChanged = false;
+  const assets = project.assets.map((asset) => {
+    const originalPath = asset.background_removal?.original_path;
+    if (!originalPath || asset.path === originalPath) return asset;
+    assetsChanged = true;
+    return { ...asset, path: originalPath };
+  });
+  const nextProject = assetsChanged ? { ...project, assets } : project;
+  return {
+    ...nextProject,
+    clips: nextProject.clips.map((clip) => ({
+      ...clip,
+      asset_variant: clip.asset_variant ?? defaultClipVariant(nextProject, clip),
+    })),
+  };
 }
 
 export function projectDuration(project: EditorialProject): number {
@@ -427,6 +459,35 @@ export function assetById(project: EditorialProject, assetId: string): ProjectAs
   return project.assets.find((asset) => asset.id === assetId);
 }
 
+export function assetPathForVariant(
+  asset: ProjectAsset,
+  variant: AssetVariantKind,
+): string | null {
+  if (variant === "cutout") {
+    return asset.background_removal?.cutout_path ?? null;
+  }
+  return asset.background_removal?.original_path ?? asset.path ?? null;
+}
+
+export function clipAssetVariant(
+  project: EditorialProject,
+  clip: TimelineClip,
+): AssetVariantKind {
+  const track = getTrack(project, clip.track_id);
+  if (track?.kind !== "video") return "original";
+  return clip.asset_variant ?? defaultClipVariant(project, clip);
+}
+
+export function mediaPathForClip(
+  project: EditorialProject,
+  clip: TimelineClip,
+): string | null {
+  const asset = assetById(project, clip.asset_id);
+  if (!asset) return null;
+  const variant = clipAssetVariant(project, clip);
+  return assetPathForVariant(asset, variant) ?? assetPathForVariant(asset, "original");
+}
+
 function firstTrackOfKind(project: EditorialProject, kind: TimelineTrackKind): TimelineTrack | undefined {
   return sortedTracks(project).find((track) => track.kind === kind);
 }
@@ -625,7 +686,7 @@ export function normalizeTrackLayout(project: EditorialProject): EditorialProjec
 }
 
 export function normalizeEditorialProject(project: EditorialProject): EditorialProject {
-  return normalizeTrackLayout(normalizeGeneratedSubtitles(project));
+  return normalizeTrackLayout(normalizeGeneratedSubtitles(normalizeClipAssetVariants(project)));
 }
 
 type PlacementInterval = { min: number; max: number };
@@ -789,6 +850,7 @@ export function createClip(
     z_index: 0,
     enabled: true,
     origin: "manual",
+    asset_variant: "original",
     transform: {
       x: 0,
       y: 0,

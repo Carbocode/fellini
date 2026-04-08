@@ -11,6 +11,7 @@ from array import array
 from pathlib import Path
 
 from fellini.domain.models import (
+    AssetVariantKind,
     EditDecisionList,
     EditorialProject,
     ProbeInfo,
@@ -425,12 +426,17 @@ class FFmpegAdapter:
             msg = f"Audio lane {track_id} is empty."
             raise FFmpegError(msg)
 
-        inputs, input_indexes = self._project_inputs(workspace_root, project, start_index=0)
+        inputs, input_indexes = self._project_inputs_for_clips(
+            workspace_root,
+            project,
+            [(clip, True) for clip in clips],
+            start_index=0,
+        )
         filters: list[str] = []
         audio_labels: list[str] = []
         for clip_index, clip in enumerate(clips):
             label = f"a{clip_index}"
-            asset_index = input_indexes[clip.asset_id]
+            asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
             delay_ms = max(0, round(clip.start * 1000))
             duration = max(0.02, clip.source_out - clip.source_in)
             chain = [
@@ -486,7 +492,6 @@ class FFmpegAdapter:
         render_config: RenderConfig,
         target: Path,
     ) -> None:
-        inputs, input_indexes = self._project_inputs(workspace_root, project, start_index=1)
         video_tracks = sorted(
             [track for track in project.tracks if track.kind == TimelineTrackKind.video and track.visible],
             key=lambda item: item.order,
@@ -500,13 +505,30 @@ class FFmpegAdapter:
             msg = "Editorial project has no timeline duration."
             raise FFmpegError(msg)
 
+        video_clips = [
+            clip
+            for track in video_tracks
+            for clip in self._sorted_track_clips(project, track)
+        ]
+        audio_clips = [
+            clip
+            for track in audio_tracks
+            for clip in self._sorted_track_clips(project, track)
+        ]
+        inputs, input_indexes = self._project_inputs_for_clips(
+            workspace_root,
+            project,
+            [(clip, False) for clip in video_clips] + [(clip, True) for clip in audio_clips],
+            start_index=1,
+        )
+
         filters: list[str] = []
         overlay_inputs: list[str] = []
         audio_labels: list[str] = []
 
         for track in video_tracks:
             for clip in self._sorted_track_clips(project, track):
-                asset_index = input_indexes[clip.asset_id]
+                asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=False)]
                 label = f"v{len(overlay_inputs)}"
                 filters.append(
                     ",".join(
@@ -523,7 +545,7 @@ class FFmpegAdapter:
 
         for track in audio_tracks:
             for clip in self._sorted_track_clips(project, track):
-                asset_index = input_indexes[clip.asset_id]
+                asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
                 label = f"a{len(audio_labels)}"
                 delay_ms = max(0, round(clip.start * 1000))
                 duration_clip = max(0.02, clip.source_out - clip.source_in)
@@ -703,17 +725,45 @@ class FFmpegAdapter:
             key=lambda item: (item.start, item.z_index, item.id),
         )
 
-    @staticmethod
-    def _project_inputs(
-        workspace_root: Path, project: EditorialProject, *, start_index: int
+    def _project_inputs_for_clips(
+        self,
+        workspace_root: Path,
+        project: EditorialProject,
+        clip_specs: list[tuple[TimelineClip, bool]],
+        *,
+        start_index: int,
     ) -> tuple[list[Path], dict[str, int]]:
         inputs: list[Path] = []
         input_indexes: dict[str, int] = {}
-        for asset in project.assets:
-            target = workspace_root / asset.path
-            input_indexes[asset.id] = len(inputs) + start_index
-            inputs.append(target)
+        for clip, for_audio in clip_specs:
+            key = self._clip_source_key(project, clip, for_audio=for_audio)
+            if key in input_indexes:
+                continue
+            input_indexes[key] = len(inputs) + start_index
+            inputs.append(workspace_root / key)
         return inputs, input_indexes
+
+    def _clip_source_key(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+        *,
+        for_audio: bool,
+    ) -> str:
+        asset = next((item for item in project.assets if item.id == clip.asset_id), None)
+        if asset is None:
+            msg = f"Asset {clip.asset_id} referenced by clip {clip.id} was not found."
+            raise FFmpegError(msg)
+        background = asset.background_removal
+        if for_audio:
+            return (background.original_path if background and background.original_path else asset.path)
+        if (
+            clip.asset_variant == AssetVariantKind.cutout
+            and background
+            and background.cutout_path
+        ):
+            return background.cutout_path
+        return (background.original_path if background and background.original_path else asset.path)
 
     def _resolve_video_encoder(self, preferred: str) -> str:
         available = self._available_encoders()

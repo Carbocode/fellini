@@ -145,6 +145,34 @@ export function useUploadEditorialAssetMutation() {
   }));
 }
 
+export function useStartBackgroundRemovalMutation() {
+  const qc = useQueryClient();
+  return createMutation(() => ({
+    mutationFn: (vars: { jobId: string; assetId: string }) =>
+      api.startAssetBackgroundRemoval(vars.jobId, vars.assetId),
+    onSuccess: (project, vars) => {
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(project));
+    },
+    onError: (_error, vars) => {
+      qc.invalidateQueries({ queryKey: ["editorial-project", vars.jobId] });
+    },
+  }));
+}
+
+export function useSetBackgroundRemovalVariantMutation() {
+  const qc = useQueryClient();
+  return createMutation(() => ({
+    mutationFn: (vars: { jobId: string; assetId: string; activeVariant: "original" | "cutout" }) =>
+      api.setAssetBackgroundRemovalVariant(vars.jobId, vars.assetId, vars.activeVariant),
+    onSuccess: (project, vars) => {
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(project));
+    },
+    onError: (_error, vars) => {
+      qc.invalidateQueries({ queryKey: ["editorial-project", vars.jobId] });
+    },
+  }));
+}
+
 export function useTranscribeLaneMutation() {
   const qc = useQueryClient();
   return createMutation(() => ({

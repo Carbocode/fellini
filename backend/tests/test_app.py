@@ -614,8 +614,8 @@ def test_asset_preview_request_marks_asset_as_generating(tmp_path, monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     preview = payload["assets"][0]["preview"]
-    assert preview["filmstrip"]["status"] == "generating"
-    assert preview["waveform"]["status"] == "generating"
+    assert preview["original"]["filmstrip"]["status"] == "generating"
+    assert preview["original"]["waveform"]["status"] == "generating"
 
 
 def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monkeypatch):
