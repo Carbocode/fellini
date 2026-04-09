@@ -3,6 +3,7 @@ import TabBar from "./components/TabBar";
 import Workspace from "./components/Workspace";
 import NewTabPage from "./components/NewTabPage";
 import NewProjectDialog from "./components/NewProjectDialog";
+import AboutDialog from "./components/AboutDialog";
 import { selectedJobId } from "./store";
 
 const CUSTOM_WHEEL_ZOOM_SELECTOR = ".timeline-ruler-viewport, .timeline-viewport";
@@ -45,6 +46,7 @@ const App: Component = () => {
         </Show>
       </div>
       <NewProjectDialog />
+      <AboutDialog />
     </div>
   );
 };

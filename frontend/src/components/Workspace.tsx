@@ -10,6 +10,7 @@ import {
   type Component,
 } from "solid-js";
 import { useQueryClient } from "@tanstack/solid-query";
+import WaveSurfer, { type WaveSurferOptions } from "wavesurfer.js";
 import {
   useEditorialProjectQuery,
   useJobPolling,
@@ -111,6 +112,9 @@ const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
 const CLIP_PREVIEW_MIN_WIDTH_PX = 32;
 const MIN_SUBTITLE_DURATION = 0.02;
+const WAVEFORM_SAMPLES_PER_DEVICE_PIXEL = 1;
+const WAVEFORM_MIN_RENDER_PEAKS = 64;
+const WAVEFORM_MAX_RENDER_PEAKS = 65536;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
 type WaveformData = {
@@ -300,14 +304,111 @@ function metaNumber(meta: Record<string, unknown> | undefined, key: string, fall
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+function waveformSliceForClip(
+  payload: WaveformData,
+  clip: TimelineClip,
+  assetDuration: number,
+): { duration: number; values: number[] } {
+  const values = payload.values;
+  const totalDuration = Math.max(assetDuration, payload.duration, 0.01);
+  const start = Math.max(0, Math.min(clip.source_in, totalDuration));
+  const end = Math.max(start + 0.001, Math.min(clip.source_out, totalDuration));
+  if (!values.length) {
+    return {
+      duration: Math.max(0.001, end - start),
+      values: [0],
+    };
+  }
+  const startIndex = Math.max(0, Math.min(values.length - 1, Math.floor((start / totalDuration) * values.length)));
+  const endIndex = Math.max(startIndex + 1, Math.min(values.length, Math.ceil((end / totalDuration) * values.length)));
+  return {
+    duration: Math.max(0.001, end - start),
+    values: values.slice(startIndex, endIndex),
+  };
+}
+
+function targetWaveformPeakCount(displayWidth: number): number {
+  const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
+  return Math.max(
+    WAVEFORM_MIN_RENDER_PEAKS,
+    Math.min(
+      WAVEFORM_MAX_RENDER_PEAKS,
+      Math.ceil(Math.max(CLIP_PREVIEW_MIN_WIDTH_PX, displayWidth) * dpr * WAVEFORM_SAMPLES_PER_DEVICE_PIXEL),
+    ),
+  );
+}
+
+function resampleWaveformPeaks(values: number[], targetCount: number): Float32Array {
+  const available = values.length;
+  const count = Math.max(1, Math.min(targetCount, available || 1));
+  const output = new Float32Array(count);
+  if (!available) return output;
+  if (count >= available) {
+    for (let index = 0; index < available; index += 1) {
+      output[index] = (values[index] ?? 0) / 255;
+    }
+    return output;
+  }
+  for (let index = 0; index < count; index += 1) {
+    const from = Math.floor((index / count) * available);
+    const to = Math.min(
+      available,
+      Math.max(from + 1, Math.ceil(((index + 1) / count) * available)),
+    );
+    let peak = 0;
+    for (let sourceIndex = from; sourceIndex < to; sourceIndex += 1) {
+      peak = Math.max(peak, values[sourceIndex] ?? 0);
+    }
+    output[index] = peak / 255;
+  }
+  return output;
+}
+
+function renderContinuousWaveform(peaks: Array<Float32Array | number[]>, ctx: CanvasRenderingContext2D): void {
+  const channel = peaks[0];
+  if (!channel?.length) return;
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+  const centerY = height / 2;
+  const xScale = channel.length > 1 ? width / (channel.length - 1) : width;
+  const strokeWidth = Math.max(1, Math.round(typeof window === "undefined" ? 1 : window.devicePixelRatio || 1));
+  const amplitudeScale = height * 0.46;
+
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.fillStyle = "rgba(139, 231, 164, 0.84)";
+  ctx.strokeStyle = "rgba(203, 255, 214, 0.32)";
+  ctx.lineWidth = Math.max(1, strokeWidth * 0.75);
+
+  ctx.beginPath();
+  for (let index = 0; index < channel.length; index += 1) {
+    const amplitude = Math.max(0, Math.min(1, Math.abs(channel[index] ?? 0)));
+    const x = Math.min(width, index * xScale);
+    const y = centerY - (amplitude * amplitudeScale);
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  for (let index = channel.length - 1; index >= 0; index -= 1) {
+    const amplitude = Math.max(0, Math.min(1, Math.abs(channel[index] ?? 0)));
+    const x = Math.min(width, index * xScale);
+    const y = centerY + (amplitude * amplitudeScale);
+    ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+}
+
 const WaveformClipPreview: Component<{
   src: string;
   clip: TimelineClip;
   assetDuration: number;
+  pxPerSecond: number;
 }> = (props) => {
   const [data, setData] = createSignal<WaveformData | null>(null);
   const [size, setSize] = createSignal({ width: 0, height: 0 });
-  let canvasRef: HTMLCanvasElement | undefined;
+  let containerRef: HTMLDivElement | undefined;
+  let waveformRef: WaveSurfer | undefined;
 
   createEffect(
     on(
@@ -333,65 +434,74 @@ const WaveformClipPreview: Component<{
   );
 
   createEffect(() => {
-    if (!canvasRef) return;
+    if (!containerRef) return;
     const updateSize = () => setSize({
-      width: Math.round(canvasRef!.clientWidth),
-      height: Math.round(canvasRef!.clientHeight),
+      width: Math.round(containerRef!.clientWidth),
+      height: Math.round(containerRef!.clientHeight),
     });
     updateSize();
     const observer = new ResizeObserver(updateSize);
-    observer.observe(canvasRef);
+    observer.observe(containerRef);
     onCleanup(() => observer.disconnect());
   });
 
-  createEffect(() => {
+  const renderData = createMemo(() => {
     const payload = data();
     const width = size().width;
     const height = size().height;
-    if (!canvasRef || !payload || width <= 0 || height <= 0) return;
-    const context = canvasRef.getContext("2d");
-    if (!context) return;
-    const dpr = typeof window === "undefined" ? 1 : window.devicePixelRatio || 1;
-    canvasRef.width = Math.max(1, Math.round(width * dpr));
-    canvasRef.height = Math.max(1, Math.round(height * dpr));
-    context.setTransform(dpr, 0, 0, dpr, 0, 0);
-    context.clearRect(0, 0, width, height);
-    context.fillStyle = "rgba(139, 231, 164, 0.88)";
-    const values = payload.values;
-    const totalDuration = Math.max(props.assetDuration, payload.duration, 0.01);
-    const start = Math.max(0, Math.min(props.clip.source_in, totalDuration));
-    const end = Math.max(start + 0.001, Math.min(props.clip.source_out, totalDuration));
-    const startIndex = Math.floor((start / totalDuration) * values.length);
-    const endIndex = Math.max(startIndex + 1, Math.ceil((end / totalDuration) * values.length));
-    const midY = height / 2;
-    for (let x = 0; x < width; x += 1) {
-      const from = startIndex + Math.floor((x / width) * (endIndex - startIndex));
-      const to = Math.min(
-        values.length,
-        startIndex + Math.max(
-          Math.ceil(((x + 1) / width) * (endIndex - startIndex)),
-          Math.floor((x / width) * (endIndex - startIndex)) + 1,
-        ),
-      );
-      let peak = 0;
-      for (let index = from; index < to; index += 1) {
-        peak = Math.max(peak, values[index] ?? 0);
-      }
-      if (peak <= 0) continue;
-      const amplitude = peak / 255;
-      const barHeight = Math.max(1, amplitude * (height * 0.5));
-      context.fillRect(x, midY - barHeight, 1, barHeight * 2);
-    }
-    context.beginPath();
-    context.strokeStyle = "rgba(203, 255, 214, 0.42)";
-    context.lineWidth = 1;
-    const lineY = Math.floor(midY) + 0.5;
-    context.moveTo(0, lineY);
-    context.lineTo(width, lineY);
-    context.stroke();
+    if (!payload || width <= 0 || height <= 0) return null;
+    const slice = waveformSliceForClip(payload, props.clip, props.assetDuration);
+    const effectiveWidth = Math.max(
+      width,
+      Math.max(CLIP_PREVIEW_MIN_WIDTH_PX, slice.duration * props.pxPerSecond),
+    );
+    return {
+      duration: slice.duration,
+      height,
+      peaks: [resampleWaveformPeaks(slice.values, targetWaveformPeakCount(effectiveWidth))],
+    };
   });
 
-  return <canvas ref={canvasRef} class="tl-waveform-canvas" aria-hidden="true" />;
+  createEffect(() => {
+    if (renderData()) return;
+    waveformRef?.empty();
+  });
+
+  createEffect(() => {
+    const current = renderData();
+    if (!containerRef || !current) return;
+    const options = {
+      peaks: current.peaks,
+      duration: current.duration,
+      height: current.height,
+      width: "100%",
+      fillParent: true,
+      normalize: false,
+      interact: false,
+      hideScrollbar: true,
+      autoScroll: false,
+      autoCenter: false,
+      cursorWidth: 0,
+      waveColor: "rgba(139, 231, 164, 0.88)",
+      progressColor: "rgba(139, 231, 164, 0.88)",
+      renderFunction: renderContinuousWaveform,
+    } satisfies Partial<WaveSurferOptions>;
+    if (!waveformRef) {
+      waveformRef = WaveSurfer.create({
+        container: containerRef,
+        ...options,
+      });
+      return;
+    }
+    waveformRef.setOptions(options);
+  });
+
+  onCleanup(() => {
+    waveformRef?.destroy();
+    waveformRef = undefined;
+  });
+
+  return <div ref={containerRef} class="tl-waveform-host" aria-hidden="true" />;
 };
 
 const FilmstripClipPreview: Component<{
@@ -476,6 +586,7 @@ const TimelineClipPreview: Component<{
   clip: TimelineClip;
   asset: ProjectAsset;
   trackKind: "video" | "audio";
+  pxPerSecond: number;
 }> = (props) => {
   const entry = () => clipPreviewEntry(props.asset, props.clip, props.trackKind);
   const status = () => entry()?.status ?? "missing";
@@ -511,6 +622,7 @@ const TimelineClipPreview: Component<{
             src={resolvedSrc()}
             clip={props.clip}
             assetDuration={assetDuration()}
+            pxPerSecond={props.pxPerSecond}
           />
         )}
       </Show>
@@ -2978,6 +3090,7 @@ const TimelinePanel: Component<{
                             clip={clip}
                             asset={asset}
                             trackKind={track.kind as "video" | "audio"}
+                            pxPerSecond={pxPerSecond()}
                           />
                         )
                       : <div class="tl-clip-preview-body tl-clip-preview-body--placeholder" aria-hidden="true" />}

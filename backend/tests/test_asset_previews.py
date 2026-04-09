@@ -83,6 +83,6 @@ def test_generate_waveform_preview_uses_higher_bucket_density(tmp_path, monkeypa
     assert call == {
         "source": str(source),
         "duration_seconds": 45.0,
-        "bucket_count": 2880,
+        "bucket_count": 23040,
         "sample_rate": 8000,
     }

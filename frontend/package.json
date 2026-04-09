@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "@tanstack/solid-query": "^5.75.7",
-    "solid-js": "^1.9.5"
+    "solid-js": "^1.9.5",
+    "wavesurfer.js": "^7.12.5"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

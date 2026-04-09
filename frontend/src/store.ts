@@ -75,6 +75,7 @@ window.addEventListener("hashchange", () => {
 
 export const [selectedStep, setSelectedStep] = createSignal<string | null>(null);
 export const [dialogOpen, setDialogOpen] = createSignal(false);
+export const [aboutDialogOpen, setAboutDialogOpen] = createSignal(false);
 
 // Per-job UI state keyed by job ID
 const previewMap: Record<string, string> = {};
