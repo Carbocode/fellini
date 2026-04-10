@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from fellini.domain.models import (
     AssetVariantKind,
+    ClipTranscriptionOptions,
     EditorialProject,
     InputAsset,
     JobRequest,
@@ -32,6 +33,7 @@ from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings, load_settings, project_root
 
 logger = get_logger(__name__)
+INTERRUPTED_RUN_MESSAGE = "Run interrupted while the backend was offline. Retry the step."
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -100,6 +102,33 @@ def _validate_step_run(snapshot, step_name: StepName) -> None:
         raise HTTPException(status_code=409, detail=detail)
 
 
+def _resolve_clip_transcription_request(
+    snapshot: JobSnapshot,
+    clip,
+    overrides: ClipTranscriptionOptions | None = None,
+):
+    options = clip.transcription_options.model_copy(deep=True)
+    if overrides is not None:
+        options = options.model_copy(
+            update=overrides.model_dump(exclude_none=True),
+            deep=True,
+        )
+
+    config = snapshot.request.transcription.model_copy(deep=True)
+    for field_name in ("model", "beam_size", "vad_filter"):
+        value = getattr(options, field_name)
+        if value is not None:
+            setattr(config, field_name, value)
+
+    language = options.language.strip() if options.language else snapshot.request.language
+    use_whisperx = (
+        options.use_whisperx
+        if options.use_whisperx is not None
+        else snapshot.request.toggles.use_whisperx
+    )
+    return options, config, language, use_whisperx
+
+
 def _resolve_frontend_dist() -> Path | None:
     candidate = project_root() / "frontend" / "dist"
     if candidate.is_dir() and (candidate / "index.html").is_file():
@@ -136,6 +165,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.editorial_projects = editorial_projects
     app.state.asset_previews = asset_previews
     app.state.background_removal = background_removal
+
+    for snapshot in store.list_jobs():
+        if snapshot.status != JobStatus.running:
+            continue
+        logger.warning(
+            "app.recover_interrupted_run job_id=%s current_step=%s",
+            snapshot.id,
+            snapshot.current_step.value if snapshot.current_step else None,
+        )
+        store.recover_interrupted_run(snapshot.id, INTERRUPTED_RUN_MESSAGE)
+        store.append_log(snapshot.id, INTERRUPTED_RUN_MESSAGE)
+        workspace = JobWorkspace(app_settings.jobs_root, snapshot.id)
+        editorial_projects.recover_interrupted_runtime_state(workspace, INTERRUPTED_RUN_MESSAGE)
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -455,6 +497,115 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             store.mark_failed(job_id, str(exc))
             raise
 
+    def run_clip_transcription(
+        job_id: str,
+        clip_id: str,
+        overrides: ClipTranscriptionOptions | None = None,
+    ) -> dict[str, Any]:
+        snapshot = enrich_snapshot(_require_job(store, job_id))
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="A run is already in progress for this job.")
+
+        context = build_context(snapshot)
+        project = editorial_projects.ensure(context)
+        clip = next((item for item in project.clips if item.id == clip_id and item.enabled), None)
+        if not clip:
+            raise HTTPException(status_code=404, detail="Audio clip not found.")
+
+        lane = next((track for track in project.tracks if track.id == clip.track_id), None)
+        if not lane or lane.kind != TimelineTrackKind.audio:
+            raise HTTPException(status_code=409, detail="Selected clip is not on an audio lane.")
+
+        resolved_options, clip_config, clip_language, clip_use_whisperx = _resolve_clip_transcription_request(
+            snapshot,
+            clip,
+            overrides,
+        )
+        editorial_projects.set_clip_transcription_running(
+            context.workspace,
+            project=project,
+            clip_id=clip_id,
+            options=resolved_options,
+        )
+
+        store.mark_running(job_id)
+        store.begin_step(job_id, StepName.transcription, f"Transcribing audio clip {clip_id}")
+
+        bounce_path = context.workspace.temp_path(f"clip_{clip_id}_bounce.wav")
+        try:
+            store.update_step_progress(job_id, StepName.transcription, 15, "Bounce della clip audio")
+            context.ffmpeg.mix_audio_clip(
+                workspace_root=context.workspace.job_dir,
+                project=editorial_projects.load(context.workspace),
+                clip_id=clip_id,
+                target=bounce_path,
+            )
+
+            store.update_step_progress(job_id, StepName.transcription, 45, "Trascrizione della clip")
+            _speech_segments, transcript = context.transcriber.transcribe(
+                bounce_path,
+                clip_config,
+                clip_language,
+            )
+
+            store.update_step_progress(job_id, StepName.transcription, 70, "Allineamento della clip")
+            aligned = context.aligner.align(
+                bounce_path,
+                transcript,
+                clip_config,
+                clip_language,
+                clip_use_whisperx,
+            )
+            completion_message = "Trascrizione completata"
+            if not aligned.segments:
+                completion_message = (
+                    "Nessuna voce rilevata nella clip"
+                    + (" (VAD ha filtrato tutto l'audio)" if clip_config.vad_filter else "")
+                )
+            saved_project = editorial_projects.set_clip_transcription(
+                context.workspace,
+                project=editorial_projects.load(context.workspace),
+                clip_id=clip_id,
+                transcript=aligned,
+                source_audio_path=context.workspace.relative(bounce_path),
+                message=completion_message,
+            )
+
+            store.update_step_progress(job_id, StepName.transcription, 100, completion_message)
+            store.complete_step(
+                job_id,
+                StepName.transcription,
+                message=completion_message,
+                artifacts=[context.workspace.relative(context.workspace.editorial_project_path)],
+            )
+
+            latest = enrich_snapshot(store.load(job_id))
+            if all(step.status.value == "completed" for step in latest.steps):
+                store.mark_completed(job_id, latest.outputs)
+            else:
+                store.mark_pending(job_id)
+            return {
+                "job": enrich_snapshot(store.load(job_id)),
+                "project": asset_previews.enrich_project(context.workspace, saved_project),
+            }
+        except Exception as exc:
+            try:
+                editorial_projects.set_clip_transcription_failed(
+                    context.workspace,
+                    project=editorial_projects.load(context.workspace),
+                    clip_id=clip_id,
+                    error=str(exc),
+                )
+            except Exception:
+                logger.exception(
+                    "api.jobs.clip.transcribe.recovery_failed job_id=%s clip_id=%s",
+                    job_id,
+                    clip_id,
+                )
+            store.fail_step(job_id, StepName.transcription, str(exc))
+            store.mark_failed(job_id, str(exc))
+            raise
+
     frontend_dist = _resolve_frontend_dist()
 
     if frontend_dist:
@@ -734,6 +885,25 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "api.jobs.audio_lane.transcribe.failed job_id=%s lane_id=%s error=%s",
                 job_id,
                 lane_id,
+                exc,
+            )
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/jobs/{job_id}/clips/{clip_id}/transcribe")
+    async def transcribe_audio_clip(
+        job_id: str,
+        clip_id: str,
+        payload: ClipTranscriptionOptions | None = Body(None),
+    ):
+        try:
+            return run_clip_transcription(job_id, clip_id, payload)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "api.jobs.clip.transcribe.failed job_id=%s clip_id=%s error=%s",
+                job_id,
+                clip_id,
                 exc,
             )
             raise HTTPException(status_code=500, detail=str(exc)) from exc

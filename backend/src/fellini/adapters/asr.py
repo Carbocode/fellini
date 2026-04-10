@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import importlib.util
+import sys
 from pathlib import Path
 
 from fellini.domain.models import (
@@ -110,10 +112,55 @@ class FasterWhisperTranscriber:
 
     @staticmethod
     def _resolve_device(device: str) -> str:
-        if device != "auto":
-            return device
+        requested = device.strip().lower()
+        if requested == "auto":
+            if importlib.util.find_spec("torch") is None:
+                return "cpu"
+            import torch
+
+            if not torch.cuda.is_available():
+                return "cpu"
+
+            missing_runtime = FasterWhisperTranscriber._missing_cuda_runtime_libraries()
+            if missing_runtime:
+                logger.warning(
+                    "asr.cuda_runtime_missing requested=auto fallback=cpu missing=%s",
+                    ",".join(missing_runtime),
+                )
+                return "cpu"
+            return "cuda"
+
+        if requested == "cuda":
+            missing_runtime = FasterWhisperTranscriber._missing_cuda_runtime_libraries()
+            if missing_runtime:
+                joined = ", ".join(missing_runtime)
+                msg = (
+                    "CUDA requested for faster-whisper but required runtime libraries are missing: "
+                    f"{joined}. Use device=cpu or install the CUDA/cuDNN runtime."
+                )
+                raise RuntimeError(msg)
+
+        return requested
+
+    @staticmethod
+    def _missing_cuda_runtime_libraries() -> list[str]:
+        if not sys.platform.startswith("linux"):
+            return []
         if importlib.util.find_spec("torch") is None:
-            return "cpu"
+            return []
         import torch
 
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if not torch.cuda.is_available():
+            return []
+
+        required = [
+            "libcudnn_ops_infer.so.8",
+            "libcudnn_cnn_infer.so.8",
+        ]
+        missing: list[str] = []
+        for library_name in required:
+            try:
+                ctypes.CDLL(library_name)
+            except OSError:
+                missing.append(library_name)
+        return missing

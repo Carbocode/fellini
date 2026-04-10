@@ -13,6 +13,7 @@ from fellini.domain.models import (
     ClipOrigin,
     EditorialProject,
     LaneTranscription,
+    LaneTranscriptionStatus,
     ProjectAsset,
     ProjectAssetKind,
     ProjectSelection,
@@ -377,6 +378,161 @@ def test_set_lane_transcription_uses_free_video_lane_for_generated_subtitles(tmp
     assert updated.lane_transcriptions[0].lane_id == "track_audio_1"
     assert [caption.track_id for caption in updated.captions] == ["track_video_2", "track_video_2"]
     assert [caption.text for caption in updated.captions] == ["ciao", "lane"]
+
+
+def test_set_clip_transcription_replaces_only_the_selected_clip_range(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    store = EditorialProjectStore(settings)
+    workspace = JobWorkspace(settings.jobs_root, "job_clip_transcription")
+    workspace.bootstrap()
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        selection=ProjectSelection(),
+        assets=[
+            ProjectAsset(
+                id="asset_source",
+                kind=ProjectAssetKind.audio,
+                label="Audio source",
+                path="uploads/source.wav",
+                duration=4.0,
+                has_audio=True,
+            )
+        ],
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(
+                id="track_audio_1",
+                kind=TimelineTrackKind.audio,
+                name="Audio 1",
+                order=1,
+                role=AudioTrackRole.story,
+            ),
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_audio_1",
+                asset_id="asset_source",
+                track_id="track_audio_1",
+                start=5.0,
+                source_in=1.0,
+                source_out=2.0,
+                origin=ClipOrigin.manual,
+            ),
+        ],
+        asset_transcriptions=[
+            AssetTranscription(
+                asset_id="asset_source",
+                language="it",
+                words=[
+                    AssetTranscriptionWord(
+                        id="word_before",
+                        start=0.5,
+                        end=0.7,
+                        text="prima",
+                    ),
+                    AssetTranscriptionWord(
+                        id="word_old",
+                        start=1.15,
+                        end=1.35,
+                        text="vecchia",
+                    ),
+                    AssetTranscriptionWord(
+                        id="word_after",
+                        start=2.2,
+                        end=2.4,
+                        text="dopo",
+                    ),
+                ],
+                source_lane_id="track_audio_1",
+                source_audio_path="temp/original.wav",
+            )
+        ],
+    )
+
+    updated = store.set_clip_transcription(
+        workspace,
+        project=project,
+        clip_id="clip_audio_1",
+        transcript=TranscriptArtifact(
+            language="it",
+            source="test-clip",
+            segments=[
+                TranscriptSegment(
+                    id="seg_1",
+                    start=0.0,
+                    end=0.52,
+                    text="ciao clip",
+                    words=[
+                        WordTiming(text="ciao", start=0.0, end=0.24, confidence=1.0),
+                        WordTiming(text="clip", start=0.28, end=0.52, confidence=1.0),
+                    ],
+                )
+            ],
+        ),
+        source_audio_path="temp/clip_audio_1_bounce.wav",
+    )
+
+    clip = next(item for item in updated.clips if item.id == "clip_audio_1")
+    words = updated.asset_transcriptions[0].words
+
+    assert clip.transcription_status == LaneTranscriptionStatus.completed
+    assert clip.transcription_source_audio_path == "temp/clip_audio_1_bounce.wav"
+    assert [word.text for word in words] == ["prima", "ciao", "clip", "dopo"]
+    assert [(round(word.start, 2), round(word.end, 2)) for word in words[1:3]] == [
+        (1.0, 1.24),
+        (1.28, 1.52),
+    ]
+    assert [caption.text for caption in updated.captions] == ["ciao", "clip"]
+    assert [round(caption.start, 2) for caption in updated.captions] == [5.0, 5.28]
+
+
+def test_recover_interrupted_runtime_state_marks_lane_and_clip_failed(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    store = EditorialProjectStore(settings)
+    workspace = JobWorkspace(settings.jobs_root, "job_runtime_recovery")
+    workspace.bootstrap()
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        selection=ProjectSelection(),
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(
+                id="track_audio_1",
+                kind=TimelineTrackKind.audio,
+                name="Audio 1",
+                order=1,
+                role=AudioTrackRole.story,
+            ),
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_audio_1",
+                asset_id="asset_source",
+                track_id="track_audio_1",
+                start=0.0,
+                source_in=0.0,
+                source_out=1.0,
+                origin=ClipOrigin.manual,
+                transcription_status=LaneTranscriptionStatus.running,
+            ),
+        ],
+        lane_transcriptions=[
+            LaneTranscription(
+                lane_id="track_audio_1",
+                status=LaneTranscriptionStatus.running,
+            )
+        ],
+    )
+    store.save(workspace, project)
+
+    changed = store.recover_interrupted_runtime_state(workspace, "retry me")
+    recovered = store.load(workspace)
+
+    assert changed is True
+    assert recovered.lane_transcriptions[0].status == LaneTranscriptionStatus.failed
+    assert recovered.lane_transcriptions[0].error == "retry me"
+    assert recovered.clips[0].transcription_status == LaneTranscriptionStatus.failed
+    assert recovered.clips[0].transcription_error == "retry me"
 
 
 def test_normalize_generated_subtitles_upgrades_segment_blocks_to_word_level(tmp_path):

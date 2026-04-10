@@ -866,6 +866,18 @@ export function createClip(
       fade_out_ms: 0,
     },
     captions_enabled: true,
+    transcription_options: {
+      language: null,
+      model: null,
+      beam_size: null,
+      vad_filter: null,
+      use_whisperx: null,
+    },
+    transcription_status: "idle",
+    transcription_message: null,
+    transcription_source_audio_path: null,
+    transcription_updated_at: new Date().toISOString(),
+    transcription_error: null,
   };
 }
 

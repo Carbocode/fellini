@@ -16,7 +16,6 @@ import {
   useJobPolling,
   useJobQuery,
   useRequestAssetPreviewsMutation,
-  useTranscribeLaneMutation,
   useUpdateEditorialProjectMutation,
   useUploadEditorialAssetMutation,
 } from "../api/queries";
@@ -202,6 +201,18 @@ function shouldRequestAnyAssetPreview(asset: ProjectAsset | null | undefined): b
   return needsVideoOriginal || needsVideoCutout || needsAudioOriginal || needsAudioCutout;
 }
 
+function previewRequestKey(
+  asset: ProjectAsset | null | undefined,
+  clip: TimelineClip,
+  trackKind: "video" | "audio",
+): string | null {
+  if (!asset) return null;
+  const variant = trackKind === "video" ? clip.asset_variant ?? "original" : "original";
+  const status = clipPreviewStatus(asset, clip, trackKind);
+  const cutoutPath = variant === "cutout" ? (asset.background_removal?.cutout_path ?? "") : "";
+  return `${asset.id}:${trackKind}:${variant}:${status}:${cutoutPath}`;
+}
+
 function projectShapeFingerprint(project: EditorialProject): string {
   return JSON.stringify({
     assetIds: project.assets.map((asset) => asset.id),
@@ -223,6 +234,8 @@ function mergeRuntimeAssetState(
   incoming: EditorialProject,
 ): EditorialProject {
   const incomingById = new Map(incoming.assets.map((asset) => [asset.id, asset]));
+  const incomingClipById = new Map(incoming.clips.map((clip) => [clip.id, clip]));
+  const incomingLaneById = new Map(incoming.lane_transcriptions.map((lane) => [lane.lane_id, lane]));
   return normalizeEditorialProject({
     ...current,
     revision: incoming.revision,
@@ -243,6 +256,25 @@ function mergeRuntimeAssetState(
         background_removal: nextAsset.background_removal,
       };
     }),
+    clips: current.clips.map((clip) => {
+      const nextClip = incomingClipById.get(clip.id);
+      if (!nextClip) return clip;
+      return {
+        ...clip,
+        transcription_options: nextClip.transcription_options,
+        transcription_status: nextClip.transcription_status,
+        transcription_message: nextClip.transcription_message,
+        transcription_source_audio_path: nextClip.transcription_source_audio_path,
+        transcription_updated_at: nextClip.transcription_updated_at,
+        transcription_error: nextClip.transcription_error,
+      };
+    }),
+    lane_transcriptions: [
+      ...current.lane_transcriptions.map((lane) => incomingLaneById.get(lane.lane_id) ?? lane),
+      ...incoming.lane_transcriptions.filter((lane) => !current.lane_transcriptions.some(
+        (currentLane) => currentLane.lane_id === lane.lane_id,
+      )),
+    ],
   });
 }
 
@@ -2090,8 +2122,7 @@ const TimelinePanel: Component<{
   const job = useJobQuery(selectedJobId);
   const queryClient = useQueryClient();
   const requestAssetPreviews = useRequestAssetPreviewsMutation();
-  const transcribeLaneMut = useTranscribeLaneMutation();
-  const requestedPreviewAssetIds = new Set<string>();
+  const requestedPreviewKeys = new Set<string>();
   const [dragPreview, setDragPreview] = createSignal<{
     assetId: string;
     start: number;
@@ -2107,6 +2138,7 @@ const TimelinePanel: Component<{
   const pxPerSecond = () => BASE_PX_PER_SEC * zoom();
   const [viewportLeft, setViewportLeft] = createSignal(0);
   const [viewportWidth, setViewportWidth] = createSignal(1);
+  const [hoverOffset, setHoverOffset] = createSignal<number | null>(null);
   let zoomWheelAccumulator = 0;
   let zoomWheelResetHandle: ReturnType<typeof setTimeout> | undefined;
   let rulerViewportRef: HTMLDivElement | undefined;
@@ -2136,6 +2168,10 @@ const TimelinePanel: Component<{
   const contentWidth = () => Math.max(timelineWidth(), viewportWidth());
   const toPx = (seconds: number) => seconds * pxPerSecond();
   const pxToSec = (px: number) => Math.max(0, Math.min(duration(), px / pxPerSecond()));
+  const hoverTime = createMemo(() => {
+    const offset = hoverOffset();
+    return offset === null ? null : pxToSec(viewportLeft() + offset);
+  });
   const tracks = createMemo(() => (project() ? sortedTracks(project()!) : []));
   const assetTracks = createMemo(() => tracks().filter((track) => track.kind !== "audio"));
   const audioTracks = createMemo(() => tracks().filter((track) => track.kind === "audio"));
@@ -2148,10 +2184,15 @@ const TimelinePanel: Component<{
       .filter((lane) => lane.status === "running")
       .map((lane) => lane.lane_id),
   ));
+  const runningSubtitleClipIds = createMemo(() => new Set(
+    (project()?.clips ?? [])
+      .filter((clip) => clip.transcription_status === "running")
+      .map((clip) => clip.id),
+  ));
   const pendingSubtitleRanges = createMemo(() => {
     const current = project();
     if (!current) return [];
-    return current.lane_transcriptions.flatMap((lane) => {
+    const lanePending = current.lane_transcriptions.flatMap((lane) => {
       if (lane.status !== "running") return [];
       const range = laneContentRange(current, lane.lane_id);
       if (!range || range.end <= range.start) return [];
@@ -2159,11 +2200,28 @@ const TimelinePanel: Component<{
       return [{
         id: `subtitle_pending_${lane.lane_id}`,
         trackId: lane.lane_id,
+        clipId: null,
         start: range.start,
         end: range.end,
         label: sourceTrack ? `AI TRANSCRIPTION / ${sourceTrack.name}` : "AI TRANSCRIPTION",
       }];
     });
+    const clipPending = current.clips.flatMap((clip) => {
+      const track = getTrack(current, clip.track_id);
+      if (!track || track.kind !== "audio" || !clip.enabled || clip.transcription_status !== "running") {
+        return [];
+      }
+      const asset = assetById(current, clip.asset_id);
+      return [{
+        id: `subtitle_pending_${clip.id}`,
+        trackId: clip.track_id,
+        clipId: clip.id,
+        start: clip.start,
+        end: clip.start + (clip.source_out - clip.source_in),
+        label: asset ? `AI TRANSCRIPTION / ${asset.label}` : "AI TRANSCRIPTION",
+      }];
+    });
+    return [...lanePending, ...clipPending];
   });
   const visibleStandaloneSubtitles = (trackId: string) =>
     trackSubtitles(project()!, trackId).filter((caption) => caption.origin !== "generated");
@@ -2172,7 +2230,9 @@ const TimelinePanel: Component<{
   const generatedTrackSubtitleGroups = (trackId: string) =>
     runningSubtitleLaneIds().has(trackId)
       ? []
-      : generatedSubtitleGroupsForLane(project()!, trackId);
+      : generatedSubtitleGroupsForLane(project()!, trackId).filter((group) => (
+          !group.sourceClipId || !runningSubtitleClipIds().has(group.sourceClipId)
+        ));
   const cancelSubtitleEditing = () => {
     setEditingSubtitleId(null);
     setEditingSubtitleText("");
@@ -2217,29 +2277,6 @@ const TimelinePanel: Component<{
         track.id === trackId ? { ...track, ...patch } : track
       )),
     }));
-  };
-  const laneClipCount = (trackId: string) => (project() ? trackClips(project()!, trackId).length : 0);
-  const laneTranscriptionStatus = (trackId: string) =>
-    project()?.lane_transcriptions.find((lane) => lane.lane_id === trackId)?.status ?? "idle";
-  const canTranscribeLane = (track: TimelineTrack) =>
-    track.kind === "audio"
-    && !!selectedJobId()
-    && !!job.data
-    && job.data.status !== "running"
-    && laneClipCount(track.id) > 0
-    && laneTranscriptionStatus(track.id) !== "running";
-  const triggerLaneSubtitles = (trackId: string) => {
-    const jobId = selectedJobId();
-    if (!jobId) return;
-    transcribeLaneMut.mutate({ jobId, laneId: trackId });
-  };
-  const subtitleButtonTitle = (trackId: string) => {
-    const status = laneTranscriptionStatus(trackId);
-    if (laneClipCount(trackId) <= 0) return "Lane vuota";
-    if (status === "running") return "Generazione sottotitoli in corso";
-    if (status === "completed") return "Rigenera i sottotitoli per questa lane";
-    if (status === "failed") return "Riprova a generare i sottotitoli per questa lane";
-    return "Genera sottotitoli da questa lane audio";
   };
   const viewportFrac = createMemo(() => {
     const visible = Math.min(viewportWidth(), contentWidth());
@@ -2348,10 +2385,10 @@ const TimelinePanel: Component<{
   );
   const visiblePreviewState = createMemo(() => {
     const current = project();
-    if (!current) return { assetIds: [] as string[], hasGenerating: false };
+    if (!current) return { requests: [] as Array<{ assetId: string; key: string }>, hasGenerating: false };
     const visibleStart = viewportLeft();
     const visibleEnd = visibleStart + viewportWidth();
-    const nextIds = new Set<string>();
+    const nextRequests = new Map<string, string>();
     let hasGenerating = false;
 
     for (const track of [...assetTracks(), ...audioTracks()]) {
@@ -2364,12 +2401,18 @@ const TimelinePanel: Component<{
         if (clipRight < visibleStart || clipLeft > visibleEnd) continue;
         const asset = assetById(current, clip.asset_id);
         if (!asset) continue;
-        if (shouldRequestClipPreview(asset, clip, previewKind)) nextIds.add(asset.id);
+        if (shouldRequestClipPreview(asset, clip, previewKind)) {
+          const key = previewRequestKey(asset, clip, previewKind);
+          if (key) nextRequests.set(key, asset.id);
+        }
         if (hasGeneratingClipPreview(asset, clip, previewKind)) hasGenerating = true;
       }
     }
 
-    return { assetIds: [...nextIds], hasGenerating };
+    return {
+      requests: [...nextRequests.entries()].map(([key, assetId]) => ({ assetId, key })),
+      hasGenerating,
+    };
   });
   const horizontalViewports = () =>
     [rulerViewportRef, assetViewportRef, audioViewportRef].filter(Boolean) as HTMLDivElement[];
@@ -2453,6 +2496,16 @@ const TimelinePanel: Component<{
     const rect = (rulerInnerRef ?? assetInnerRef ?? audioInnerRef)?.getBoundingClientRect();
     if (!rect) return 0;
     return pxToSec(clientX - rect.left);
+  };
+  const updateTimelineHover = (event: PointerEvent) => {
+    const viewport = (event.target as Element | null)?.closest(".timeline-ruler-viewport, .timeline-viewport");
+    if (!(viewport instanceof HTMLDivElement)) {
+      setHoverOffset(null);
+      return;
+    }
+    const rect = viewport.getBoundingClientRect();
+    const nextOffset = Math.max(0, Math.min(viewport.clientWidth, event.clientX - rect.left));
+    setHoverOffset(nextOffset);
   };
   const trackGroupOffset = (kind: "video" | "audio") => {
     const inner = kind === "audio" ? audioInnerRef : assetInnerRef;
@@ -2622,6 +2675,54 @@ const TimelinePanel: Component<{
     document.body.style.userSelect = "none";
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onUp);
+  };
+
+  const beginTrackViewportPan = (event: PointerEvent, track: TimelineTrack) => {
+    if (event.button !== 0 || event.target !== event.currentTarget) return;
+    const viewport = track.kind === "audio" ? audioViewportRef : assetViewportRef;
+    const target = event.currentTarget as HTMLDivElement | null;
+    if (!viewport || !target) return;
+    event.preventDefault();
+
+    const pointerId = event.pointerId;
+    const group = track.kind === "audio" ? "audio" : "asset";
+    const originLeft = viewport.scrollLeft;
+    const originTop = viewport.scrollTop;
+    const startX = event.clientX;
+    const startY = event.clientY;
+
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      target.classList.remove("is-panning");
+      if (target.hasPointerCapture?.(pointerId)) target.releasePointerCapture(pointerId);
+    };
+
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      const nextLeft = Math.max(0, originLeft - (moveEvent.clientX - startX));
+      const nextTop = Math.max(0, originTop - (moveEvent.clientY - startY));
+      if (Math.abs(viewport.scrollLeft - nextLeft) > 0.5) viewport.scrollLeft = nextLeft;
+      if (Math.abs(viewport.scrollTop - nextTop) > 0.5) viewport.scrollTop = nextTop;
+      syncHorizontalScroll(viewport);
+      syncMirroredVerticalScroll(group, viewport);
+    };
+
+    const onUp = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      cleanup();
+    };
+
+    target.classList.add("is-panning");
+    target.setPointerCapture?.(pointerId);
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
   };
 
   const beginClipDrag = (event: PointerEvent, clip: TimelineClip) => {
@@ -2909,16 +3010,6 @@ const TimelinePanel: Component<{
           <div class="tl-lane-actions">
             <button
               type="button"
-              class={`tl-lane-btn tl-lane-btn--icon tl-lane-btn--subtitle${laneTranscriptionStatus(track.id) === "completed" ? " is-active" : ""}${laneTranscriptionStatus(track.id) === "running" ? " is-running" : ""}`}
-              disabled={!canTranscribeLane(track)}
-              aria-label={subtitleButtonTitle(track.id)}
-              title={subtitleButtonTitle(track.id)}
-              onClick={() => triggerLaneSubtitles(track.id)}
-            >
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="14" height="10" rx="2"/><path d="M4 8h3M9 8h3M4 10.5h5"/></svg>
-            </button>
-            <button
-              type="button"
               class={`tl-lane-btn tl-lane-btn--mute${track.muted ? " is-active" : ""}`}
               title={track.muted ? "Riattiva audio lane" : "Metti in muto la lane"}
               onClick={() => updateTrack(track.id, { muted: !track.muted })}
@@ -2960,7 +3051,15 @@ const TimelinePanel: Component<{
         if (group.sourceClipId) splitAudioClipIds.add(group.sourceClipId);
       }
       if (pendingRanges.length) {
-        for (const clip of trackClips(project()!, track.id)) splitAudioClipIds.add(clip.id);
+        const pendingClipIds = pendingRanges
+          .map((pending) => pending.clipId)
+          .filter((clipId): clipId is string => Boolean(clipId));
+        if (pendingClipIds.length) {
+          for (const clipId of pendingClipIds) splitAudioClipIds.add(clipId);
+        }
+        if (pendingRanges.some((pending) => !pending.clipId)) {
+          for (const clip of trackClips(project()!, track.id)) splitAudioClipIds.add(clip.id);
+        }
       }
     }
     const hasAudioSubtitleBand = pendingRanges.length > 0 || generatedGroups.length > 0;
@@ -2968,6 +3067,7 @@ const TimelinePanel: Component<{
     <div
       class={`tl-track tl-track--project tl-track--${track.kind}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}`}
       style={{ height: `${trackHeight(track.kind)}px` }}
+      onPointerDown={(event) => beginTrackViewportPan(event, track)}
       onDragOver={(e) => {
         e.preventDefault();
         e.dataTransfer!.dropEffect = "copy";
@@ -3168,7 +3268,7 @@ const TimelinePanel: Component<{
     on(
       () => selectedJobId(),
       () => {
-        requestedPreviewAssetIds.clear();
+        requestedPreviewKeys.clear();
       },
     ),
   );
@@ -3184,11 +3284,12 @@ const TimelinePanel: Component<{
   createEffect(() => {
     const jobId = selectedJobId();
     if (!jobId || !project() || job.data?.status === "running") return;
-    const nextAssetIds = visiblePreviewState().assetIds.filter(
-      (assetId) => !requestedPreviewAssetIds.has(assetId),
+    const nextRequests = visiblePreviewState().requests.filter(
+      (request) => !requestedPreviewKeys.has(request.key),
     );
+    const nextAssetIds = [...new Set(nextRequests.map((request) => request.assetId))];
     if (!nextAssetIds.length) return;
-    nextAssetIds.forEach((assetId) => requestedPreviewAssetIds.add(assetId));
+    nextRequests.forEach((request) => requestedPreviewKeys.add(request.key));
     requestAssetPreviews.mutate({ jobId, assetIds: nextAssetIds });
   });
   createEffect(() => {
@@ -3223,6 +3324,11 @@ const TimelinePanel: Component<{
       <div class="panel-header">
         <span class="panel-title">Timeline</span>
         <div class="timeline-toolbar">
+          <Show when={hoverTime() !== null}>
+            <span class="timeline-zoom-label" style={{ "min-width": "96px" }}>
+              Cursor {fmtTimePrecise(hoverTime()!)}
+            </span>
+          </Show>
           <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
           <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
             Follow
@@ -3245,7 +3351,12 @@ const TimelinePanel: Component<{
         </div>
       </div>
       <Show when={project()} fallback={<div class="placeholder">Timeline non disponibile</div>}>
-        <div class="timeline-shell">
+        <div
+          class="timeline-shell"
+          onPointerEnter={updateTimelineHover}
+          onPointerMove={updateTimelineHover}
+          onPointerLeave={() => setHoverOffset(null)}
+        >
           <div class="timeline-body">
             <div class="tl-label tl-label--ruler" />
             <div
@@ -3259,6 +3370,9 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner"
                 style={{ width: `${contentWidth()}px` }}
               >
+                <Show when={hoverTime() !== null}>
+                  <div class="tl-hover-line tl-hover-line--ruler" style={{ left: `${toPx(hoverTime()!)}px` }} />
+                </Show>
                 <div class="tl-playhead tl-playhead--ruler" style={{ left: `${toPx(playheadTime())}px` }} />
                 <div class="tl-ruler" onPointerDown={beginRulerScrub}>
                   <For each={rulerTicks()}>
@@ -3301,6 +3415,9 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner timeline-scroll-inner--assets"
                 style={{ width: `${contentWidth()}px` }}
               >
+                <Show when={hoverTime() !== null}>
+                  <div class="tl-hover-line tl-hover-line--body" style={{ left: `${toPx(hoverTime()!)}px` }} />
+                </Show>
                 <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
                 <For each={assetTracks()}>{renderTrackRow}</For>
               </div>
@@ -3332,6 +3449,9 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner timeline-scroll-inner--audio"
                 style={{ width: `${contentWidth()}px` }}
               >
+                <Show when={hoverTime() !== null}>
+                  <div class="tl-hover-line tl-hover-line--body" style={{ left: `${toPx(hoverTime()!)}px` }} />
+                </Show>
                 <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
                 <For each={audioTracks()}>{renderTrackRow}</For>
               </div>

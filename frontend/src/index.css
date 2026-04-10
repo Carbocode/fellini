@@ -1491,17 +1491,23 @@ textarea { resize: vertical; min-height: 36px; }
   width: 0;
   height: 0;
 }
-.timeline-viewport--group { height: 100%; min-height: 0; }
+.timeline-viewport--group {
+  height: 100%;
+  min-height: 0;
+  background: #000;
+}
 .timeline-viewport--assets { grid-column: 2; grid-row: 2; }
 .timeline-viewport--audio { grid-column: 2; grid-row: 3; border-top: 2px solid #222; }
 .timeline-scroll-inner { position: relative; min-width: 100%; padding-bottom: 0; }
 .timeline-scroll-inner--assets {
+  background: #000;
   min-height: 100%;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
 }
 .timeline-scroll-inner--audio {
+  background: #000;
   min-height: 100%;
   display: flex;
   flex-direction: column;
@@ -1525,27 +1531,17 @@ textarea { resize: vertical; min-height: 36px; }
 .tl-track--align-words { height: 28px; }
 .tl-track--captions { height: 24px; }
 .tl-track--cuts { height: 16px; }
-.tl-track--project { background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0)); }
+.tl-track--project {
+  background: linear-gradient(180deg, rgba(255,255,255,0.015), rgba(255,255,255,0)), #111;
+  cursor: grab;
+}
+.tl-track--project.is-panning { cursor: grabbing; }
 .tl-track--video { height: 64px; }
 .tl-track--audio {
   height: 64px;
-  --tl-audio-band-gap: 0.5px;
+  --tl-audio-band-gap: 0px;
   --tl-audio-subtitle-height: 30%;
   --tl-audio-clip-height: calc(100% - var(--tl-audio-subtitle-height));
-}
-.tl-track--audio::before {
-  display: none;
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: var(--tl-audio-clip-height);
-  border-top: 1px solid rgba(255,255,255,0.06);
-  pointer-events: none;
-  z-index: 1;
-}
-.tl-track--audio.has-audio-subtitles::before {
-  display: block;
 }
 .tl-track--subtitle { height: 64px; }
 .tl-audio-subtitle-band {
@@ -1584,9 +1580,24 @@ textarea { resize: vertical; min-height: 36px; }
 /* Segments */
 .tl-seg { position: absolute; display: flex; align-items: center; justify-content: center; border-radius: 6px; overflow: hidden; cursor: default; transition: opacity 80ms, filter 80ms, box-shadow 80ms, border-color 80ms; }
 .tl-seg:hover { filter: brightness(1.3); }
+.tl-seg--clip:hover { filter: none; }
 .tl-seg span { font-size: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; }
 
 /* Playhead */
+.tl-hover-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255,255,255,0.88);
+  box-shadow:
+    0 0 0 1px rgba(255,255,255,0.08),
+    0 0 10px rgba(255,255,255,0.16);
+  pointer-events: none;
+  z-index: 8;
+}
+.tl-hover-line--ruler { z-index: 8; }
+.tl-hover-line--body { z-index: 8; }
 .tl-playhead {
   position: absolute;
   top: 0;
@@ -1945,9 +1956,6 @@ textarea { resize: vertical; min-height: 36px; }
   opacity: 0;
   transition: opacity 80ms, box-shadow 80ms, background-color 80ms;
 }
-.tl-seg--clip:hover .tl-clip-handle,
-.tl-seg--clip.is-active .tl-clip-handle,
-.tl-clip-handle:hover,
 .tl-seg--subtitle:hover .tl-subtitle-handle,
 .tl-seg--subtitle.is-active .tl-subtitle-handle,
 .tl-subtitle-handle:hover { opacity: 1; }
@@ -1969,17 +1977,12 @@ textarea { resize: vertical; min-height: 36px; }
   --tl-handle-line: rgba(139,231,164,0.92);
   --tl-handle-glow: rgba(139,231,164,0.34);
 }
-.tl-seg--clip:hover .tl-clip-handle::after,
-.tl-seg--clip.is-active .tl-clip-handle::after,
-.tl-clip-handle:hover::after,
 .tl-seg--subtitle:hover .tl-subtitle-handle::after,
 .tl-seg--subtitle.is-active .tl-subtitle-handle::after,
 .tl-subtitle-handle:hover::after {
   opacity: 0.92;
   box-shadow: 0 0 6px var(--tl-handle-glow);
 }
-.tl-clip-handle--start:hover::after,
-.tl-clip-handle--end:hover::after,
 .tl-subtitle-handle--start:hover::after,
 .tl-subtitle-handle--end:hover::after {
   opacity: 1;
@@ -2096,6 +2099,82 @@ textarea { resize: vertical; min-height: 36px; }
   margin-bottom: 10px;
   background: rgba(255,255,255,0.02);
 }
+.inspector-accordion-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.inspector-accordion-stack + .inspector-accordion-stack { margin-top: 8px; }
+.inspector-accordion {
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: var(--radius);
+  background: rgba(0,0,0,0.18);
+  overflow: hidden;
+}
+.inspector-accordion-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.inspector-accordion-summary::-webkit-details-marker { display: none; }
+.inspector-accordion-summary:hover { background: rgba(255,255,255,0.03); }
+.inspector-accordion-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.inspector-accordion-symbol {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(115,227,255,0.1);
+  color: var(--accent);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+.inspector-accordion-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.inspector-accordion-title {
+  font-size: 10px;
+  color: var(--text-bright);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.inspector-accordion-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inspector-accordion-caret {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  transition: transform 120ms ease, color 120ms ease;
+}
+.inspector-accordion[open] .inspector-accordion-caret {
+  transform: rotate(90deg);
+  color: var(--text-bright);
+}
+.inspector-accordion-body {
+  padding: 8px 10px 10px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
 .inspector-card-title {
   font-size: 10px;
   color: var(--text-dim);
@@ -2123,6 +2202,9 @@ textarea { resize: vertical; min-height: 36px; }
   align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
+}
+.inspector-accordion-body .inspector-card-actions {
+  margin-bottom: 0;
 }
 .inspector-segmented {
   display: inline-flex;

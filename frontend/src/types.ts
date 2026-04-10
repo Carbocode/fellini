@@ -140,6 +140,14 @@ export interface ClipAudio {
   fade_out_ms: number;
 }
 
+export interface ClipTranscriptionOptions {
+  language: string | null;
+  model: string | null;
+  beam_size: number | null;
+  vad_filter: boolean | null;
+  use_whisperx: boolean | null;
+}
+
 export interface AssetPreviewEntry {
   status: AssetPreviewStatus;
   resource_path: string | null;
@@ -167,8 +175,6 @@ export interface AssetBackgroundRemoval {
   error: string | null;
   original_path: string | null;
   cutout_path: string | null;
-  alpha_path: string | null;
-  compare_path: string | null;
   benchmark_path: string | null;
   progress_path: string | null;
   updated_at: string;
@@ -218,6 +224,12 @@ export interface TimelineClip {
   transform: ClipTransform;
   audio: ClipAudio;
   captions_enabled: boolean;
+  transcription_options: ClipTranscriptionOptions;
+  transcription_status: LaneTranscriptionStatus;
+  transcription_message: string | null;
+  transcription_source_audio_path: string | null;
+  transcription_updated_at: string;
+  transcription_error: string | null;
 }
 
 export interface SourceWordRef {
@@ -311,7 +323,7 @@ export interface EditorialProject {
   updated_at: string;
 }
 
-export interface LaneTranscriptionResponse {
+export interface TranscriptionResponse {
   job: JobSnapshot;
   project: EditorialProject;
 }

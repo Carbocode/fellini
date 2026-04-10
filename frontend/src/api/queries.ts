@@ -5,7 +5,7 @@ import {
 } from "@tanstack/solid-query";
 import type { Accessor } from "solid-js";
 import * as api from "./client";
-import type { EditorialProject, JobSnapshot } from "../types";
+import type { ClipTranscriptionOptions, EditorialProject, JobSnapshot } from "../types";
 import { normalizeEditorialProject } from "../lib/editorial";
 
 function syncJobSnapshot(qc: ReturnType<typeof useQueryClient>, snapshot: JobSnapshot) {
@@ -229,6 +229,73 @@ export function useTranscribeLaneMutation() {
     },
     mutationFn: (vars: { jobId: string; laneId: string }) =>
       api.transcribeAudioLane(vars.jobId, vars.laneId),
+    onSuccess: (payload, vars) => {
+      syncJobSnapshot(qc, payload.job);
+      qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(payload.project));
+      qc.invalidateQueries({ queryKey: ["artifact", vars.jobId] });
+    },
+    onError: (_error, vars) => {
+      qc.invalidateQueries({ queryKey: ["job", vars.jobId] });
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      qc.invalidateQueries({ queryKey: ["editorial-project", vars.jobId] });
+    },
+  }));
+}
+
+export function useTranscribeClipMutation() {
+  const qc = useQueryClient();
+  return createMutation(() => ({
+    onMutate: async (vars) => {
+      const projectQueryKey = ["editorial-project", vars.jobId] as const;
+      const previousProject = qc.getQueryData<EditorialProject>(projectQueryKey) ?? null;
+      const previousJob = qc.getQueryData<JobSnapshot>(["job", vars.jobId]) ?? null;
+
+      if (previousJob) {
+        const nextJob: JobSnapshot = {
+          ...previousJob,
+          status: "running",
+          current_step: "transcription",
+          steps: previousJob.steps.map((step) =>
+            step.name === "transcription"
+              ? {
+                  ...step,
+                  status: "running",
+                  progress: Math.max(step.progress, 1),
+                  message: "Trascrizione della clip in corso",
+                  started_at: step.started_at ?? new Date().toISOString(),
+                  finished_at: null,
+                }
+              : step
+          ),
+        };
+        syncJobSnapshot(qc, nextJob);
+      }
+
+      if (!previousProject) {
+        return { previousProject, previousJob, projectQueryKey };
+      }
+
+      const nextProject = normalizeEditorialProject({
+        ...previousProject,
+        clips: previousProject.clips.map((clip) => (
+          clip.id === vars.clipId
+            ? {
+                ...clip,
+                transcription_options: vars.options ?? clip.transcription_options,
+                transcription_status: "running",
+                transcription_message: "Trascrizione in corso",
+                transcription_source_audio_path: null,
+                transcription_updated_at: new Date().toISOString(),
+                transcription_error: null,
+              }
+            : clip
+        )),
+      });
+      qc.setQueryData(projectQueryKey, nextProject);
+      return { previousProject, previousJob, projectQueryKey };
+    },
+    mutationFn: (vars: { jobId: string; clipId: string; options?: ClipTranscriptionOptions }) =>
+      api.transcribeAudioClip(vars.jobId, vars.clipId, vars.options),
     onSuccess: (payload, vars) => {
       syncJobSnapshot(qc, payload.job);
       qc.setQueryData(["editorial-project", vars.jobId], normalizeEditorialProject(payload.project));

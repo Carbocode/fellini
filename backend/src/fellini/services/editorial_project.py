@@ -10,6 +10,7 @@ from fellini.domain.models import (
     AssetTranscription,
     AssetTranscriptionWord,
     AudioTrackRole,
+    ClipTranscriptionOptions,
     ClipOrigin,
     EditorialProject,
     InputAsset,
@@ -152,6 +153,37 @@ class EditorialProjectStore:
                 raise ValueError(msg)
         return self.save(workspace, project)
 
+    def recover_interrupted_runtime_state(
+        self,
+        workspace: JobWorkspace,
+        message: str,
+    ) -> bool:
+        if not self.exists(workspace):
+            return False
+
+        project = self.load(workspace)
+        changed = False
+        for lane in project.lane_transcriptions:
+            if lane.status != LaneTranscriptionStatus.running:
+                continue
+            lane.status = LaneTranscriptionStatus.failed
+            lane.error = message
+            lane.updated_at = utcnow()
+            changed = True
+
+        for clip in project.clips:
+            if clip.transcription_status != LaneTranscriptionStatus.running:
+                continue
+            clip.transcription_status = LaneTranscriptionStatus.failed
+            clip.transcription_message = None
+            clip.transcription_error = message
+            clip.transcription_updated_at = utcnow()
+            changed = True
+
+        if changed:
+            self.save(workspace, project)
+        return changed
+
     def ensure(self, context: PipelineContext) -> EditorialProject:
         workspace = context.workspace
         if self.exists(workspace):
@@ -233,6 +265,77 @@ class EditorialProjectStore:
         )
         project, _ = self._normalize_generated_subtitles(project)
         return self.save(workspace, project)
+
+    def set_clip_transcription_running(
+        self,
+        workspace: JobWorkspace,
+        *,
+        project: EditorialProject,
+        clip_id: str,
+        options: ClipTranscriptionOptions | None = None,
+    ) -> EditorialProject:
+        updated = project.model_copy(deep=True)
+        clip = next((item for item in updated.clips if item.id == clip_id), None)
+        if clip is None:
+            msg = f"Clip {clip_id} was not found."
+            raise ValueError(msg)
+        if options is not None:
+            clip.transcription_options = options
+        clip.transcription_status = LaneTranscriptionStatus.running
+        clip.transcription_message = "Trascrizione in corso"
+        clip.transcription_source_audio_path = None
+        clip.transcription_updated_at = utcnow()
+        clip.transcription_error = None
+        return self.save(workspace, updated)
+
+    def set_clip_transcription_failed(
+        self,
+        workspace: JobWorkspace,
+        *,
+        project: EditorialProject,
+        clip_id: str,
+        error: str,
+    ) -> EditorialProject:
+        updated = project.model_copy(deep=True)
+        clip = next((item for item in updated.clips if item.id == clip_id), None)
+        if clip is None:
+            msg = f"Clip {clip_id} was not found."
+            raise ValueError(msg)
+        clip.transcription_status = LaneTranscriptionStatus.failed
+        clip.transcription_message = None
+        clip.transcription_updated_at = utcnow()
+        clip.transcription_error = error
+        return self.save(workspace, updated)
+
+    def set_clip_transcription(
+        self,
+        workspace: JobWorkspace,
+        *,
+        project: EditorialProject,
+        clip_id: str,
+        transcript: TranscriptArtifact,
+        source_audio_path: str,
+        message: str | None = None,
+    ) -> EditorialProject:
+        updated = project.model_copy(deep=True)
+        clip = next((item for item in updated.clips if item.id == clip_id), None)
+        if clip is None:
+            msg = f"Clip {clip_id} was not found."
+            raise ValueError(msg)
+
+        self._merge_asset_transcription_for_clip(
+            updated,
+            clip,
+            transcript,
+            source_audio_path=source_audio_path,
+        )
+        clip.transcription_status = LaneTranscriptionStatus.completed
+        clip.transcription_message = message
+        clip.transcription_source_audio_path = source_audio_path
+        clip.transcription_updated_at = utcnow()
+        clip.transcription_error = None
+        updated, _ = self._normalize_generated_subtitles(updated)
+        return self.save(workspace, updated)
 
     def story_lane(self, project: EditorialProject) -> TimelineTrack | None:
         audio_tracks = [track for track in project.tracks if track.kind == TimelineTrackKind.audio]
@@ -701,6 +804,29 @@ class EditorialProjectStore:
             source_word_refs=source_word_refs,
         )
 
+    def _asset_word_from_clip_range(
+        self,
+        clip: TimelineClip,
+        *,
+        text: str,
+        start: float,
+        end: float,
+        source_word_refs: list[SourceWordRef],
+    ) -> AssetTranscriptionWord:
+        asset_start = max(0.0, clip.source_in + max(0.0, start))
+        clip_asset_end = max(clip.source_in + 0.02, clip.source_out)
+        asset_start = min(asset_start, max(clip.source_in, clip_asset_end - 0.02))
+        asset_end = max(asset_start + 0.02, clip.source_in + max(start + 0.02, end))
+        asset_end = min(asset_end, clip_asset_end)
+        asset_end = max(asset_end, min(clip_asset_end, asset_start + 0.02))
+        return AssetTranscriptionWord(
+            id=self._asset_word_id(clip.asset_id, asset_start, asset_end, text),
+            start=asset_start,
+            end=asset_end,
+            text=text,
+            source_word_refs=source_word_refs,
+        )
+
     def _ranges_intersect(
         self,
         left_start: float,
@@ -872,6 +998,94 @@ class EditorialProjectStore:
             if asset.id in next_words_by_asset:
                 asset.transcript_ref = asset.id
         return True
+
+    def _merge_asset_transcription_for_clip(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+        transcript: TranscriptArtifact,
+        *,
+        source_audio_path: str | None,
+    ) -> None:
+        touched_start = clip.source_in
+        touched_end = max(clip.source_in + 0.02, clip.source_out)
+        next_words: dict[str, AssetTranscriptionWord] = {}
+
+        for segment_index, segment in enumerate(transcript.segments):
+            if segment.words:
+                for word_index, word in enumerate(segment.words):
+                    asset_word = self._asset_word_from_clip_range(
+                        clip,
+                        text=word.text,
+                        start=word.start,
+                        end=max(word.end, word.start + 0.02),
+                        source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=word_index)],
+                    )
+                    next_words[asset_word.id] = asset_word
+                continue
+
+            asset_word = self._asset_word_from_clip_range(
+                clip,
+                text=segment.text,
+                start=segment.start,
+                end=max(segment.end, segment.start + 0.02),
+                source_word_refs=[SourceWordRef(segment_id=segment.id, word_index=segment_index)],
+            )
+            next_words[asset_word.id] = asset_word
+
+        updated_asset_transcriptions: list[AssetTranscription] = []
+        asset_entry_written = False
+        for item in project.asset_transcriptions:
+            if item.asset_id != clip.asset_id:
+                updated_asset_transcriptions.append(item)
+                continue
+
+            preserved = [
+                word
+                for word in item.words
+                if not self._ranges_intersect(word.start, word.end, touched_start, touched_end)
+            ]
+            merged_words = sorted(
+                [*preserved, *next_words.values()],
+                key=lambda word: (word.start, word.end, word.text, word.id),
+            )
+            if merged_words:
+                updated_asset_transcriptions.append(
+                    item.model_copy(
+                        update={
+                            "language": transcript.language,
+                            "words": merged_words,
+                            "source_lane_id": clip.track_id,
+                            "source_audio_path": source_audio_path,
+                            "updated_at": utcnow(),
+                            "error": None,
+                        },
+                        deep=True,
+                    )
+                )
+                asset_entry_written = True
+            continue
+
+        if next_words and not asset_entry_written:
+            updated_asset_transcriptions.append(
+                AssetTranscription(
+                    asset_id=clip.asset_id,
+                    language=transcript.language,
+                    words=sorted(next_words.values(), key=lambda word: (word.start, word.end, word.text, word.id)),
+                    source_lane_id=clip.track_id,
+                    source_audio_path=source_audio_path,
+                    error=None,
+                )
+            )
+
+        project.asset_transcriptions = updated_asset_transcriptions
+        for asset in project.assets:
+            if asset.id != clip.asset_id:
+                continue
+            asset.transcript_ref = asset.id if any(
+                item.asset_id == clip.asset_id and item.words for item in updated_asset_transcriptions
+            ) else None
+            break
 
     def _materialized_generated_subtitle_blocks(
         self,

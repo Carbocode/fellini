@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -13,13 +14,18 @@ import time
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import numpy as np
-from PIL import Image, ImageColor, ImageDraw
-
+from PIL import Image, ImageDraw
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = BACKEND_ROOT.parent
+DEFAULT_CHECKPOINT_URL = "https://github.com/pq-yang/MatAnyone2/releases/download/v1.0.0/matanyone2.pth"
+DEFAULT_MATANYONE_REPO_URL = "https://github.com/pq-yang/MatAnyone2.git"
+DEFAULT_MATANYONE_REF = "main"
+DEFAULT_VIDEO_ENCODERS = ("libx264", "libopenh264", "mpeg4")
 
 
 def require_executable(name: str) -> None:
@@ -62,7 +68,7 @@ def find_missing_modules(*, require_sam2: bool) -> list[str]:
     return missing
 
 
-def resolve_matanyone_root(cli_value: str | None) -> Path:
+def _matanyone_root_candidates(cli_value: str | None) -> list[Path]:
     candidates: list[Path] = []
     if cli_value:
         candidates.append(Path(cli_value).expanduser())
@@ -77,6 +83,19 @@ def resolve_matanyone_root(cli_value: str | None) -> Path:
             REPO_ROOT / "third_party" / "MatAnyone",
         ]
     )
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        deduped.append(resolved)
+        seen.add(resolved)
+    return deduped
+
+
+def resolve_matanyone_root(cli_value: str | None) -> Path:
+    candidates = _matanyone_root_candidates(cli_value)
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
@@ -86,6 +105,77 @@ def resolve_matanyone_root(cli_value: str | None) -> Path:
         "Clone it locally and pass --matanyone-root or set MATANYONE_ROOT.\n"
         f"Searched:\n{searched}"
     )
+
+
+def ensure_matanyone_root(
+    cli_value: str | None,
+    *,
+    progress_path: Path | None = None,
+    repo_url: str = DEFAULT_MATANYONE_REPO_URL,
+    repo_ref: str = DEFAULT_MATANYONE_REF,
+) -> Path:
+    candidates = _matanyone_root_candidates(cli_value)
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            resolve_inference_script(candidate)
+            return candidate
+        except SystemExit:
+            if cli_value and candidate != Path(cli_value).expanduser().resolve():
+                continue
+            print(f"matanyone_invalid_checkout: {candidate}")
+
+    require_executable("git")
+    target = (
+        Path(cli_value).expanduser().resolve()
+        if cli_value
+        else (BACKEND_ROOT / "third_party" / "MatAnyone2").resolve()
+    )
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target = target.with_name(f"{target.name}.clone-{os.getpid()}")
+    if temp_target.exists():
+        shutil.rmtree(temp_target)
+
+    print(f"matanyone_missing: {target}")
+    print(f"matanyone_repo_url: {repo_url}")
+    print(f"matanyone_ref: {repo_ref}")
+    if progress_path is not None:
+        write_progress(
+            progress_path,
+            phase="cloning_matanyone",
+            message="Cloning MatAnyone2 repository for the first run.",
+        )
+
+    try:
+        run_command(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                repo_ref,
+                repo_url,
+                str(temp_target),
+            ]
+        )
+        temp_target.replace(target)
+    except Exception:
+        if temp_target.exists():
+            shutil.rmtree(temp_target, ignore_errors=True)
+        raise
+
+    print(f"matanyone_ready: {target}")
+    if progress_path is not None:
+        write_progress(
+            progress_path,
+            phase="cloning_matanyone",
+            message="MatAnyone2 repository ready.",
+        )
+    return target
 
 
 def resolve_inference_script(matanyone_root: Path) -> Path:
@@ -100,6 +190,63 @@ def resolve_inference_script(matanyone_root: Path) -> Path:
         "Could not find an official inference entrypoint in the MatAnyone checkout.\n"
         f"Checked:\n- {candidates[0]}\n- {candidates[1]}"
     )
+
+
+def inference_supports_progress_path(inference_script: Path) -> bool:
+    try:
+        contents = inference_script.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return "--progress_path" in contents
+
+
+def available_video_encoders() -> set[str]:
+    command = ["ffmpeg", "-hide_banner", "-encoders"]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        msg = completed.stderr.strip() or completed.stdout.strip() or "ffmpeg -encoders failed."
+        raise SystemExit(msg)
+
+    encoders: set[str] = set()
+    pattern = re.compile(r"^\s*[A-Z\.]{6}\s+([^\s]+)")
+    for line in completed.stdout.splitlines():
+        match = pattern.match(line)
+        if match:
+            encoders.add(match.group(1))
+    return encoders
+
+
+def resolve_video_encoder(preferred: str) -> str:
+    available = available_video_encoders()
+    candidates = [preferred]
+    candidates.extend(codec for codec in DEFAULT_VIDEO_ENCODERS if codec != preferred)
+    for codec in candidates:
+        if codec in available:
+            return codec
+    raise SystemExit(f"No supported FFmpeg video encoder is available. Tried: {', '.join(candidates)}")
+
+
+def fallback_bitrate(width: int, height: int) -> str:
+    pixels = width * height
+    if pixels >= 1080 * 1920:
+        return "8M"
+    if pixels >= 1280 * 720:
+        return "4M"
+    return "2M"
+
+
+def video_encode_args(codec: str, *, fallback_rate: str) -> list[str]:
+    args = ["-c:v", codec, "-pix_fmt", "yuv420p"]
+    if codec == "libx264":
+        args.extend(["-preset", "veryfast", "-crf", "18"])
+        return args
+    if codec == "libopenh264":
+        args.extend(["-profile:v", "high", "-b:v", fallback_rate])
+        return args
+    if codec == "mpeg4":
+        args.extend(["-q:v", "2"])
+        return args
+    return args
 
 
 def ffprobe_stream_info(video_path: Path) -> dict[str, object]:
@@ -177,6 +324,96 @@ def write_progress(progress_path: Path, *, phase: str, message: str, status: str
     progress_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def resolve_checkpoint_path(raw_path: str) -> Path:
+    checkpoint_path = Path(raw_path)
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = (REPO_ROOT / checkpoint_path).resolve()
+    return checkpoint_path
+
+
+def _format_download_size(num_bytes: int) -> str:
+    size_mib = num_bytes / (1024 * 1024)
+    if size_mib >= 1024:
+        return f"{(size_mib / 1024):.2f} GiB"
+    return f"{size_mib:.1f} MiB"
+
+
+def ensure_checkpoint(
+    checkpoint_path: Path,
+    *,
+    progress_path: Path | None = None,
+    checkpoint_url: str = DEFAULT_CHECKPOINT_URL,
+) -> Path:
+    if checkpoint_path.exists():
+        return checkpoint_path
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = checkpoint_path.with_name(f"{checkpoint_path.name}.download-{os.getpid()}")
+    print(f"checkpoint_missing: {checkpoint_path}")
+    print(f"checkpoint_download_url: {checkpoint_url}")
+
+    if progress_path is not None:
+        write_progress(
+            progress_path,
+            phase="loading_checkpoint",
+            message="Downloading MatAnyone2 checkpoint for the first run.",
+        )
+
+    try:
+        request = urllib_request.Request(checkpoint_url, headers={"User-Agent": "Fellini/0.1"})
+        with urllib_request.urlopen(request, timeout=60) as response, temp_path.open("wb") as handle:
+            content_length = response.headers.get("Content-Length")
+            total_bytes = int(content_length) if content_length and content_length.isdigit() else None
+            downloaded_bytes = 0
+            last_progress_update = 0.0
+
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                downloaded_bytes += len(chunk)
+
+                if progress_path is None:
+                    continue
+
+                now = time.monotonic()
+                if now - last_progress_update < 0.5 and total_bytes and downloaded_bytes < total_bytes:
+                    continue
+
+                if total_bytes:
+                    message = (
+                        "Downloading MatAnyone2 checkpoint "
+                        f"({_format_download_size(downloaded_bytes)} / {_format_download_size(total_bytes)})."
+                    )
+                else:
+                    message = (
+                        "Downloading MatAnyone2 checkpoint "
+                        f"({_format_download_size(downloaded_bytes)} downloaded)."
+                    )
+                write_progress(progress_path, phase="loading_checkpoint", message=message)
+                last_progress_update = now
+
+        temp_path.replace(checkpoint_path)
+    except urllib_error.URLError as exc:
+        temp_path.unlink(missing_ok=True)
+        raise SystemExit(
+            f"Unable to download MatAnyone2 checkpoint from {checkpoint_url}: {exc}"
+        ) from exc
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+    print(f"checkpoint_ready: {checkpoint_path}")
+    if progress_path is not None:
+        write_progress(
+            progress_path,
+            phase="loading_checkpoint",
+            message="MatAnyone2 checkpoint ready.",
+        )
+    return checkpoint_path
+
+
 def should_use_original_input(*, start: float, duration: float | None) -> bool:
     return start <= 0 and duration is None
 
@@ -238,7 +475,6 @@ def extract_first_frame(input_video: Path, output_frame: Path) -> None:
 def create_default_mask(
     first_frame_path: Path,
     mask_path: Path,
-    preview_path: Path,
     *,
     center_x: float,
     center_y: float,
@@ -265,16 +501,12 @@ def create_default_mask(
         fill=255,
     )
     mask_array = np.array(mask_image, dtype=np.uint8)
-    save_mask_with_preview(image, mask_array, mask_path, preview_path)
+    save_mask(mask_array, mask_path)
 
 
-def save_mask_with_preview(image: Image.Image, mask_array: np.ndarray, mask_path: Path, preview_path: Path) -> None:
+def save_mask(mask_array: np.ndarray, mask_path: Path) -> None:
     mask_image = Image.fromarray(mask_array.astype(np.uint8), mode="L")
     mask_image.save(mask_path)
-    width, height = image.size
-    overlay = Image.new("RGBA", (width, height), ImageColor.getrgb("#00ff00") + (96,))
-    composited = Image.alpha_composite(image, Image.composite(overlay, Image.new("RGBA", image.size), mask_image))
-    composited.save(preview_path)
 
 
 def resolve_torch_device(torch_module, requested_device: str) -> str:
@@ -459,7 +691,6 @@ def detect_person_box(
 def create_sam2_mask(
     first_frame_path: Path,
     mask_path: Path,
-    preview_path: Path,
     *,
     center_x: float,
     center_y: float,
@@ -551,7 +782,7 @@ def create_sam2_mask(
     )
     best_score = float(flat_scores_np[best_index]) if flat_scores_np is not None else None
     binary_mask = np.where(best_mask > 0, 255, 0).astype(np.uint8)
-    save_mask_with_preview(image.convert("RGBA"), binary_mask, mask_path, preview_path)
+    save_mask(binary_mask, mask_path)
 
     return {
         "device": device,
@@ -563,28 +794,6 @@ def create_sam2_mask(
         "best_heuristic": best_heuristic,
         "person_detection": detection,
     }
-
-
-def maybe_make_compare(original_video: Path, foreground_video: Path, compare_video: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(original_video),
-        "-i",
-        str(foreground_video),
-        "-filter_complex",
-        "[0:v]scale=-2:360[left];[1:v]scale=-2:360[right];[left][right]hstack=inputs=2[v]",
-        "-map",
-        "[v]",
-        "-an",
-        "-c:v",
-        "libx264",
-        str(compare_video),
-    ]
-    run_command(command)
-
-
 def has_audio_stream(video_path: Path) -> bool:
     command = [
         "ffprobe",
@@ -633,6 +842,16 @@ def parse_args() -> argparse.Namespace:
         help="Path to a local MatAnyone checkout. Defaults to MATANYONE_ROOT or third_party/MatAnyone2.",
     )
     parser.add_argument(
+        "--matanyone-repo-url",
+        default=DEFAULT_MATANYONE_REPO_URL,
+        help="Git repository used to auto-clone MatAnyone2 when missing.",
+    )
+    parser.add_argument(
+        "--matanyone-ref",
+        default=DEFAULT_MATANYONE_REF,
+        help="Git ref used when auto-cloning MatAnyone2.",
+    )
+    parser.add_argument(
         "--output-root",
         default="test-videos/matanyone-runs",
         help="Directory where output artifacts will be written.",
@@ -644,7 +863,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         default="pretrained_models/matanyone2.pth",
-        help="Checkpoint path relative to repo root. Used only for existence checks.",
+        help="Checkpoint cache path relative to repo root.",
+    )
+    parser.add_argument(
+        "--checkpoint-url",
+        default=DEFAULT_CHECKPOINT_URL,
+        help="URL used to auto-download the MatAnyone2 checkpoint when missing.",
     )
     parser.add_argument("--start", type=float, default=0.0, help="Clip start time in seconds.")
     parser.add_argument(
@@ -693,11 +917,6 @@ def parse_args() -> argparse.Namespace:
         help="Set PYTORCH_ENABLE_MPS_FALLBACK=1 for the inference subprocess.",
     )
     parser.add_argument(
-        "--make-compare",
-        action="store_true",
-        help="Generate a side-by-side original vs foreground comparison video.",
-    )
-    parser.add_argument(
         "--preserve-audio",
         action="store_true",
         help="Mux the original audio back into the foreground output when the source video has audio.",
@@ -731,14 +950,7 @@ def main() -> int:
     if not video_path.exists():
         raise SystemExit(f"Video not found: {video_path}")
 
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.is_absolute():
-        checkpoint_path = (REPO_ROOT / checkpoint_path).resolve()
-    if not checkpoint_path.exists():
-        raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
-
-    matanyone_root = resolve_matanyone_root(args.matanyone_root)
-    inference_script = resolve_inference_script(matanyone_root)
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
 
     if args.output_dir:
         workdir = Path(args.output_dir)
@@ -751,22 +963,36 @@ def main() -> int:
             output_root = (REPO_ROOT / output_root).resolve()
         workdir = build_workdir(output_root, video_path)
 
+    progress_path = workdir / "progress.json"
+    write_progress(progress_path, phase="setup", message="Resolving environment and preparing background removal run.")
+
+    matanyone_root = ensure_matanyone_root(
+        args.matanyone_root,
+        progress_path=progress_path,
+        repo_url=args.matanyone_repo_url,
+        repo_ref=args.matanyone_ref,
+    )
+    inference_script = resolve_inference_script(matanyone_root)
+    checkpoint_path = ensure_checkpoint(
+        checkpoint_path,
+        progress_path=progress_path,
+        checkpoint_url=args.checkpoint_url,
+    )
+
     duration_value = args.duration if args.duration and args.duration > 0 else None
     use_original_input = should_use_original_input(start=args.start, duration=duration_value)
     clip_path = workdir / "input_clip.mp4"
     normalized_input_path = workdir / "normalized_input.mp4"
     first_frame_path = workdir / "first_frame.png"
     generated_mask_path = workdir / "generated_mask.png"
-    mask_preview_path = workdir / "generated_mask_preview.png"
-    compare_video_path = workdir / "compare-original-vs-foreground.mp4"
     benchmark_path = workdir / "benchmark.json"
-    progress_path = workdir / "progress.json"
 
     print(f"python_executable: {sys.executable}")
     print(f"torch_version: {torch.__version__}")
     print(f"mps_available: {torch.backends.mps.is_available()}")
     print(f"matanyone_root: {matanyone_root}")
     print(f"inference_script: {inference_script}")
+    print(f"checkpoint_path: {checkpoint_path}")
     print(f"video_path: {video_path}")
     print(f"output_dir: {workdir}")
     print(f"progress_json: {progress_path}")
@@ -814,7 +1040,6 @@ def main() -> int:
             sam2_info = create_sam2_mask(
                 first_frame_path,
                 generated_mask_path,
-                mask_preview_path,
                 center_x=args.center_x,
                 center_y=args.center_y,
                 width_ratio=args.mask_width_ratio,
@@ -844,7 +1069,6 @@ def main() -> int:
             create_default_mask(
                 first_frame_path,
                 generated_mask_path,
-                mask_preview_path,
                 center_x=args.center_x,
                 center_y=args.center_y,
                 width_ratio=args.mask_width_ratio,
@@ -852,7 +1076,6 @@ def main() -> int:
             )
         mask_path = generated_mask_path
         print(f"generated_mask: {mask_path}")
-        print(f"mask_preview: {mask_preview_path}")
 
     stream_info = input_stream_info
     clip_seconds = float(stream_info.get("duration") or 0.0)
@@ -865,15 +1088,17 @@ def main() -> int:
         str(input_video_for_inference),
         "-m",
         str(mask_path),
+        "-c",
+        str(checkpoint_path),
         "-o",
         str(workdir),
         "--max_size",
         str(args.max_size),
         "-w",
         str(args.warmup),
-        "--progress_path",
-        str(progress_path),
     ]
+    if inference_supports_progress_path(inference_script):
+        command.extend(["--progress_path", str(progress_path)])
 
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
@@ -883,23 +1108,18 @@ def main() -> int:
     if args.enable_mps_fallback:
         env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
+    write_progress(progress_path, phase="inferencing", message="Running MatAnyone2 inference.")
     start_time = time.perf_counter()
     run_command(command, cwd=REPO_ROOT, env=env)
     wall_seconds = time.perf_counter() - start_time
 
     foreground_candidates = sorted(workdir.glob("*_fgr.mp4"))
-    alpha_candidates = sorted(workdir.glob("*_pha.mp4"))
     foreground_path = foreground_candidates[0] if foreground_candidates else None
-    alpha_path = alpha_candidates[0] if alpha_candidates else None
     foreground_with_audio_path = workdir / "foreground-with-audio.mp4"
 
     if foreground_path is not None and args.preserve_audio and has_audio_stream(video_path):
         write_progress(progress_path, phase="muxing_audio", message="Muxing original audio into foreground video.")
         mux_original_audio(foreground_path, video_path, foreground_with_audio_path)
-
-    if foreground_path is not None and args.make_compare:
-        write_progress(progress_path, phase="building_compare", message="Generating side-by-side comparison video.")
-        maybe_make_compare(input_video_for_inference, foreground_path, compare_video_path)
 
     benchmark = {
         "created_at": datetime.now().isoformat(),
@@ -924,8 +1144,6 @@ def main() -> int:
         "sam2_device": (args.sam2_device if not args.mask and args.mask_generator == "sam2" else None),
         "foreground_path": str(foreground_path) if foreground_path else None,
         "foreground_with_audio_path": (str(foreground_with_audio_path) if foreground_with_audio_path.exists() else None),
-        "alpha_path": str(alpha_path) if alpha_path else None,
-        "compare_path": str(compare_video_path) if compare_video_path.exists() else None,
         "command": command,
     }
     benchmark_path.write_text(json.dumps(benchmark, indent=2), encoding="utf-8")
@@ -943,10 +1161,6 @@ def main() -> int:
         print(f"foreground_video: {foreground_path}")
     if foreground_with_audio_path.exists():
         print(f"foreground_with_audio_video: {foreground_with_audio_path}")
-    if alpha_path:
-        print(f"alpha_video: {alpha_path}")
-    if compare_video_path.exists():
-        print(f"compare_video: {compare_video_path}")
 
     return 0
 

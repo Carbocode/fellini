@@ -37,7 +37,7 @@ class BackgroundRemovalService:
     DEFAULT_MAX_SIZE = 256
     DEFAULT_WARMUP = 1
     DEFAULT_SAM2_MODEL = "facebook/sam2.1-hiera-small"
-    DEFAULT_SAM2_DEVICE = "mps"
+    DEFAULT_SAM2_DEVICE = "auto"
     DEFAULT_PERSON_DETECTOR_DEVICE = "cpu"
     PROGRESS_POLL_SECONDS = 0.8
 
@@ -186,31 +186,7 @@ class BackgroundRemovalService:
         log_path = run_dir / "runner.log"
 
         source_abspath = workspace.resolve_relative(source_path)
-        command = [
-            sys.executable,
-            str(project_root() / "backend" / "scripts" / "run_matanyone_benchmark.py"),
-            "--video",
-            str(source_abspath),
-            "--output-dir",
-            str(run_dir),
-            "--matanyone-root",
-            str(project_root() / "backend" / "third_party" / "MatAnyone2"),
-            "--mask-generator",
-            "sam2",
-            "--sam2-model",
-            self.DEFAULT_SAM2_MODEL,
-            "--sam2-device",
-            self.DEFAULT_SAM2_DEVICE,
-            "--person-detector-device",
-            self.DEFAULT_PERSON_DETECTOR_DEVICE,
-            "--max-size",
-            str(self.DEFAULT_MAX_SIZE),
-            "--warmup",
-            str(self.DEFAULT_WARMUP),
-            "--enable-mps-fallback",
-            "--preserve-audio",
-            "--make-compare",
-        ]
+        command = self._runner_command(source_abspath, run_dir)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
 
@@ -250,19 +226,7 @@ class BackgroundRemovalService:
                 msg = "MatAnyone completed without producing a foreground output."
                 raise BackgroundRemovalError(msg)
 
-            alpha_path = benchmark.get("alpha_path")
-            compare_path = benchmark.get("compare_path")
             relative_cutout_path = workspace.relative(Path(cutout_path))
-            relative_alpha_path = (
-                workspace.relative(Path(alpha_path))
-                if isinstance(alpha_path, str) and Path(alpha_path).exists()
-                else None
-            )
-            relative_compare_path = (
-                workspace.relative(Path(compare_path))
-                if isinstance(compare_path, str) and Path(compare_path).exists()
-                else None
-            )
             relative_benchmark_path = workspace.relative(benchmark_path)
             relative_progress_path = workspace.relative(progress_path)
 
@@ -279,8 +243,6 @@ class BackgroundRemovalService:
                     "error": None,
                     "original_path": background.original_path or source_path,
                     "cutout_path": relative_cutout_path,
-                    "alpha_path": relative_alpha_path,
-                    "compare_path": relative_compare_path,
                     "benchmark_path": relative_benchmark_path,
                     "progress_path": relative_progress_path,
                     "updated_at": utcnow(),
@@ -447,6 +409,7 @@ class BackgroundRemovalService:
         phase_map = {
             "setup": 0.02,
             "queued": 0.03,
+            "cloning_matanyone": 0.05,
             "preparing_input": 0.08,
             "normalizing_orientation": 0.14,
             "extracting_first_frame": 0.20,
@@ -458,7 +421,6 @@ class BackgroundRemovalService:
             "preparing_mask": 0.64,
             "encoding_outputs": 0.94,
             "muxing_audio": 0.97,
-            "building_compare": 0.99,
             "completed": 1.0,
             "failed": 1.0,
         }
@@ -472,3 +434,29 @@ class BackgroundRemovalService:
             return ""
         text = path.read_text(encoding="utf-8", errors="replace")
         return text[-max_chars:].strip()
+
+    def _runner_command(self, source_abspath: Path, run_dir: Path) -> list[str]:
+        return [
+            sys.executable,
+            str(project_root() / "backend" / "scripts" / "run_matanyone_benchmark.py"),
+            "--video",
+            str(source_abspath),
+            "--output-dir",
+            str(run_dir),
+            "--matanyone-root",
+            str(project_root() / "backend" / "third_party" / "MatAnyone2"),
+            "--mask-generator",
+            "sam2",
+            "--sam2-model",
+            self.DEFAULT_SAM2_MODEL,
+            "--sam2-device",
+            self.DEFAULT_SAM2_DEVICE,
+            "--person-detector-device",
+            self.DEFAULT_PERSON_DETECTOR_DEVICE,
+            "--max-size",
+            str(self.DEFAULT_MAX_SIZE),
+            "--warmup",
+            str(self.DEFAULT_WARMUP),
+            "--enable-mps-fallback",
+            "--preserve-audio",
+        ]

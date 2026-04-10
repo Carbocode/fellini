@@ -165,6 +165,12 @@ Se installi i gruppi `asr` e `llm`, i componenti principali vengono scaricati al
 - `WhisperX` gestisce alignment e timing piu' accurati
 - la parte LLM locale resta un extension point per tool editoriali assistiti
 
+Per la rimozione background video:
+
+- `MatAnyone2` viene clonato automaticamente in `backend/third_party/MatAnyone2` al primo uso
+- il checkpoint `pretrained_models/matanyone2.pth` viene scaricato automaticamente al primo uso
+- `SAM2` e i relativi pesi vengono scaricati on demand tramite Hugging Face
+
 Se le dipendenze AI non sono installate, Fellini continua a funzionare in modalita' degradata:
 
 - l'editor resta utilizzabile

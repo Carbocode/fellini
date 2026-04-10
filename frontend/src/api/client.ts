@@ -1,8 +1,9 @@
 import type {
+  ClipTranscriptionOptions,
   EditorialProject,
   JobSnapshot,
-  LaneTranscriptionResponse,
   ProjectAsset,
+  TranscriptionResponse,
 } from "../types";
 
 async function json<T>(res: Response): Promise<T> {
@@ -124,10 +125,24 @@ export async function setAssetBackgroundRemovalVariant(
 export async function transcribeAudioLane(
   jobId: string,
   laneId: string,
-): Promise<LaneTranscriptionResponse> {
+): Promise<TranscriptionResponse> {
   return json(
     await fetch(`/api/jobs/${jobId}/audio-lanes/${laneId}/transcribe`, {
       method: "POST",
+    }),
+  );
+}
+
+export async function transcribeAudioClip(
+  jobId: string,
+  clipId: string,
+  options?: ClipTranscriptionOptions,
+): Promise<TranscriptionResponse> {
+  return json(
+    await fetch(`/api/jobs/${jobId}/clips/${clipId}/transcribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options ?? {}),
     }),
   );
 }

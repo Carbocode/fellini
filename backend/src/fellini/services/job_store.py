@@ -344,6 +344,25 @@ class JobStore:
 
         return self.update(job_id, mutate)
 
+    def recover_interrupted_run(self, job_id: str, message: str) -> JobSnapshot:
+        logger.warning("job_store.recover_interrupted_run job_id=%s message=%s", job_id, message)
+
+        def mutate(snapshot: JobSnapshot) -> None:
+            if snapshot.status != JobStatus.running:
+                return
+            interrupted_step = snapshot.current_step
+            snapshot.status = JobStatus.failed
+            snapshot.current_step = None
+            snapshot.error = message
+            if interrupted_step is None:
+                return
+            step = snapshot.step(interrupted_step)
+            step.status = StepStatus.failed
+            step.finished_at = utcnow()
+            step.message = message
+
+        return self.update(job_id, mutate)
+
     @staticmethod
     def _normalize_snapshot(snapshot: JobSnapshot) -> JobSnapshot:
         steps_by_name = {step.name: step.model_copy(deep=True) for step in snapshot.steps}

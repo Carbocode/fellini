@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from fellini.app import create_app
+from fellini.app import INTERRUPTED_RUN_MESSAGE, create_app
 from fellini.domain.models import (
     JobStatus,
     ProbeInfo,
@@ -15,6 +15,46 @@ from fellini.domain.models import (
 )
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+
+
+def _attach_audio_clip_to_first_audio_lane(client: TestClient, job_id: str) -> tuple[dict, dict, dict]:
+    project = client.get(f"/api/jobs/{job_id}/editorial-project").json()
+    asset = project["assets"][0]
+    audio_lane = next(track for track in project["tracks"] if track["kind"] == "audio")
+    project["clips"] = [
+        {
+            "id": "clip_audio_1",
+            "asset_id": asset["id"],
+            "track_id": audio_lane["id"],
+            "linked_group_id": None,
+            "start": 0.0,
+            "source_in": 0.0,
+            "source_out": 2.0,
+            "z_index": 0,
+            "enabled": True,
+            "origin": "manual",
+            "transform": {
+                "x": 0.0,
+                "y": 0.0,
+                "scale": 1.0,
+                "rotation": 0.0,
+                "opacity": 1.0,
+                "crop": {"left": 0.0, "top": 0.0, "right": 0.0, "bottom": 0.0},
+            },
+            "audio": {
+                "gain": 1.0,
+                "muted": False,
+                "fade_in_ms": 0,
+                "fade_out_ms": 0,
+            },
+            "captions_enabled": True,
+        }
+    ]
+    updated = client.put(f"/api/jobs/{job_id}/editorial-project", json=project)
+    assert updated.status_code == 200
+    next_project = updated.json()
+    clip = next(item for item in next_project["clips"] if item["id"] == "clip_audio_1")
+    return next_project, clip, audio_lane
 
 
 def test_api_jobs_list_empty(tmp_path):
@@ -834,3 +874,340 @@ def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch)
     assert payload["job"]["steps"][1]["status"] == "completed"
     assert payload["project"]["lane_transcriptions"][0]["lane_id"] == audio_lane["id"]
     assert [caption["text"] for caption in payload["project"]["captions"]] == ["ciao", "lane"]
+
+
+def test_audio_clip_transcription_updates_project_and_job(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Clip transcription job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+    _project, clip, _audio_lane = _attach_audio_clip_to_first_audio_lane(client, created_job["id"])
+
+    monkeypatch.setattr(
+        "fellini.adapters.ffmpeg.FFmpegAdapter.mix_audio_clip",
+        lambda self, **kwargs: Path(kwargs["target"]).write_bytes(b"wav"),
+    )
+    transcribe_calls = []
+    align_calls = []
+
+    def fake_transcribe(self, audio_path, config, language):
+        transcribe_calls.append(
+            {
+                "model": config.model,
+                "beam_size": config.beam_size,
+                "vad_filter": config.vad_filter,
+                "language": language,
+            }
+        )
+        return (
+            [],
+            TranscriptArtifact(
+                language=language,
+                source="test-clip",
+                segments=[
+                    TranscriptSegment(
+                        id="seg_1",
+                        start=0.0,
+                        end=0.82,
+                        text="hello clip",
+                        words=[
+                            WordTiming(text="hello", start=0.0, end=0.36, confidence=1.0),
+                            WordTiming(text="clip", start=0.4, end=0.82, confidence=1.0),
+                        ],
+                    )
+                ],
+            ),
+        )
+
+    def fake_align(self, audio_path, transcript, config, language, use_whisperx):
+        align_calls.append({"language": language, "use_whisperx": use_whisperx})
+        return transcript
+
+    monkeypatch.setattr(
+        "fellini.adapters.asr.FasterWhisperTranscriber.transcribe",
+        fake_transcribe,
+    )
+    monkeypatch.setattr(
+        "fellini.adapters.alignment.TranscriptAligner.align",
+        fake_align,
+    )
+
+    response = client.post(
+        f"/api/jobs/{created_job['id']}/clips/{clip['id']}/transcribe",
+        json={
+            "language": "en",
+            "model": "small",
+            "beam_size": 2,
+            "vad_filter": False,
+            "use_whisperx": False,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    clip_payload = next(item for item in payload["project"]["clips"] if item["id"] == clip["id"])
+    assert transcribe_calls == [{
+        "model": "small",
+        "beam_size": 2,
+        "vad_filter": False,
+        "language": "en",
+    }]
+    assert align_calls == [{"language": "en", "use_whisperx": False}]
+    assert payload["job"]["steps"][1]["status"] == "completed"
+    assert clip_payload["transcription_status"] == "completed"
+    assert clip_payload["transcription_options"] == {
+        "language": "en",
+        "model": "small",
+        "beam_size": 2,
+        "vad_filter": False,
+        "use_whisperx": False,
+    }
+    assert clip_payload["transcription_source_audio_path"] == "temp/clip_clip_audio_1_bounce.wav"
+    assert [caption["text"] for caption in payload["project"]["captions"]] == ["hello", "clip"]
+    assert all(caption["source_clip_id"] == clip["id"] for caption in payload["project"]["captions"])
+
+
+def test_interrupted_lane_transcription_is_recovered_after_restart(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Interrupted lane transcription job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+    project = client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    audio_lane = next(track for track in project["tracks"] if track["kind"] == "audio")
+
+    app.state.store.mark_running(created_job["id"])
+    app.state.store.begin_step(
+        created_job["id"],
+        StepName.transcription,
+        "Trascrizione della lane",
+    )
+
+    recovered_app = create_app(settings)
+    recovered_client = TestClient(recovered_app)
+    recovered_snapshot = recovered_client.get(f"/api/jobs/{created_job['id']}").json()
+    transcription_step = next(
+        step for step in recovered_snapshot["steps"] if step["name"] == StepName.transcription.value
+    )
+    assert recovered_snapshot["status"] == JobStatus.failed.value
+    assert recovered_snapshot["current_step"] is None
+    assert recovered_snapshot["error"] == INTERRUPTED_RUN_MESSAGE
+    assert transcription_step["status"] == StepStatus.failed.value
+    assert transcription_step["message"] == INTERRUPTED_RUN_MESSAGE
+    assert transcription_step["can_run"] is True
+
+    monkeypatch.setattr(
+        "fellini.adapters.ffmpeg.FFmpegAdapter.mix_audio_lane",
+        lambda self, **kwargs: Path(kwargs["target"]).write_bytes(b"wav"),
+    )
+    monkeypatch.setattr(
+        "fellini.adapters.asr.FasterWhisperTranscriber.transcribe",
+        lambda self, audio_path, config, language: (
+            [],
+            TranscriptArtifact(
+                language=language,
+                source="test-lane",
+                segments=[
+                    TranscriptSegment(
+                        id="seg_1",
+                        start=0.0,
+                        end=0.8,
+                        text="ciao retry",
+                        words=[
+                            WordTiming(text="ciao", start=0.0, end=0.4, confidence=1.0),
+                            WordTiming(text="retry", start=0.42, end=0.8, confidence=1.0),
+                        ],
+                    )
+                ],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "fellini.adapters.alignment.TranscriptAligner.align",
+        lambda self, audio_path, transcript, config, language, use_whisperx: transcript,
+    )
+
+    response = recovered_client.post(
+        f"/api/jobs/{created_job['id']}/audio-lanes/{audio_lane['id']}/transcribe"
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job"]["status"] == JobStatus.pending.value
+    assert payload["job"]["steps"][1]["status"] == StepStatus.completed.value
+    assert payload["project"]["lane_transcriptions"][0]["lane_id"] == audio_lane["id"]
+
+
+def test_interrupted_clip_transcription_is_recovered_after_restart(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Interrupted clip transcription job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
+    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda _path: ProbeInfo(
+            path="temp/source_mezzanine.mp4",
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+    _project, clip, _audio_lane = _attach_audio_clip_to_first_audio_lane(client, created_job["id"])
+
+    saved_project = app.state.editorial_projects.load(workspace)
+    app.state.editorial_projects.set_clip_transcription_running(
+        workspace,
+        project=saved_project,
+        clip_id=clip["id"],
+    )
+    app.state.store.mark_running(created_job["id"])
+    app.state.store.begin_step(
+        created_job["id"],
+        StepName.transcription,
+        "Trascrizione della clip",
+    )
+
+    recovered_app = create_app(settings)
+    recovered_client = TestClient(recovered_app)
+    recovered_project = recovered_client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    recovered_clip = next(item for item in recovered_project["clips"] if item["id"] == clip["id"])
+    assert recovered_clip["transcription_status"] == StepStatus.failed.value
+    assert recovered_clip["transcription_error"] == INTERRUPTED_RUN_MESSAGE

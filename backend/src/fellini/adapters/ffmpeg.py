@@ -484,6 +484,71 @@ class FFmpegAdapter:
         self._run(args)
         logger.info("ffmpeg.mix_audio_lane.done track=%s target=%s", track_id, target)
 
+    def mix_audio_clip(
+        self,
+        *,
+        workspace_root: Path,
+        project: EditorialProject,
+        clip_id: str,
+        target: Path,
+        sample_rate: int = 16000,
+    ) -> None:
+        clip = next((item for item in project.clips if item.id == clip_id and item.enabled), None)
+        if not clip:
+            msg = f"Clip {clip_id} was not found."
+            raise FFmpegError(msg)
+
+        track = next((item for item in project.tracks if item.id == clip.track_id), None)
+        if not track or track.kind != TimelineTrackKind.audio:
+            msg = f"Clip {clip_id} is not on an audio lane."
+            raise FFmpegError(msg)
+        if clip.audio.muted:
+            msg = f"Clip {clip_id} is muted."
+            raise FFmpegError(msg)
+
+        inputs, input_indexes = self._project_inputs_for_clips(
+            workspace_root,
+            project,
+            [(clip, True)],
+            start_index=0,
+        )
+        asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
+        duration = max(0.02, clip.source_out - clip.source_in)
+        chain = [
+            f"[{asset_index}:a]atrim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+            "asetpts=PTS-STARTPTS",
+        ]
+        if clip.audio.gain != 1.0:
+            chain.append(f"volume={clip.audio.gain:.4f}")
+        if clip.audio.fade_in_ms > 0:
+            chain.append(f"afade=t=in:st=0:d={clip.audio.fade_in_ms / 1000:.3f}")
+        if clip.audio.fade_out_ms > 0:
+            fade_out_start = max(0.0, duration - (clip.audio.fade_out_ms / 1000))
+            chain.append(
+                f"afade=t=out:st={fade_out_start:.3f}:d={clip.audio.fade_out_ms / 1000:.3f}"
+            )
+
+        args = [self.settings.ffmpeg_bin, "-y"]
+        for path in inputs:
+            args.extend(["-i", str(path)])
+        args.extend(
+            [
+                "-filter_complex",
+                ",".join(chain) + "[clipout]",
+                "-map",
+                "[clipout]",
+                "-ac",
+                "1",
+                "-ar",
+                str(sample_rate),
+                "-c:a",
+                "pcm_s16le",
+                str(target),
+            ]
+        )
+        self._run(args)
+        logger.info("ffmpeg.mix_audio_clip.done clip=%s target=%s", clip_id, target)
+
     def render_project_master(
         self,
         *,

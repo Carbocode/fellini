@@ -129,6 +129,14 @@ class ClipAudio(BaseModel):
     fade_out_ms: int = 0
 
 
+class ClipTranscriptionOptions(BaseModel):
+    language: str | None = None
+    model: str | None = None
+    beam_size: int | None = Field(default=None, ge=1, le=10)
+    vad_filter: bool | None = None
+    use_whisperx: bool | None = None
+
+
 class ProjectAsset(BaseModel):
     id: str
     origin: str = "library"
@@ -173,8 +181,6 @@ class AssetBackgroundRemoval(BaseModel):
     error: str | None = None
     original_path: str | None = None
     cutout_path: str | None = None
-    alpha_path: str | None = None
-    compare_path: str | None = None
     benchmark_path: str | None = None
     progress_path: str | None = None
     updated_at: datetime = Field(default_factory=utcnow)
@@ -215,6 +221,12 @@ class TimelineClip(BaseModel):
     transform: ClipTransform = Field(default_factory=ClipTransform)
     audio: ClipAudio = Field(default_factory=ClipAudio)
     captions_enabled: bool = True
+    transcription_options: ClipTranscriptionOptions = Field(default_factory=ClipTranscriptionOptions)
+    transcription_status: LaneTranscriptionStatus = LaneTranscriptionStatus.idle
+    transcription_message: str | None = None
+    transcription_source_audio_path: str | None = None
+    transcription_updated_at: datetime = Field(default_factory=utcnow)
+    transcription_error: str | None = None
 
     @property
     def duration(self) -> float:
