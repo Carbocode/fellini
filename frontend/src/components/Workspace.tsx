@@ -80,6 +80,11 @@ import {
   upsertClips,
   visibleTimelineCaptions,
 } from "../lib/editorial";
+import { compileMonitorComposition } from "../lib/monitor/composition";
+import {
+  CanvasMonitorRuntime,
+  type MonitorDiagnostics,
+} from "../lib/monitor/runtime";
 import {
   baseName,
   fmtTime,
@@ -106,14 +111,13 @@ const RULER_MINOR_STEPS = [0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 30
 const RULER_MINOR_TARGET_PX = 10;
 const RULER_LABEL_EVERY_N_TICKS = 10;
 const TIMELINE_RULER_HEIGHT = 28;
-const AUDIO_PREWARM_LEAD_SECONDS = 0.8;
-const AUDIO_PREWARM_TRAIL_SECONDS = 0.2;
 const SIDEBAR_COLLAPSED_STORAGE_KEY = "fellini:workspace-sidebar-collapsed";
 const CLIP_PREVIEW_MIN_WIDTH_PX = 32;
 const MIN_SUBTITLE_DURATION = 0.02;
 const WAVEFORM_SAMPLES_PER_DEVICE_PIXEL = 1;
 const WAVEFORM_MIN_RENDER_PEAKS = 64;
 const WAVEFORM_MAX_RENDER_PEAKS = 65536;
+const FRAME_STEP_EPSILON = 1e-9;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
 type WaveformData = {
@@ -293,23 +297,6 @@ function isTypingTarget(target: EventTarget | null): boolean {
       || target.tagName === "INPUT"
       || target.tagName === "TEXTAREA"
       || target.tagName === "SELECT");
-}
-
-function containScale(
-  sourceWidth: number,
-  sourceHeight: number,
-  targetWidth: number,
-  targetHeight: number,
-): [number, number] {
-  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
-    return [1, 1];
-  }
-  const sourceAspect = sourceWidth / sourceHeight;
-  const targetAspect = targetWidth / targetHeight;
-  if (sourceAspect > targetAspect) {
-    return [1, targetAspect / sourceAspect];
-  }
-  return [sourceAspect / targetAspect, 1];
 }
 
 async function loadWaveformData(src: string): Promise<WaveformData> {
@@ -1313,32 +1300,30 @@ const FileTypeIcon: Component<{ type: "video" | "audio" }> = (props) => (
 );
 
 const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
-  const [gpuStatus, setGpuStatus] = createSignal<"ready" | "fallback" | "unsupported">("unsupported");
+  const [gpuStatus, setGpuStatus] = createSignal<"ready" | "unsupported">("unsupported");
   const [codecStatus, setCodecStatus] = createSignal<"ready" | "unsupported">("unsupported");
   const [stageSize, setStageSize] = createSignal({ width: 0, height: 0 });
   const [transportPlaying, setTransportPlaying] = createSignal(false);
+  const [monitorDiagnostics, setMonitorDiagnostics] = createSignal<MonitorDiagnostics>({
+    renderer: "webgpu",
+    currentTime: 0,
+    activeLayers: 0,
+    renderedLayers: 0,
+    decodedFrames: 0,
+    bufferedFrames: 0,
+    lastError: null,
+  });
   let stageRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
-  let playbackVideoRef: HTMLVideoElement | undefined;
-  let decoderVideoRef: HTMLVideoElement | undefined;
-  const audioRefs = new Map<string, HTMLAudioElement>();
-  let gpuContext: any;
-  let gpuDevice: any;
-  let gpuPipeline: any;
-  let sampler: any;
-  let layoutBuffer: any;
-  let raf = 0;
-  let transportStartAt = 0;
-  let transportStartTime = 0;
-  let videoFrameCallbackHandle: number | null = null;
-  let videoWarmupToken = 0;
-  const desiredMediaTimes = new WeakMap<HTMLMediaElement, number>();
+  let runtime: CanvasMonitorRuntime | null = null;
+  let runtimeMounted = false;
 
   const project = () => props.project();
-  const frameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
-  const contentDuration = createMemo(() => (project() ? projectDuration(project()!) : 0));
-  const sequenceWidth = createMemo(() => Math.max(1, Math.round(project()?.sequence.width ?? 1080)));
-  const sequenceHeight = createMemo(() => Math.max(1, Math.round(project()?.sequence.height ?? 1920)));
+  const composition = createMemo(() => (project() ? compileMonitorComposition(project()!) : null));
+  const frameRate = createMemo(() => Math.max(1, composition()?.sequence.fps ?? 30));
+  const monitorDuration = createMemo(() => Math.max(0, composition()?.duration ?? 0));
+  const sequenceWidth = createMemo(() => Math.max(1, Math.round(composition()?.sequence.width ?? 1080)));
+  const sequenceHeight = createMemo(() => Math.max(1, Math.round(composition()?.sequence.height ?? 1920)));
   const displayFrame = createMemo(() => {
     const width = stageSize().width;
     const height = stageSize().height;
@@ -1351,425 +1336,41 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
       height: Math.max(1, Math.floor(sequenceHeight() * scale)),
     };
   });
-  const activeVideoClip = createMemo(() => {
-    const current = project();
-    if (!current) return null;
-    const at = playheadTime();
-    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
-    return [...current.clips]
-      .filter((clip) => {
-        const track = getTrack(current, clip.track_id);
-        return clip.enabled
-          && track?.kind === "video"
-          && track.visible
-          && clip.start <= at
-          && (clip.start + (clip.source_out - clip.source_in)) >= at;
-      })
-      .sort((a, b) =>
-        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
-        || (b.z_index - a.z_index)
-        || (a.start - b.start)
-      )[0] ?? null;
-  });
-  const activeVideoAsset = createMemo(() => {
-    const current = project();
-    const clip = activeVideoClip();
-    if (!current || !clip) return null;
-    return assetById(current, clip.asset_id) ?? null;
-  });
-  const activeAudioClips = createMemo(() => {
-    const current = project();
-    if (!current) return [] as TimelineClip[];
-    const at = playheadTime();
-    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
-    return [...current.clips]
-      .filter((clip) => {
-        const track = getTrack(current, clip.track_id);
-        return clip.enabled
-          && track?.kind === "audio"
-          && !track.muted
-          && !clip.audio.muted
-          && clip.start <= at
-          && (clip.start + (clip.source_out - clip.source_in)) >= at;
-      })
-      .sort((a, b) =>
-        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
-        || (a.start - b.start)
-      );
-  });
-  const monitorAudioClips = createMemo(() => {
-    const current = project();
-    if (!current) return [] as TimelineClip[];
-    const at = playheadTime();
-    const trackOrder = new Map(current.tracks.map((track) => [track.id, track.order]));
-    return [...current.clips]
-      .filter((clip) => {
-        const track = getTrack(current, clip.track_id);
-        if (!clip.enabled || track?.kind !== "audio" || track.muted || clip.audio.muted) return false;
-        const clipEnd = clip.start + (clip.source_out - clip.source_in);
-        return clipEnd >= (at - AUDIO_PREWARM_TRAIL_SECONDS)
-          && clip.start <= (at + AUDIO_PREWARM_LEAD_SECONDS);
-      })
-      .sort((a, b) =>
-        ((trackOrder.get(a.track_id) ?? 0) - (trackOrder.get(b.track_id) ?? 0))
-        || (a.start - b.start)
-      );
-  });
-  const mediaSource = (clip: TimelineClip | null) => {
-    const current = project();
-    const jobId = selectedJobId();
-    if (!current || !jobId || !clip) return null;
-    const path = mediaPathForClip(current, clip);
-    return path ? fileUrl(jobId, path) : null;
-  };
-  const mediaSourceForClip = (clip: TimelineClip) => mediaSource(clip);
-  const normalizeMediaSource = (src: string) => {
-    try {
-      return new URL(src, window.location.href).href;
-    } catch {
-      return src;
-    }
-  };
-  const mediaElementHasSource = (
-    element: HTMLMediaElement | undefined,
-    src: string | null,
-  ) => {
-    if (!element || !src) return false;
-    const expected = normalizeMediaSource(src);
-    const current = element.currentSrc || element.getAttribute("src") || "";
-    return normalizeMediaSource(current) === expected;
-  };
-  const activeVideoSource = createMemo(() => mediaSource(activeVideoClip()));
-  const activeVideoSourceKey = createMemo(() => {
-    const clip = activeVideoClip();
-    const src = activeVideoSource();
-    return clip && src ? `${clip.id}:${src}` : null;
-  });
-  const monitorDuration = createMemo(() => Math.max(0, contentDuration()));
   const monitorPlayhead = createMemo(() => Math.max(0, Math.min(playheadTime(), monitorDuration())));
   const monitorHasMedia = createMemo(() => monitorDuration() > 0);
   const monitorProgressPercent = createMemo(() =>
     monitorDuration() > 0 ? (monitorPlayhead() / monitorDuration()) * 100 : 0
   );
-  const syncClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
-    if (!clip || !element) return;
-    const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
-    desiredMediaTimes.set(element, localTime);
-    if (element.readyState < 1) return;
-    if (element.seeking) return;
-    try {
-      if (Math.abs(element.currentTime - localTime) > 0.08) element.currentTime = localTime;
-    } catch {
-      // Media can reject seeks before metadata is fully ready; tick will retry.
-    }
+  const monitorUnsupported = createMemo(() => gpuStatus() === "unsupported" || codecStatus() === "unsupported");
+
+  const resolveMonitorMediaUrl = (path: string) => {
+    const jobId = selectedJobId();
+    return jobId ? fileUrl(jobId, path) : null;
   };
-  const syncAudioClipTime = (
-    clip: TimelineClip | null,
-    element: HTMLAudioElement | undefined,
-    mode: "soft" | "force" = "soft",
-  ) => {
-    if (!clip || !element) return;
-    const localTime = clip.source_in + Math.max(0, playheadTime() - clip.start);
-    desiredMediaTimes.set(element, localTime);
-    if (element.readyState < 1) return;
-    if (element.seeking) return;
-    const drift = Math.abs(element.currentTime - localTime);
-    const threshold = mode === "force"
-      ? 0.02
-      : (transportPlaying() && !element.paused ? 0.35 : 0.1);
-    try {
-      if (drift > threshold) element.currentTime = localTime;
-    } catch {
-      // Media can reject seeks before metadata is fully ready; tick will retry.
-    }
-  };
-  const settleClipTime = (clip: TimelineClip | null, element: HTMLMediaElement | undefined) => {
-    if (!clip || !element) return;
-    if (element.readyState < 1 || element.seeking) return;
-    const target = desiredMediaTimes.get(element);
-    if (target === undefined) return;
-    try {
-      if (Math.abs(element.currentTime - target) > 0.04) element.currentTime = target;
-    } catch {
-      // Ignore late seek reconciliation errors.
-    }
-  };
-  const pausePlayback = () => {
-    transportStartTime = playheadTime();
-    setTransportPlaying(false);
-    playbackVideoRef?.pause();
-    for (const element of audioRefs.values()) element.pause();
-  };
-  const playMediaElement = (element: HTMLMediaElement | undefined) => {
-    if (!element || element.readyState < 2 || !element.paused) return;
-    void element.play().catch(() => {});
-  };
-  const clearVideoFrameCallback = () => {
-    if (!decoderVideoRef || videoFrameCallbackHandle === null || !("cancelVideoFrameCallback" in decoderVideoRef)) return;
-    try {
-      (
-        decoderVideoRef as HTMLVideoElement & {
-          cancelVideoFrameCallback?: (handle: number) => void;
-        }
-      ).cancelVideoFrameCallback?.(videoFrameCallbackHandle);
-    } catch {
-      // Ignore cancellation errors during source swaps.
-    }
-    videoFrameCallbackHandle = null;
-  };
-  const scheduleVideoFrameProbe = () => {
-    const video = decoderVideoRef as (HTMLVideoElement & {
-      requestVideoFrameCallback?: (cb: () => void) => number;
-    }) | undefined;
-    if (!video || !("requestVideoFrameCallback" in video)) return;
-    clearVideoFrameCallback();
-    try {
-      videoFrameCallbackHandle = video.requestVideoFrameCallback?.(() => {
-        videoFrameCallbackHandle = null;
-        if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
-      }) ?? null;
-    } catch {
-      videoFrameCallbackHandle = null;
-    }
-  };
-  const requestVideoFrameDraw = () => {
-    if (!decoderVideoRef) return;
-    scheduleVideoFrameProbe();
-    if (gpuStatus() === "ready") requestAnimationFrame(drawFrame);
-  };
-  const warmVideoFrame = () => {
-    const video = decoderVideoRef;
-    const clip = activeVideoClip();
-    if (!video || !clip || transportPlaying() || video.readyState < 2) return;
-    const token = ++videoWarmupToken;
-    syncClipTime(clip, video);
-    const settle = () => {
-      if (token !== videoWarmupToken) return;
-      video.pause();
-      syncClipTime(activeVideoClip(), decoderVideoRef);
-      requestVideoFrameDraw();
-    };
-    const playAttempt = video.play();
-    if (!playAttempt || typeof playAttempt.then !== "function") {
-      settle();
-      return;
-    }
-    void playAttempt
-      .then(() => {
-        requestAnimationFrame(() => {
-          settle();
-        });
-      })
-      .catch(() => {
-        settle();
-      });
-  };
-  const syncTransportClock = (time: number) => {
-    transportStartAt = performance.now();
-    transportStartTime = time;
-  };
+
   const togglePlayback = () => {
-    if (transportPlaying()) {
-      pausePlayback();
-      return;
-    }
-    const duration = contentDuration();
-    const startTime = Math.max(0, Math.min(playheadTime(), duration));
-    setPlayheadTime(startTime);
-    syncTransportClock(startTime);
-    setTransportPlaying(true);
-    syncClipTime(activeVideoClip(), playbackVideoRef);
-    syncClipTime(activeVideoClip(), decoderVideoRef);
-    for (const clip of activeAudioClips()) {
-      syncAudioClipTime(clip, audioRefs.get(clip.id), "force");
-    }
-    playMediaElement(playbackVideoRef);
-    for (const clip of activeAudioClips()) {
-      playMediaElement(audioRefs.get(clip.id));
-    }
+    if (!runtime || !monitorHasMedia()) return;
+    void (transportPlaying() ? runtime.pause() : runtime.play());
+  };
+  const adjacentFrameTime = (direction: -1 | 1, maxTime = Number.POSITIVE_INFINITY) => {
+    const fps = frameRate();
+    const current = Math.max(0, Math.min(maxTime, playheadTime()));
+    const framePosition = current * fps;
+    const nextFrame = direction > 0
+      ? Math.floor(framePosition + FRAME_STEP_EPSILON) + 1
+      : Math.ceil(framePosition - FRAME_STEP_EPSILON) - 1;
+    return Math.max(0, Math.min(maxTime, nextFrame / fps));
   };
   const stepFrame = (direction: -1 | 1) => {
-    pausePlayback();
-    const next = Math.max(0, Math.min(monitorDuration(), playheadTime() + direction / frameRate()));
-    setSeekRequest(next);
+    if (!runtime) return;
+    void (async () => {
+      await runtime.pause();
+      await runtime.seek(adjacentFrameTime(direction, monitorDuration()));
+    })();
   };
   const scrubMonitor = (time: number) => {
-    setSeekRequest(Math.max(0, Math.min(monitorDuration(), time)));
-  };
-  const initGpu = async () => {
-    const gpu = (navigator as Navigator & { gpu?: any }).gpu;
-    if (!canvasRef || !gpu) {
-      setGpuStatus("unsupported");
-      return;
-    }
-    try {
-      const adapter = await gpu.requestAdapter();
-      if (!adapter) {
-        setGpuStatus("unsupported");
-        return;
-      }
-      gpuDevice = await adapter.requestDevice();
-      gpuContext = canvasRef.getContext("webgpu") ?? undefined;
-      if (!gpuContext || !gpuDevice) {
-        setGpuStatus("fallback");
-        return;
-      }
-      gpuContext.configure({
-        device: gpuDevice,
-        format: gpu.getPreferredCanvasFormat(),
-        alphaMode: "opaque",
-      });
-      sampler = gpuDevice.createSampler({ magFilter: "linear", minFilter: "linear" });
-      const bufferUsage = (globalThis as { GPUBufferUsage?: { UNIFORM: number; COPY_DST: number } }).GPUBufferUsage;
-      if (!bufferUsage) {
-        setGpuStatus("fallback");
-        return;
-      }
-      layoutBuffer = gpuDevice.createBuffer({
-        size: 16,
-        usage: bufferUsage.UNIFORM | bufferUsage.COPY_DST,
-      });
-      gpuPipeline = gpuDevice.createRenderPipeline({
-        layout: "auto",
-        vertex: {
-          module: gpuDevice.createShaderModule({
-            code: `
-              struct FrameLayout {
-                scale: vec2f,
-                pad: vec2f,
-              };
-              struct Out {
-                @builtin(position) pos: vec4f,
-                @location(0) uv: vec2f,
-              };
-              @group(0) @binding(0) var<uniform> frameLayout: FrameLayout;
-              @vertex
-              fn main(@builtin(vertex_index) i: u32) -> Out {
-                var pos = array<vec2f, 6>(
-                  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
-                  vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0)
-                );
-                var uv = array<vec2f, 6>(
-                  vec2f(0.0, 1.0), vec2f(1.0, 1.0), vec2f(0.0, 0.0),
-                  vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0)
-                );
-                var out: Out;
-                out.pos = vec4f(pos[i] * frameLayout.scale, 0.0, 1.0);
-                out.uv = uv[i];
-                return out;
-              }
-            `,
-          }),
-          entryPoint: "main",
-        },
-        fragment: {
-          module: gpuDevice.createShaderModule({
-            code: `
-              @group(0) @binding(1) var frameSampler: sampler;
-              @group(0) @binding(2) var frameTex: texture_external;
-              @fragment
-              fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
-                return textureSampleBaseClampToEdge(frameTex, frameSampler, uv);
-              }
-            `,
-          }),
-          entryPoint: "main",
-          targets: [{ format: gpu.getPreferredCanvasFormat() }],
-        },
-        primitive: { topology: "triangle-list" },
-      });
-      setGpuStatus("ready");
-    } catch {
-      setGpuStatus("fallback");
-    }
-  };
-
-  const drawFrame = () => {
-    const video = decoderVideoRef;
-    if (
-      !canvasRef
-      || !video
-      || !gpuDevice
-      || !gpuContext
-      || !gpuPipeline
-      || !sampler
-      || !layoutBuffer
-      || video.readyState < 2
-    ) return;
-    try {
-      const asset = activeVideoAsset();
-      const [scaleX, scaleY] = containScale(
-        video.videoWidth || asset?.width || sequenceWidth(),
-        video.videoHeight || asset?.height || sequenceHeight(),
-        sequenceWidth(),
-        sequenceHeight(),
-      );
-      gpuDevice.queue.writeBuffer(layoutBuffer, 0, new Float32Array([scaleX, scaleY, 0, 0]));
-      const texture = gpuDevice.importExternalTexture({ source: video });
-      const bindGroup = gpuDevice.createBindGroup({
-        layout: gpuPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: layoutBuffer } },
-          { binding: 1, resource: sampler },
-          { binding: 2, resource: texture },
-        ],
-      });
-      const encoder = gpuDevice.createCommandEncoder();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: gpuContext.getCurrentTexture().createView(),
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-      });
-      pass.setPipeline(gpuPipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.draw(6);
-      pass.end();
-      gpuDevice.queue.submit([encoder.finish()]);
-    } catch {
-      setGpuStatus("fallback");
-    }
-  };
-
-  const tick = () => {
-    if (transportPlaying()) {
-      const duration = contentDuration();
-      const elapsed = (performance.now() - transportStartAt) / 1000;
-      const nextTime = transportStartTime + elapsed;
-      if (nextTime >= duration) {
-        setPlayheadTime(duration);
-        pausePlayback();
-      } else {
-        setPlayheadTime(nextTime);
-      }
-    }
-    const clip = activeVideoClip();
-    if (clip) {
-      syncClipTime(clip, playbackVideoRef);
-      syncClipTime(clip, decoderVideoRef);
-    } else {
-      playbackVideoRef?.pause();
-      decoderVideoRef?.pause();
-    }
-    const activeAudioIds = new Set(activeAudioClips().map((item) => item.id));
-    for (const audioClip of activeAudioClips()) {
-      const element = audioRefs.get(audioClip.id);
-      if (!element) continue;
-      element.volume = Math.max(0, Math.min(1, audioClip.audio.gain));
-      syncAudioClipTime(audioClip, element, "soft");
-    }
-    for (const [clipId, element] of audioRefs.entries()) {
-      if (!activeAudioIds.has(clipId)) element.pause();
-    }
-    if (transportPlaying()) {
-      if (clip) playMediaElement(playbackVideoRef);
-      for (const audioClip of activeAudioClips()) {
-        playMediaElement(audioRefs.get(audioClip.id));
-      }
-    }
-    raf = requestAnimationFrame(tick);
+    if (!runtime) return;
+    void runtime.seek(Math.max(0, Math.min(monitorDuration(), time)));
   };
 
   createEffect(() => {
@@ -1778,14 +1379,6 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     if (canvasRef) {
       canvasRef.width = sequenceWidth();
       canvasRef.height = sequenceHeight();
-    }
-    const gpu = (navigator as Navigator & { gpu?: any }).gpu;
-    if (gpuContext && gpuDevice && gpu) {
-      gpuContext.configure({
-        device: gpuDevice,
-        format: gpu.getPreferredCanvasFormat(),
-        alphaMode: "opaque",
-      });
     }
   });
 
@@ -1805,80 +1398,34 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   });
 
   createEffect(() => {
-    void initGpu();
-    setCodecStatus("VideoDecoder" in window && "VideoEncoder" in window ? "ready" : "unsupported");
-    raf = requestAnimationFrame(tick);
-    onCleanup(() => cancelAnimationFrame(raf));
+    if (!canvasRef || runtimeMounted) return;
+    runtime = new CanvasMonitorRuntime(canvasRef, {
+      onTimeUpdate: (time) => setPlayheadTime(time),
+      onPlayingChange: (playing) => setTransportPlaying(playing),
+      onGpuStatus: setGpuStatus,
+      onCodecStatus: setCodecStatus,
+      onDiagnostics: setMonitorDiagnostics,
+      onError: (error) => {
+        console.error("[monitor-runtime]", error);
+      },
+    });
+    runtimeMounted = true;
+    void runtime.setComposition(composition(), resolveMonitorMediaUrl);
   });
 
   createEffect(() => {
-    const src = activeVideoSource();
-    const key = activeVideoSourceKey();
-    if (!playbackVideoRef && !decoderVideoRef) return;
-    videoWarmupToken += 1;
-    clearVideoFrameCallback();
-    if (!src || !key) {
-      playbackVideoRef?.pause();
-      decoderVideoRef?.pause();
-      return;
-    }
-    if (playbackVideoRef) {
-      if (mediaElementHasSource(playbackVideoRef, src)) {
-        syncClipTime(activeVideoClip(), playbackVideoRef);
-      } else {
-        playbackVideoRef.pause();
-        playbackVideoRef.removeAttribute("src");
-        playbackVideoRef.load();
-        playbackVideoRef.src = src;
-        playbackVideoRef.load();
-      }
-    }
-    if (decoderVideoRef) {
-      if (mediaElementHasSource(decoderVideoRef, src)) {
-        syncClipTime(activeVideoClip(), decoderVideoRef);
-        requestVideoFrameDraw();
-        warmVideoFrame();
-      } else {
-        decoderVideoRef.pause();
-        decoderVideoRef.removeAttribute("src");
-        decoderVideoRef.load();
-        decoderVideoRef.src = src;
-        decoderVideoRef.load();
-      }
-    }
-  });
-  createEffect(() => {
-    const mountedIds = new Set(monitorAudioClips().map((clip) => clip.id));
-    for (const [clipId, element] of audioRefs.entries()) {
-      if (mountedIds.has(clipId)) continue;
-      element.pause();
-      audioRefs.delete(clipId);
-    }
-    for (const clip of monitorAudioClips()) {
-      const element = audioRefs.get(clip.id);
-      const src = mediaSourceForClip(clip);
-      if (!element || !src) continue;
-      const track = project() ? getTrack(project()!, clip.track_id) : null;
-      if (!mediaElementHasSource(element, src)) {
-        element.src = src;
-        element.load();
-      }
-      element.volume = Math.max(0, Math.min(1, clip.audio.gain));
-      element.muted = !!clip.audio.muted || !!track?.muted;
-    }
+    const currentComposition = composition();
+    selectedJobId();
+    if (!runtimeMounted || !runtime) return;
+    void runtime.setComposition(currentComposition, resolveMonitorMediaUrl);
   });
 
   createEffect(
     on(seekRequest, (time) => {
       if (time === null) return;
-      setPlayheadTime(time);
-      if (transportPlaying()) syncTransportClock(time);
-      syncClipTime(activeVideoClip(), playbackVideoRef);
-      syncClipTime(activeVideoClip(), decoderVideoRef);
-      for (const clip of activeAudioClips()) {
-        syncAudioClipTime(clip, audioRefs.get(clip.id), "force");
-      }
       setSeekRequest(null);
+      if (!runtime) return;
+      void runtime.seek(time);
     }),
   );
   createEffect(
@@ -1889,14 +1436,18 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   createEffect(
     on(frameStepRequest, (dir) => {
       if (!dir) return;
-      pausePlayback();
-      const next = Math.max(0, playheadTime() + dir / frameRate());
-      setSeekRequest(next);
+      if (runtime) {
+        void (async () => {
+          await runtime.pause();
+          await runtime.seek(adjacentFrameTime(dir > 0 ? 1 : -1));
+        })();
+      }
       setFrameStepRequest(0);
     }),
   );
   onCleanup(() => {
-    clearVideoFrameCallback();
+    void runtime?.destroy();
+    runtime = null;
   });
 
   return (
@@ -1918,96 +1469,31 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
         >
           <canvas
             ref={canvasRef}
-            class="monitor-canvas"
+            class="monitor-canvas active"
             width={sequenceWidth()}
             height={sequenceHeight()}
           />
-          <video
-            ref={playbackVideoRef}
-            preload="auto"
-            muted
-            playsinline
-            class="monitor-fallback-video"
-            style={{ display: activeVideoSource() ? "block" : "none" }}
-            onLoadedMetadata={() => {
-              syncClipTime(activeVideoClip(), playbackVideoRef);
-            }}
-            onLoadedData={() => {
-              syncClipTime(activeVideoClip(), playbackVideoRef);
-              if (transportPlaying()) playMediaElement(playbackVideoRef);
-            }}
-            onCanPlay={() => {
-              syncClipTime(activeVideoClip(), playbackVideoRef);
-              if (transportPlaying()) playMediaElement(playbackVideoRef);
-            }}
-            onSeeked={() => {
-              settleClipTime(activeVideoClip(), playbackVideoRef);
-              if (transportPlaying()) playMediaElement(playbackVideoRef);
-            }}
-          />
-          <video
-            ref={decoderVideoRef}
-            preload="auto"
-            muted
-            playsinline
-            class="monitor-decoder-video"
-            aria-hidden="true"
-            tabindex={-1}
-            onLoadedMetadata={() => {
-              syncClipTime(activeVideoClip(), decoderVideoRef);
-              requestVideoFrameDraw();
-              warmVideoFrame();
-            }}
-            onLoadedData={() => {
-              syncClipTime(activeVideoClip(), decoderVideoRef);
-              requestVideoFrameDraw();
-            }}
-            onCanPlay={() => {
-              syncClipTime(activeVideoClip(), decoderVideoRef);
-              requestVideoFrameDraw();
-            }}
-            onSeeked={() => {
-              settleClipTime(activeVideoClip(), decoderVideoRef);
-              requestVideoFrameDraw();
-            }}
-          />
-        </div>
-        <div class="monitor-audio hidden" aria-hidden="true">
-          <For each={monitorAudioClips()}>
-            {(clip) => (
-              <audio
-                ref={(element) => {
-                  if (!element) return;
-                  audioRefs.set(clip.id, element);
-                }}
-                preload="auto"
-                style={{ display: "none" }}
-                onLoadedData={(event) => {
-                  const element = event.currentTarget;
-                  audioRefs.set(clip.id, element);
-                  syncAudioClipTime(clip, element, "force");
-                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
-                    playMediaElement(element);
-                  }
-                }}
-                onCanPlay={(event) => {
-                  const element = event.currentTarget;
-                  audioRefs.set(clip.id, element);
-                  syncAudioClipTime(clip, element, "force");
-                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
-                    playMediaElement(element);
-                  }
-                }}
-                onSeeked={(event) => {
-                  const element = event.currentTarget;
-                  settleClipTime(clip, element);
-                  if (activeAudioClips().some((item) => item.id === clip.id) && transportPlaying()) {
-                    playMediaElement(element);
-                  }
-                }}
-              />
-            )}
-          </For>
+          <Show when={!monitorUnsupported()}>
+            <div class="monitor-debug-panel">
+              <div>renderer {monitorDiagnostics().renderer}</div>
+              <div>layers {monitorDiagnostics().renderedLayers}/{monitorDiagnostics().activeLayers}</div>
+              <div>decoded {monitorDiagnostics().decodedFrames}</div>
+              <div>buffered {monitorDiagnostics().bufferedFrames}</div>
+              <Show when={monitorDiagnostics().lastError}>
+                <div class="monitor-debug-panel__error">{monitorDiagnostics().lastError}</div>
+              </Show>
+            </div>
+          </Show>
+          <Show when={monitorUnsupported()}>
+            <div class="monitor-stage-overlay">
+              <div class="monitor-stage-overlay-card">
+                <div class="monitor-stage-overlay-title">Monitor non supportato</div>
+                <div class="monitor-stage-overlay-copy">
+                  Il monitor realtime richiede Chromium con WebGPU e WebCodecs attivi.
+                </div>
+              </div>
+            </div>
+          </Show>
         </div>
       </div>
       <div class="monitor-controls-shell">
@@ -2133,6 +1619,7 @@ const TimelinePanel: Component<{
   const [editingSubtitleId, setEditingSubtitleId] = createSignal<string | null>(null);
   const [editingSubtitleText, setEditingSubtitleText] = createSignal("");
   const project = () => props.project();
+  const projectFrameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
   const [zoomIdx, setZoomIdx] = createSignal(DEFAULT_ZOOM_INDEX);
   const zoom = () => ZOOM_STEPS[zoomIdx()];
   const pxPerSecond = () => BASE_PX_PER_SEC * zoom();
@@ -2289,19 +1776,23 @@ const TimelinePanel: Component<{
   const minimapViewportFrac = createMemo(() => Math.min(viewportFrac(), 1));
   const minimapViewportLeftFrac = createMemo(() => scrollFrac() * Math.max(1 - minimapViewportFrac(), 0));
   const rulerScale = createMemo(() => {
-    const minorStep = RULER_MINOR_STEPS.find((step) => step * pxPerSecond() >= RULER_MINOR_TARGET_PX)
+    const targetMinorStep = RULER_MINOR_STEPS.find((step) => step * pxPerSecond() >= RULER_MINOR_TARGET_PX)
       ?? RULER_MINOR_STEPS[RULER_MINOR_STEPS.length - 1];
+    const fps = projectFrameRate();
+    const minorFrames = Math.max(1, Math.ceil(targetMinorStep * fps - Number.EPSILON));
     return {
-      minorStep,
-      labelStep: minorStep * RULER_LABEL_EVERY_N_TICKS,
+      minorFrames,
+      minorStep: minorFrames / fps,
+      labelStep: (minorFrames * RULER_LABEL_EVERY_N_TICKS) / fps,
     };
   });
   const rulerTicks = createMemo(() => {
     const ticks: Array<{ time: number; kind: "major" | "medium" | "minor"; label: string | null }> = [];
-    const { minorStep, labelStep } = rulerScale();
-    const count = Math.ceil(duration() / minorStep);
+    const fps = projectFrameRate();
+    const { minorFrames, labelStep } = rulerScale();
+    const count = Math.ceil((duration() * fps) / minorFrames);
     for (let index = 0; index <= count; index += 1) {
-      const time = Number((index * minorStep).toFixed(4));
+      const time = Number((((index * minorFrames) / fps)).toFixed(6));
       const isLabel = index % RULER_LABEL_EVERY_N_TICKS === 0;
       const isMedium = !isLabel && index % (RULER_LABEL_EVERY_N_TICKS / 2) === 0;
       const kind: "major" | "medium" | "minor" = isLabel ? "major" : isMedium ? "medium" : "minor";
