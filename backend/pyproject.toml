@@ -26,7 +26,7 @@ packages = [{ include = "fellini", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 httpx = ">=0.28.0,<1.0.0"
-pytest = ">=8.4.0,<9.0.0"
+pytest = ">=9.0.3,<10.0.0"
 ruff = ">=0.12.0,<1.0.0"
 
 [tool.poetry.group.asr]
