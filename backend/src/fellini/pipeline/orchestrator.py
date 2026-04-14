@@ -191,14 +191,8 @@ class PipelineOrchestrator:
     def _collect_outputs(context: PipelineContext) -> list[str]:
         outputs: list[str] = []
         render_plan = context.state.render_plan
-        if not render_plan:
+        if not render_plan or not render_plan.edited_master:
             return outputs
 
-        for candidate in (
-            render_plan.edited_master,
-            render_plan.clean_output,
-            render_plan.captioned_output,
-        ):
-            if candidate and candidate not in outputs:
-                outputs.append(candidate)
+        outputs.append(render_plan.edited_master)
         return outputs

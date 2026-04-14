@@ -1,4 +1,5 @@
 import { For, type Component } from "solid-js";
+import { IconMovie, IconPlus, IconX } from "@tabler/icons-solidjs";
 import {
   tabs,
   activeTabIdx,
@@ -18,11 +19,7 @@ const TabBar: Component = () => {
         aria-label="Apri About Fellini"
         onClick={() => setAboutDialogOpen(true)}
       >
-        <svg viewBox="0 0 24 24" fill="none">
-          <rect x="2" y="4" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.5" />
-          <path d="M10 9l5 3-5 3V9z" fill="currentColor" opacity="0.8" />
-          <circle cx="6" cy="8" r="1.2" fill="currentColor" opacity="0.5" />
-        </svg>
+        <IconMovie />
         <span>Fellini</span>
       </button>
       <div class="tab-list">
@@ -41,7 +38,7 @@ const TabBar: Component = () => {
                   closeTab(i());
                 }}
               >
-                &times;
+                <IconX size={13} />
               </button>
             </div>
           )}
@@ -52,7 +49,7 @@ const TabBar: Component = () => {
           title="Nuova tab"
           onClick={() => openTab(null)}
         >
-          +
+          <IconPlus size={14} />
         </button>
       </div>
     </div>

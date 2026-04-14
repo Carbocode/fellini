@@ -5,6 +5,11 @@ export type DecoderAccelerationPreference =
   | "no-preference"
   | "prefer-software";
 
+export type VideoDecodeIntent =
+  | "snapshot"
+  | "play-start"
+  | "play-tick";
+
 export type VideoDecoderWorkerCommand =
   | {
     type: "init";

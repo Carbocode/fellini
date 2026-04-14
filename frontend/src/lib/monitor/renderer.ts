@@ -8,7 +8,6 @@ type GpuObjects = {
   device: any;
   pipeline: any;
   sampler: any;
-  uniformBuffer: any;
   presentationFormat: string;
 };
 
@@ -74,6 +73,21 @@ function describeErrorLike(value: unknown): string {
     if (typeof message === "string" && message.trim()) return message;
   }
   return String(value ?? "Errore sconosciuto");
+}
+
+function isDetachedVideoFrameError(value: unknown): boolean {
+  const message = describeErrorLike(value).toLowerCase();
+  return message.includes("back resource");
+}
+
+function releaseRenderLayerFrames(layers: RenderVideoLayer[]): void {
+  for (const layer of layers) {
+    try {
+      layer.frame.close();
+    } catch {
+      // Ignore already-released frames.
+    }
+  }
 }
 
 function layerUniforms(sequence: MonitorSequenceSpec, layer: RenderVideoLayer): Float32Array {
@@ -163,10 +177,6 @@ export class MonitorWebGpuRenderer {
       magFilter: "linear",
       minFilter: "linear",
     });
-    const uniformBuffer = device.createBuffer({
-      size: UNIFORM_FLOATS * Float32Array.BYTES_PER_ELEMENT,
-      usage: GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST,
-    });
     const pipeline = device.createRenderPipeline({
       layout: "auto",
       vertex: {
@@ -226,7 +236,7 @@ export class MonitorWebGpuRenderer {
               @location(1) opacity: f32,
             ) -> @location(0) vec4f {
               let color = textureSampleBaseClampToEdge(frameTexture, frameSampler, uv);
-              return vec4f(color.rgb, opacity);
+              return vec4f(color.rgb, color.a * opacity);
             }
           `,
         }),
@@ -257,7 +267,6 @@ export class MonitorWebGpuRenderer {
       device,
       pipeline,
       sampler,
-      uniformBuffer,
       presentationFormat,
     };
   }
@@ -274,9 +283,18 @@ export class MonitorWebGpuRenderer {
   }
 
   render(sequence: MonitorSequenceSpec, layers: RenderVideoLayer[]): void {
-    if (!this.gpuObjects) return;
+    if (!this.gpuObjects) {
+      releaseRenderLayerFrames(layers);
+      return;
+    }
     const background = parseHexColor(sequence.background);
-    const { device, context, pipeline, sampler, uniformBuffer } = this.gpuObjects;
+    const { device, context, pipeline, sampler } = this.gpuObjects;
+    let released = false;
+    const releaseLayers = () => {
+      if (released) return;
+      released = true;
+      releaseRenderLayerFrames(layers);
+    };
     try {
       device.pushErrorScope?.("validation");
       const encoder = device.createCommandEncoder();
@@ -290,32 +308,47 @@ export class MonitorWebGpuRenderer {
       });
       pass.setPipeline(pipeline);
       for (const layer of layers) {
-        device.queue.writeBuffer(
-          uniformBuffer,
-          0,
-          layerUniforms(sequence, layer),
-        );
-        const externalTexture = device.importExternalTexture({
-          source: layer.frame,
-        });
-        const bindGroup = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: { buffer: uniformBuffer } },
-            { binding: 1, resource: sampler },
-            { binding: 2, resource: externalTexture },
-          ],
-        });
-        pass.setBindGroup(0, bindGroup);
-        pass.draw(6);
+        try {
+          const uniformBuffer = device.createBuffer({
+            size: UNIFORM_FLOATS * Float32Array.BYTES_PER_ELEMENT,
+            usage: GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST,
+          });
+          device.queue.writeBuffer(
+            uniformBuffer,
+            0,
+            layerUniforms(sequence, layer),
+          );
+          const externalTexture = device.importExternalTexture({
+            source: layer.frame,
+          });
+          const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: uniformBuffer } },
+              { binding: 1, resource: sampler },
+              { binding: 2, resource: externalTexture },
+            ],
+          });
+          pass.setBindGroup(0, bindGroup);
+          pass.draw(6);
+        } catch (error) {
+          if (isDetachedVideoFrameError(error)) continue;
+          this.onError?.(new Error(describeErrorLike(error)));
+        }
       }
       pass.end();
       device.queue.submit([encoder.finish()]);
+      if (typeof device.queue.onSubmittedWorkDone === "function") {
+        void device.queue.onSubmittedWorkDone().finally(releaseLayers);
+      } else {
+        requestAnimationFrame(releaseLayers);
+      }
       void device.popErrorScope?.().then((error: unknown) => {
         if (!error) return;
         this.onError?.(new Error(describeErrorLike(error)));
       });
     } catch (error) {
+      releaseLayers();
       this.onError?.(new Error(describeErrorLike(error)));
     }
   }

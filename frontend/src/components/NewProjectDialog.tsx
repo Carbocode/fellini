@@ -1,4 +1,5 @@
 import { createSignal, Show, type Component } from "solid-js";
+import { IconX } from "@tabler/icons-solidjs";
 import { useCreateJobMutation } from "../api/queries";
 import { dialogOpen, selectProjectInTab, setDialogOpen } from "../store";
 
@@ -77,7 +78,7 @@ const NewProjectDialog: Component = () => {
           <div class="dialog-header">
             <h2>Nuovo progetto</h2>
             <button type="button" class="btn-icon" onClick={close}>
-              &times;
+              <IconX size={16} />
             </button>
           </div>
           <form ref={formRef} onSubmit={onSubmit}>

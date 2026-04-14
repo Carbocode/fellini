@@ -13,7 +13,9 @@ import type {
 
 const MIN_TRACK_PAIR_COUNT = 2;
 const CAPTION_TRACK_ID = "track_subtitle_1";
+const EDITORIAL_RESULT_SOURCE_PREFIX = "editorial:";
 const MIN_SUBTITLE_DURATION = 0.02;
+const EDITORIAL_DECISION_LABELS = new Set(["KEEP", "CUT", "SHORTEN", "MAYBE"]);
 
 function clipDuration(clip: Pick<TimelineClip, "source_in" | "source_out">): number {
   return Math.max(0, clip.source_out - clip.source_in);
@@ -64,13 +66,8 @@ export function projectDuration(project: EditorialProject): number {
 
 function subtitleTrackForProject(project: EditorialProject): TimelineTrack | undefined {
   const orderedTracks = sortedTracks(project);
-  const videoTracks = orderedTracks.filter((track) => track.kind === "video");
-  const emptyVideoTrack = videoTracks.find((track) => !project.clips.some((clip) => (
-    clip.enabled && clip.track_id === track.id
-  )));
-  return emptyVideoTrack
-    ?? videoTracks[0]
-    ?? orderedTracks.find((track) => track.kind === "subtitle");
+  return orderedTracks.find((track) => track.kind === "subtitle")
+    ?? orderedTracks.find((track) => track.id === CAPTION_TRACK_ID);
 }
 
 function clipContainsTime(clip: TimelineClip, time: number): boolean {
@@ -321,12 +318,13 @@ export function normalizeGeneratedSubtitles(project: EditorialProject): Editoria
   }
 
   const manualCaptions = updated.captions.filter((caption) => caption.origin !== "generated");
+  const editorialResultCaptions = updated.captions.filter(isEditorialResultCaption);
   const legacyGeneratedCaptions = updated.captions.filter((caption) => (
-    caption.origin === "generated" && !caption.source_asset_id
+    caption.origin === "generated" && !caption.source_asset_id && !isEditorialResultCaption(caption)
   ));
   const generatedCaptions = materializedGeneratedSubtitles(updated, subtitleTrack.id);
   if (
-    manualCaptions.length === updated.captions.length
+    manualCaptions.length + editorialResultCaptions.length === updated.captions.length
     && !generatedCaptions.length
     && updated === project
   ) {
@@ -336,6 +334,7 @@ export function normalizeGeneratedSubtitles(project: EditorialProject): Editoria
     ...updated,
     captions: [
       ...manualCaptions,
+      ...editorialResultCaptions,
       ...(updated.asset_transcriptions.length ? [] : legacyGeneratedCaptions),
       ...generatedCaptions,
     ],
@@ -396,6 +395,15 @@ export function visibleTimelineCaptions(project: EditorialProject): SubtitleBloc
   ));
 }
 
+export function editorialDecisionLabel(caption: SubtitleBlock): string | null {
+  if (!caption.source_lane_id.startsWith(EDITORIAL_RESULT_SOURCE_PREFIX)) return null;
+  const [, suffix] = caption.source_lane_id.split(EDITORIAL_RESULT_SOURCE_PREFIX, 2);
+  if (!suffix) return null;
+  const parts = suffix.split(":");
+  const label = parts[parts.length - 1] ?? null;
+  return label && EDITORIAL_DECISION_LABELS.has(label) ? label : null;
+}
+
 export function generatedSubtitleGroupsForLane(
   project: EditorialProject,
   laneId: string,
@@ -441,6 +449,10 @@ export function syncGeneratedSubtitlesWithMovedAudioClips(
   _clipIds: string[],
 ): EditorialProject {
   return nextProject;
+}
+
+export function isEditorialResultCaption(caption: SubtitleBlock): boolean {
+  return caption.source_lane_id.startsWith(EDITORIAL_RESULT_SOURCE_PREFIX);
 }
 
 export function laneContentRange(
@@ -583,6 +595,20 @@ function createGeneratedTrack(
   };
 }
 
+function createSubtitleTrack(order: number): TimelineTrack {
+  return {
+    id: CAPTION_TRACK_ID,
+    kind: "subtitle",
+    name: "Editorial",
+    order,
+    visible: true,
+    muted: false,
+    locked: false,
+    auto_generated: true,
+    role: null,
+  };
+}
+
 export function normalizeTrackLayout(project: EditorialProject): EditorialProject {
   const legacyCaptionTrack = sortedTracks(project).find((track) => track.id === CAPTION_TRACK_ID || track.kind === "subtitle");
   const existingPairs = [
@@ -647,16 +673,18 @@ export function normalizeTrackLayout(project: EditorialProject): EditorialProjec
     });
   }
   const nextTracks: TimelineTrack[] = [
-    ...[...nextVideoTracks.reverse(), ...nextAudioTracks].map((track, index) => ({
+    ...[...nextVideoTracks.reverse(), {
+      ...(legacyCaptionTrack ?? createSubtitleTrack(0)),
+      kind: "subtitle" as const,
+      name: "Editorial",
+      role: null,
+      order: 0,
+    }, ...nextAudioTracks].map((track, index) => ({
       ...track,
       order: index,
     })),
   ];
-  const hostTrackId = subtitleTrackForProject({
-    ...project,
-    tracks: nextTracks,
-    captions: project.captions,
-  })?.id ?? null;
+  const hostTrackId = nextTracks.find((track) => track.kind === "subtitle")?.id ?? null;
   const nextCaptions = hostTrackId
     ? project.captions.map((caption) => {
       if (caption.track_id === hostTrackId) return caption;
@@ -686,7 +714,7 @@ export function normalizeTrackLayout(project: EditorialProject): EditorialProjec
 }
 
 export function normalizeEditorialProject(project: EditorialProject): EditorialProject {
-  return normalizeTrackLayout(normalizeGeneratedSubtitles(normalizeClipAssetVariants(project)));
+  return normalizeGeneratedSubtitles(normalizeTrackLayout(normalizeClipAssetVariants(project)));
 }
 
 type PlacementInterval = { min: number; max: number };
@@ -811,6 +839,21 @@ export function resolveClipGroupTrimEndDelta(
     minDelta = Math.max(minDelta, 0.02 - clipDuration(clip));
     if (assetDuration > 0) maxDelta = Math.min(maxDelta, assetDuration - clip.source_out);
     if (Number.isFinite(nextStart)) maxDelta = Math.min(maxDelta, nextStart - (clip.start + clipDuration(clip)));
+  }
+  return Math.min(maxDelta, Math.max(minDelta, desiredDelta));
+}
+
+export function resolveClipGroupSlipDelta(
+  project: EditorialProject,
+  clips: TimelineClip[],
+  desiredDelta: number,
+): number {
+  let minDelta = Number.NEGATIVE_INFINITY;
+  let maxDelta = Number.POSITIVE_INFINITY;
+  for (const clip of clips) {
+    const assetDuration = assetById(project, clip.asset_id)?.duration ?? 0;
+    minDelta = Math.max(minDelta, -clip.source_in);
+    if (assetDuration > 0) maxDelta = Math.min(maxDelta, assetDuration - clip.source_out);
   }
   return Math.min(maxDelta, Math.max(minDelta, desiredDelta));
 }
@@ -951,6 +994,27 @@ export function upsertClip(project: EditorialProject, clip: TimelineClip): Edito
   return upsertClips(project, [clip]);
 }
 
+export function setClipEnabled(project: EditorialProject, clipId: string, enabled: boolean): EditorialProject {
+  const clips = linkedClips(project, clipId);
+  if (!clips.length) return project;
+  if (!enabled) {
+    return upsertClips(project, clips.map((clip) => ({ ...clip, enabled: false })));
+  }
+  const anchorStart = Math.min(...clips.map((clip) => clip.start));
+  const resolvedStart = resolveClipGroupStart(
+    project,
+    clips,
+    anchorStart,
+    clips.map((clip) => clip.id),
+  );
+  const resolvedDelta = resolvedStart - anchorStart;
+  return upsertClips(project, clips.map((clip) => ({
+    ...clip,
+    enabled: true,
+    start: Math.max(0, clip.start + resolvedDelta),
+  })));
+}
+
 export function removeClip(project: EditorialProject, clipId: string): EditorialProject {
   const clips = linkedClips(project, clipId);
   const ids = new Set(clips.map((clip) => clip.id));
@@ -1015,6 +1079,148 @@ export function splitClip(project: EditorialProject, clipId: string, atTime: num
     ...project,
     clips: project.clips.flatMap((item) => replacements.get(item.id) ?? [item]),
   });
+}
+
+export function rippleDeleteRange(
+  project: EditorialProject,
+  start: number,
+  end: number,
+  trackIds?: string[],
+): EditorialProject {
+  const rangeStart = Math.max(0, Math.min(start, end));
+  const rangeEnd = Math.max(rangeStart, Math.max(start, end));
+  const rangeDuration = rangeEnd - rangeStart;
+  if (rangeDuration < 0.02) return project;
+
+  const targetTrackIds = new Set(
+    trackIds?.length
+      ? trackIds
+      : sortedTracks(project)
+        .filter((track) => track.kind === "video" || track.kind === "audio")
+        .map((track) => track.id),
+  );
+  if (!targetTrackIds.size) return project;
+
+  const nextRightLinkedGroupIds = new Map<string, string>();
+  const nextClips = project.clips.flatMap((clip) => {
+    if (!clip.enabled || !targetTrackIds.has(clip.track_id)) return [clip];
+    const clipEnd = clip.start + clipDuration(clip);
+
+    if (clipEnd <= rangeStart) return [clip];
+    if (clip.start >= rangeEnd) {
+      return [{ ...clip, start: Math.max(0, clip.start - rangeDuration) }];
+    }
+    if (clip.start >= rangeStart && clipEnd <= rangeEnd) return [];
+    if (clip.start < rangeStart && clipEnd <= rangeEnd) {
+      const nextSourceOut = clip.source_in + (rangeStart - clip.start);
+      return nextSourceOut - clip.source_in >= 0.02
+        ? [{ ...clip, source_out: nextSourceOut }]
+        : [];
+    }
+    if (clip.start >= rangeStart && clipEnd > rangeEnd) {
+      const removedFromHead = rangeEnd - clip.start;
+      const nextSourceIn = clip.source_in + removedFromHead;
+      return clip.source_out - nextSourceIn >= 0.02
+        ? [{
+            ...clip,
+            start: rangeStart,
+            source_in: nextSourceIn,
+          }]
+        : [];
+    }
+
+    const rightLinkedGroupId = clip.linked_group_id
+      ? (
+          nextRightLinkedGroupIds.get(clip.linked_group_id)
+          ?? `link_${crypto.randomUUID()}`
+        )
+      : null;
+    if (clip.linked_group_id && !nextRightLinkedGroupIds.has(clip.linked_group_id)) {
+      nextRightLinkedGroupIds.set(clip.linked_group_id, rightLinkedGroupId!);
+    }
+    const leftDuration = rangeStart - clip.start;
+    const rightSourceIn = clip.source_in + (rangeEnd - clip.start);
+    const leftClip = leftDuration >= 0.02
+      ? {
+          ...clip,
+          source_out: clip.source_in + leftDuration,
+        }
+      : null;
+    const rightClip = clip.source_out - rightSourceIn >= 0.02
+      ? {
+          ...clip,
+          id: `clip_${crypto.randomUUID()}`,
+          linked_group_id: rightLinkedGroupId,
+          start: rangeStart,
+          source_in: rightSourceIn,
+        }
+      : null;
+    return [leftClip, rightClip].filter((item): item is TimelineClip => Boolean(item));
+  });
+
+  const shouldRippleCaptions = !trackIds || !trackIds.length;
+  const nextCaptions = shouldRippleCaptions
+    ? project.captions.flatMap((caption) => {
+        if (caption.origin === "generated") return [caption];
+        if (caption.end <= rangeStart) return [caption];
+        if (caption.start >= rangeEnd) {
+          return [{
+            ...caption,
+            start: Math.max(0, caption.start - rangeDuration),
+            end: Math.max(0.02, caption.end - rangeDuration),
+          }];
+        }
+        if (caption.start >= rangeStart && caption.end <= rangeEnd) return [];
+        if (caption.start < rangeStart && caption.end <= rangeEnd) {
+          const nextEnd = rangeStart;
+          return nextEnd - caption.start >= MIN_SUBTITLE_DURATION
+            ? [{ ...caption, end: nextEnd }]
+            : [];
+        }
+        if (caption.start >= rangeStart && caption.end > rangeEnd) {
+          const nextEnd = caption.end - rangeDuration;
+          return nextEnd - rangeStart >= MIN_SUBTITLE_DURATION
+            ? [{
+                ...caption,
+                start: rangeStart,
+                end: nextEnd,
+              }]
+            : [];
+        }
+        const nextEnd = caption.end - rangeDuration;
+        return nextEnd - caption.start >= MIN_SUBTITLE_DURATION
+          ? [{ ...caption, end: nextEnd }]
+          : [];
+      })
+    : project.captions;
+
+  return normalizeTrackLayout({
+    ...project,
+    clips: nextClips,
+    captions: nextCaptions,
+  });
+}
+
+export function rippleDeleteClip(project: EditorialProject, clipId: string): EditorialProject {
+  const clips = linkedClips(project, clipId).filter((clip) => clip.enabled);
+  if (!clips.length) return project;
+  const rangesByTrack = new Map<string, { start: number; end: number }>();
+  for (const clip of clips) {
+    const current = rangesByTrack.get(clip.track_id);
+    const clipStart = clip.start;
+    const clipEnd = clip.start + clipDuration(clip);
+    if (!current) {
+      rangesByTrack.set(clip.track_id, { start: clipStart, end: clipEnd });
+      continue;
+    }
+    current.start = Math.min(current.start, clipStart);
+    current.end = Math.max(current.end, clipEnd);
+  }
+  let nextProject = project;
+  for (const [trackId, range] of rangesByTrack.entries()) {
+    nextProject = rippleDeleteRange(nextProject, range.start, range.end, [trackId]);
+  }
+  return nextProject;
 }
 
 export function patchSubtitle(

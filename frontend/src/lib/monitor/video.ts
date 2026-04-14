@@ -1,6 +1,7 @@
 import type { DemuxedVideoTrack } from "./mp4";
 import type {
   DecoderAccelerationPreference,
+  VideoDecodeIntent,
   VideoDecoderWorkerCommand,
   VideoDecoderWorkerEvent,
 } from "./video-worker-types";
@@ -26,6 +27,31 @@ function cachedFrameEndUs(frame: CachedVideoFrame): number {
   return frame.timestampUs + Math.max(1, frame.durationUs);
 }
 
+export type VideoClipPlayerDebugState = {
+  workerReady: boolean;
+  destroyed: boolean;
+  decodedFrames: number;
+  bufferedFrames: number;
+  bufferedRangeStartUs: number | null;
+  bufferedRangeEndUs: number | null;
+  firstFrameTimestampUs: number | null;
+  lastFrameTimestampUs: number | null;
+  selectedAcceleration: DecoderAccelerationPreference | null;
+  lastDispatchedTargetUs: number | null;
+  lastDispatchedPlaying: boolean | null;
+  lastRequestedTargetUs: number | null;
+  lastRequestedPlaying: boolean | null;
+  lastRequestedIntent: VideoDecodeIntent | null;
+  lastNeedsSeek: boolean;
+  lastForceSeek: boolean;
+  lastHadFrameAtTarget: boolean;
+  lastResumeRequiresSeek: boolean;
+  activeSessionToken: number;
+  pendingSessionToken: number | null;
+  pendingWaiters: number;
+  lastError: string | null;
+};
+
 export class VideoClipPlayer {
   private worker: Worker | null = null;
   private workerReady = false;
@@ -39,6 +65,13 @@ export class VideoClipPlayer {
   private lastError: Error | null = null;
   private lastDispatchedTargetUs: number | null = null;
   private lastDispatchedPlaying: boolean | null = null;
+  private lastRequestedTargetUs: number | null = null;
+  private lastRequestedPlaying: boolean | null = null;
+  private lastRequestedIntent: VideoDecodeIntent | null = null;
+  private lastNeedsSeek = false;
+  private lastForceSeek = false;
+  private lastHadFrameAtTarget = false;
+  private lastResumeRequiresSeek = false;
   private destroyed = false;
 
   constructor(
@@ -81,8 +114,11 @@ export class VideoClipPlayer {
   private evictFramesBefore(cutoffUs: number): void {
     const keep: CachedVideoFrame[] = [];
     for (const cached of this.frames) {
-      if (cachedFrameEndUs(cached) < cutoffUs) cached.frame.close();
-      else keep.push(cached);
+      if (cachedFrameEndUs(cached) < cutoffUs) {
+        cached.frame.close();
+      } else {
+        keep.push(cached);
+      }
     }
     this.frames = keep;
   }
@@ -249,6 +285,34 @@ export class VideoClipPlayer {
     return this.selectedAcceleration;
   }
 
+  getDebugState(): VideoClipPlayerDebugState {
+    const bufferedRange = this.bufferedRangeUs();
+    return {
+      workerReady: this.workerReady,
+      destroyed: this.destroyed,
+      decodedFrames: this.decodedFrameCount,
+      bufferedFrames: this.frames.length,
+      bufferedRangeStartUs: bufferedRange?.startUs ?? null,
+      bufferedRangeEndUs: bufferedRange?.endUs ?? null,
+      firstFrameTimestampUs: this.frames[0]?.timestampUs ?? null,
+      lastFrameTimestampUs: this.frames[this.frames.length - 1]?.timestampUs ?? null,
+      selectedAcceleration: this.selectedAcceleration,
+      lastDispatchedTargetUs: this.lastDispatchedTargetUs,
+      lastDispatchedPlaying: this.lastDispatchedPlaying,
+      lastRequestedTargetUs: this.lastRequestedTargetUs,
+      lastRequestedPlaying: this.lastRequestedPlaying,
+      lastRequestedIntent: this.lastRequestedIntent,
+      lastNeedsSeek: this.lastNeedsSeek,
+      lastForceSeek: this.lastForceSeek,
+      lastHadFrameAtTarget: this.lastHadFrameAtTarget,
+      lastResumeRequiresSeek: this.lastResumeRequiresSeek,
+      activeSessionToken: 1,
+      pendingSessionToken: null,
+      pendingWaiters: this.waiters.length,
+      lastError: this.lastError?.message ?? null,
+    };
+  }
+
   async ensureWindow(targetUs: number, playing: boolean): Promise<void> {
     await this.ensureWorker(targetUs, playing);
     const bufferedRange = this.bufferedRangeUs();
@@ -262,6 +326,37 @@ export class VideoClipPlayer {
     this.evictFramesBefore(targetUs - VIDEO_RETAIN_BEFORE_US);
 
     if (needsSeek || !frameAtTarget) {
+      await this.waitForFrameAt(targetUs);
+    }
+  }
+
+  async requestFrame(
+    targetUs: number,
+    options: {
+      playing: boolean;
+      intent: VideoDecodeIntent;
+      blocking: boolean;
+    },
+  ): Promise<void> {
+    this.lastRequestedTargetUs = targetUs;
+    this.lastRequestedPlaying = options.playing;
+    this.lastRequestedIntent = options.intent;
+    this.lastResumeRequiresSeek = options.intent === "play-start";
+
+    const bufferedRange = this.bufferedRangeUs();
+    const frameAtTarget = this.findFrameAt(targetUs);
+    const needsSeek = !!bufferedRange && (
+      ((targetUs < bufferedRange.startUs) && !frameAtTarget)
+      || (!options.playing && targetUs > bufferedRange.endUs)
+    );
+
+    this.lastNeedsSeek = needsSeek;
+    this.lastForceSeek = needsSeek;
+    this.lastHadFrameAtTarget = !!frameAtTarget;
+
+    await this.ensureWindow(targetUs, options.playing);
+
+    if (options.blocking && !this.findFrameAt(targetUs)) {
       await this.waitForFrameAt(targetUs);
     }
   }
@@ -286,3 +381,5 @@ export class VideoClipPlayer {
     this.initReject = null;
   }
 }
+
+export type { VideoDecodeIntent };

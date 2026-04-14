@@ -38,9 +38,7 @@ export function isPreviewableText(path: string): boolean {
 }
 
 export function humanizeMediaName(path: string): string {
-  if (path.endsWith("master_vertical_captioned.mp4")) return "Captioned";
-  if (path.endsWith("master_vertical_clean.mp4")) return "Clean";
-  if (path.endsWith("edited_master.mp4")) return "Edited";
+  if (path.endsWith("edited_master.mp4")) return "Render";
   if (path.endsWith("source_mezzanine.mp4")) return "Source";
   if (path.endsWith("audio_16k_mono.wav")) return "Audio";
   return baseName(path);
@@ -67,8 +65,6 @@ export function buildArtifactCatalog(job: JobSnapshot): ArtifactEntry[] {
 }
 
 const MONITOR_ORDER = [
-  "master_vertical_captioned.mp4",
-  "master_vertical_clean.mp4",
   "edited_master.mp4",
   "source_mezzanine.mp4",
   "audio_16k_mono.wav",

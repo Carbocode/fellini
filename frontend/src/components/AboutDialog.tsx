@@ -1,4 +1,5 @@
 import { For, Show, createEffect, onCleanup, type Component } from "solid-js";
+import { IconMovie, IconX } from "@tabler/icons-solidjs";
 import { aboutDialogOpen, setAboutDialogOpen } from "../store";
 import {
   ABOUT_DETAILS,
@@ -38,7 +39,7 @@ const AboutDialog: Component = () => {
           <div class="dialog-header">
             <h2 id="about-title">About Fellini</h2>
             <button type="button" class="btn-icon" onClick={close} aria-label="Chiudi finestra About">
-              &times;
+              <IconX size={16} />
             </button>
           </div>
           <div class="dialog-body about-dialog-body">
@@ -47,11 +48,7 @@ const AboutDialog: Component = () => {
                 <section class="about-hero-card">
                   <div class="about-hero">
                     <div class="about-logo" aria-hidden="true">
-                      <svg viewBox="0 0 24 24" fill="none">
-                        <rect x="2" y="4" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.5" />
-                        <path d="M10 9l5 3-5 3V9z" fill="currentColor" opacity="0.8" />
-                        <circle cx="6" cy="8" r="1.2" fill="currentColor" opacity="0.5" />
-                      </svg>
+                      <IconMovie />
                     </div>
                     <div class="about-hero-copy">
                       <span class="about-eyebrow">Software inventory</span>

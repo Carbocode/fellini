@@ -103,6 +103,18 @@ type ScheduledAudioNode = {
   gainNode: GainNode;
 };
 
+export type MonitorAudioTransportDebugState = {
+  playing: boolean;
+  contextState: AudioContextState | "uninitialized";
+  contextCurrentTime: number | null;
+  sampleRate: number | null;
+  startContextTime: number;
+  startTimelineTime: number;
+  duration: number;
+  sessionToken: number;
+  scheduledNodeCount: number;
+};
+
 export class MonitorAudioTransport {
   private context: AudioContext | null = null;
   private sessionToken = 0;
@@ -199,6 +211,20 @@ export class MonitorAudioTransport {
 
   isPlaying(): boolean {
     return this.playing;
+  }
+
+  getDebugState(): MonitorAudioTransportDebugState {
+    return {
+      playing: this.playing,
+      contextState: this.context?.state ?? "uninitialized",
+      contextCurrentTime: this.context?.currentTime ?? null,
+      sampleRate: this.context?.sampleRate ?? null,
+      startContextTime: this.startContextTime,
+      startTimelineTime: this.startTimelineTime,
+      duration: this.duration,
+      sessionToken: this.sessionToken,
+      scheduledNodeCount: this.scheduledNodes.size,
+    };
   }
 
   async play(clips: MonitorAudioClip[], startTime: number, duration: number): Promise<void> {

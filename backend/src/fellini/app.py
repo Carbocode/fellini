@@ -265,7 +265,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 return False, "Editorial richiede l'ingest completato."
             project = editorial_projects.ensure(context)
             story_lane = editorial_projects.story_lane(project)
-            story_transcription = editorial_projects.story_lane_transcription(project)
+            story_transcription = editorial_projects.story_lane_editorial_transcript(project)
             legacy_transcript = context.state.aligned_transcript or context.state.raw_transcript
             if not story_lane or (not story_transcription and not legacy_transcript):
                 return False, "Editorial richiede una story lane trascritta."
@@ -292,18 +292,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if not plan or not plan.edited_master:
             return []
 
-        required = [plan.edited_master]
-        if snapshot.request.toggles.render_clean:
-            if not plan.clean_output:
-                return []
-            required.append(plan.clean_output)
-
         resolved: list[str] = []
-        for relative_path in required:
-            target = context.workspace.resolve_relative(relative_path)
-            if not target.exists():
-                return []
-            resolved.append(relative_path)
+        target = context.workspace.resolve_relative(plan.edited_master)
+        if not target.exists():
+            return []
+        resolved.append(plan.edited_master)
         return resolved
 
     def hydrate_snapshot_progress(
@@ -318,6 +311,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 "04_transcript_aligned.json",
             ),
             StepName.editorial: (
+                "05_story_lane_unified_transcript.json",
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
                 "09_render_plan.json",
@@ -353,7 +347,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             and Path(context.state.audio_path).exists()
         )
         project = editorial_projects.ensure(context)
-        story_transcription = editorial_projects.story_lane_transcription(project)
+        story_transcription = editorial_projects.story_lane_editorial_transcript(project)
         transcription_ready = story_transcription is not None or bool(
             context.state.aligned_transcript or context.state.raw_transcript
         )
@@ -923,7 +917,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         return enrich_snapshot(prepared)
 
     @app.get("/jobs/{job_id}/files/{relative_path:path}")
-    async def get_job_file(job_id: str, relative_path: str):
+    async def get_job_file(
+        job_id: str,
+        relative_path: str,
+        download: bool = Query(False),
+    ):
         workspace = JobWorkspace(app_settings.jobs_root, job_id)
         try:
             target = workspace.resolve_relative(relative_path)
@@ -942,6 +940,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=404, detail="File not found")
         logger.debug("api.jobs.file.get job_id=%s path=%s", job_id, relative_path)
+        if download:
+            return FileResponse(
+                target,
+                filename=target.name,
+                content_disposition_type="attachment",
+            )
         return FileResponse(target)
 
     if frontend_dist:

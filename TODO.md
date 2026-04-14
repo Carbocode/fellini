@@ -1,0 +1,2 @@
+- la midle lane editorial non deve essere parte del container video, deve essere un nuovo blocco, non legato a nessuno dei 2 container, come se fosse parte della linea di separazione. Poi deve essere pero' essere almeno la meta' in altezza, metti poi un pulsante nell'header della timeline per disabilitarne e abilitarne la visione
+- Implementare Ctrl+Z 

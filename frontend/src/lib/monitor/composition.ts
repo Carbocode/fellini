@@ -65,7 +65,7 @@ function isActiveAtTime(
   item: Pick<MonitorVideoLayer, "start" | "end"> | Pick<MonitorAudioClip, "start" | "end">,
   time: number,
 ): boolean {
-  return item.start <= time && item.end >= time;
+  return item.start <= time && time < item.end;
 }
 
 function videoLayerDrawOrder(left: MonitorVideoLayer, right: MonitorVideoLayer): number {

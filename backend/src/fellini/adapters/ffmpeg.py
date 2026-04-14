@@ -557,29 +557,18 @@ class FFmpegAdapter:
         render_config: RenderConfig,
         target: Path,
     ) -> None:
-        video_tracks = sorted(
-            [track for track in project.tracks if track.kind == TimelineTrackKind.video and track.visible],
-            key=lambda item: item.order,
-        )
-        audio_tracks = sorted(
-            [track for track in project.tracks if track.kind == TimelineTrackKind.audio and not track.muted],
-            key=lambda item: item.order,
-        )
+        sequence_width = self._sequence_dimension(project.sequence.width, render_config.width)
+        sequence_height = self._sequence_dimension(project.sequence.height, render_config.height)
+        sequence_fps = max(1, round(project.sequence.fps or 30.0))
+        sequence_sample_rate = max(1, round(project.sequence.sample_rate or 48000))
+        sequence_background = self._sequence_background(project.sequence.background)
         duration = self._project_duration(project)
         if duration <= 0:
             msg = "Editorial project has no timeline duration."
             raise FFmpegError(msg)
 
-        video_clips = [
-            clip
-            for track in video_tracks
-            for clip in self._sorted_track_clips(project, track)
-        ]
-        audio_clips = [
-            clip
-            for track in audio_tracks
-            for clip in self._sorted_track_clips(project, track)
-        ]
+        video_clips = self._video_render_clips(project)
+        audio_clips = self._audio_render_clips(project)
         inputs, input_indexes = self._project_inputs_for_clips(
             workspace_root,
             project,
@@ -588,48 +577,62 @@ class FFmpegAdapter:
         )
 
         filters: list[str] = []
-        overlay_inputs: list[str] = []
+        overlay_inputs: list[tuple[str, float, float]] = []
         audio_labels: list[str] = []
 
-        for track in video_tracks:
-            for clip in self._sorted_track_clips(project, track):
-                asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=False)]
-                label = f"v{len(overlay_inputs)}"
-                filters.append(
-                    ",".join(
-                        [
-                            f"[{asset_index}:v]trim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
-                            f"setpts=PTS-STARTPTS+{clip.start:.3f}/TB",
-                            f"scale={render_config.width}:{render_config.height}:force_original_aspect_ratio=decrease",
-                            "setsar=1",
-                        ]
-                    )
-                    + f"[{label}]"
+        for clip in video_clips:
+            asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=False)]
+            label = f"v{len(overlay_inputs)}"
+            crop_left, crop_top, visible_width, visible_height, scaled_width, scaled_height = (
+                self._clip_video_geometry(
+                    project,
+                    clip,
+                    sequence_width=sequence_width,
+                    sequence_height=sequence_height,
                 )
-                overlay_inputs.append(f"[{label}]")
+            )
+            filters.append(
+                ",".join(
+                    [
+                        f"[{asset_index}:v]trim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                        f"setpts=PTS-STARTPTS+{clip.start:.3f}/TB",
+                        f"crop={visible_width}:{visible_height}:{crop_left}:{crop_top}",
+                        f"scale={scaled_width}:{scaled_height}:flags=bicubic",
+                        "setsar=1",
+                        "format=rgba",
+                        (
+                            f"rotate={(clip.transform.rotation or 0.0) * (math.pi / 180):.6f}:"
+                            "ow=rotw(iw):oh=roth(ih):c=none"
+                        ),
+                        f"colorchannelmixer=aa={max(0.0, min(1.0, clip.transform.opacity or 0.0)):.6f}",
+                        "format=rgba",
+                    ]
+                )
+                + f"[{label}]"
+            )
+            overlay_inputs.append((f"[{label}]", clip.transform.x or 0.0, clip.transform.y or 0.0))
 
-        for track in audio_tracks:
-            for clip in self._sorted_track_clips(project, track):
-                asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
-                label = f"a{len(audio_labels)}"
-                delay_ms = max(0, round(clip.start * 1000))
-                duration_clip = max(0.02, clip.source_out - clip.source_in)
-                chain = [
-                    f"[{asset_index}:a]atrim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
-                    "asetpts=PTS-STARTPTS",
-                ]
-                if clip.audio.gain != 1.0:
-                    chain.append(f"volume={clip.audio.gain:.4f}")
-                if clip.audio.fade_in_ms > 0:
-                    chain.append(f"afade=t=in:st=0:d={clip.audio.fade_in_ms / 1000:.3f}")
-                if clip.audio.fade_out_ms > 0:
-                    fade_out_start = max(0.0, duration_clip - (clip.audio.fade_out_ms / 1000))
-                    chain.append(
-                        f"afade=t=out:st={fade_out_start:.3f}:d={clip.audio.fade_out_ms / 1000:.3f}"
-                    )
-                chain.append(f"adelay={delay_ms}|{delay_ms}")
-                filters.append(",".join(chain) + f"[{label}]")
-                audio_labels.append(f"[{label}]")
+        for clip in audio_clips:
+            asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
+            label = f"a{len(audio_labels)}"
+            delay_ms = max(0, round(clip.start * 1000))
+            duration_clip = max(0.02, clip.source_out - clip.source_in)
+            chain = [
+                f"[{asset_index}:a]atrim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            if clip.audio.gain != 1.0:
+                chain.append(f"volume={clip.audio.gain:.4f}")
+            if clip.audio.fade_in_ms > 0:
+                chain.append(f"afade=t=in:st=0:d={clip.audio.fade_in_ms / 1000:.3f}")
+            if clip.audio.fade_out_ms > 0:
+                fade_out_start = max(0.0, duration_clip - (clip.audio.fade_out_ms / 1000))
+                chain.append(
+                    f"afade=t=out:st={fade_out_start:.3f}:d={clip.audio.fade_out_ms / 1000:.3f}"
+                )
+            chain.append(f"adelay={delay_ms}|{delay_ms}")
+            filters.append(",".join(chain) + f"[{label}]")
+            audio_labels.append(f"[{label}]")
 
         args = [
             self.settings.ffmpeg_bin,
@@ -638,8 +641,8 @@ class FFmpegAdapter:
             "lavfi",
             "-i",
             (
-                f"color=c=black:s={render_config.width}x{render_config.height}:"
-                f"r={max(1, round(project.sequence.fps or 30.0))}:d={duration:.3f}"
+                f"color=c={sequence_background}:s={sequence_width}x{sequence_height}:"
+                f"r={sequence_fps}:d={duration:.3f}"
             ),
         ]
         for path in inputs:
@@ -649,17 +652,19 @@ class FFmpegAdapter:
                 "-f",
                 "lavfi",
                 "-i",
-                f"anullsrc=channel_layout=stereo:sample_rate={project.sequence.sample_rate}:d={duration:.3f}",
+                f"anullsrc=channel_layout=stereo:sample_rate={sequence_sample_rate}:d={duration:.3f}",
             ]
         )
 
         base_label = "[0:v]"
-        for overlay_index, overlay_label in enumerate(overlay_inputs):
+        for overlay_index, (overlay_label, translate_x, translate_y) in enumerate(overlay_inputs):
             next_label = f"[vcomp{overlay_index}]"
             filters.append(
                 (
                     f"{base_label}{overlay_label}"
-                    f"overlay=x=(main_w-overlay_w)/2:y=(main_h-overlay_h)/2:eof_action=pass"
+                    f"overlay=x='(main_w-overlay_w)/2+{translate_x:.6f}':"
+                    f"y='(main_h-overlay_h)/2-{translate_y:.6f}':"
+                    "eof_action=pass:format=auto"
                     f"{next_label}"
                 )
             )
@@ -691,7 +696,7 @@ class FFmpegAdapter:
                 video_codec,
                 preset=render_config.preset,
                 crf=render_config.crf,
-                fallback_bitrate=self._fallback_bitrate(render_config.width, render_config.height),
+                fallback_bitrate=self._fallback_bitrate(sequence_width, sequence_height),
             )
         )
         args.extend(
@@ -707,6 +712,113 @@ class FFmpegAdapter:
         )
         self._run(args)
         logger.info("ffmpeg.render_project_master.done target=%s", target)
+
+    def _clip_video_geometry(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+        *,
+        sequence_width: int,
+        sequence_height: int,
+    ) -> tuple[int, int, int, int, int, int]:
+        asset = next((item for item in project.assets if item.id == clip.asset_id), None)
+        if asset is None:
+            msg = f"Asset {clip.asset_id} referenced by clip {clip.id} was not found."
+            raise FFmpegError(msg)
+
+        frame_width = max(1, round(asset.width or sequence_width))
+        frame_height = max(1, round(asset.height or sequence_height))
+        crop = clip.transform.crop
+        crop_left = self._clamp(
+            self._resolve_crop_pixels(crop.left, frame_width),
+            0.0,
+            frame_width - 1,
+        )
+        crop_right = self._clamp(
+            self._resolve_crop_pixels(crop.right, frame_width),
+            0.0,
+            frame_width - crop_left - 1,
+        )
+        crop_top = self._clamp(
+            self._resolve_crop_pixels(crop.top, frame_height),
+            0.0,
+            frame_height - 1,
+        )
+        crop_bottom = self._clamp(
+            self._resolve_crop_pixels(crop.bottom, frame_height),
+            0.0,
+            frame_height - crop_top - 1,
+        )
+        visible_width = max(1, round(frame_width - crop_left - crop_right))
+        visible_height = max(1, round(frame_height - crop_top - crop_bottom))
+        contain_scale = min(sequence_width / visible_width, sequence_height / visible_height)
+        user_scale = max(0.001, clip.transform.scale)
+        scaled_width = max(1, round(visible_width * contain_scale * user_scale))
+        scaled_height = max(1, round(visible_height * contain_scale * user_scale))
+        return (
+            round(crop_left),
+            round(crop_top),
+            visible_width,
+            visible_height,
+            scaled_width,
+            scaled_height,
+        )
+
+    def _video_render_clips(self, project: EditorialProject) -> list[TimelineClip]:
+        track_order = {
+            track.id: track.order
+            for track in project.tracks
+            if track.kind == TimelineTrackKind.video and track.visible
+        }
+        return sorted(
+            [
+                clip
+                for clip in project.clips
+                if clip.enabled and clip.track_id in track_order
+            ],
+            key=lambda item: (-track_order[item.track_id], item.z_index, item.start, item.id),
+        )
+
+    def _audio_render_clips(self, project: EditorialProject) -> list[TimelineClip]:
+        track_order = {
+            track.id: track.order
+            for track in project.tracks
+            if track.kind == TimelineTrackKind.audio and not track.muted
+        }
+        return sorted(
+            [
+                clip
+                for clip in project.clips
+                if clip.enabled
+                and clip.track_id in track_order
+                and not clip.audio.muted
+            ],
+            key=lambda item: (item.start, track_order[item.track_id], item.id),
+        )
+
+    @staticmethod
+    def _resolve_crop_pixels(value: float, dimension: int) -> float:
+        if value <= 0:
+            return 0.0
+        if value < 1:
+            return value * dimension
+        return value
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float) -> float:
+        return min(maximum, max(minimum, value))
+
+    @staticmethod
+    def _sequence_dimension(value: int, fallback: int) -> int:
+        dimension = max(2, round(value or fallback))
+        return dimension if dimension % 2 == 0 else dimension + 1
+
+    @staticmethod
+    def _sequence_background(value: str) -> str:
+        candidate = (value or "#000000").strip()
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", candidate):
+            return "0x" + candidate[1:]
+        return candidate or "black"
 
     def _normalize_clip(self, source: Path, target: Path) -> None:
         video_codec = self._resolve_video_encoder("libx264")
@@ -767,8 +879,7 @@ class FFmpegAdapter:
             encoding="utf-8",
         )
 
-    @staticmethod
-    def _project_duration(project: EditorialProject) -> float:
+    def _project_duration(self, project: EditorialProject) -> float:
         max_end = 0.0
         for clip in project.clips:
             if clip.enabled:

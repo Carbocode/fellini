@@ -18,3 +18,5 @@ frontend/dist/
 .DS_Store
 test-videos/
 pretrained_models/
+.claude
+.agents

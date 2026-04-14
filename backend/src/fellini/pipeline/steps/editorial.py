@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-from uuid import uuid4
-
 from fellini.domain.models import (
-    ClipOrigin,
     StepName,
-    TimelineClip,
-    TimelineTrackKind,
-    TranscriptArtifact,
 )
 from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
@@ -23,22 +17,13 @@ class EditorialStep(PipelineStep):
     def run(self, context: PipelineContext) -> list[str]:
         project = context.editorial_projects.ensure(context)
         story_lane = context.editorial_projects.story_lane(project)
-        lane_transcription = (
-            context.editorial_projects.story_lane_transcription(project) if story_lane else None
-        )
         transcript = (
-            TranscriptArtifact(
-                language=lane_transcription.language,
-                segments=lane_transcription.segments,
-                source=f"lane:{lane_transcription.lane_id}",
-            )
-            if lane_transcription
+            context.editorial_projects.story_lane_editorial_transcript(project)
+            if story_lane
             else context.state.aligned_transcript
-            or context.state.raw_transcript
-            or context.transcriber._empty_transcript(
-                context.request.language,
-                "empty",
-            )
+        ) or context.state.aligned_transcript or context.state.raw_transcript or context.transcriber._empty_transcript(
+            context.request.language,
+            "empty",
         )
         logger.info(
             "step.editorial.start transcript_source=%s transcript_segments=%s duration=%.3f llm_refine=%s",
@@ -46,6 +31,10 @@ class EditorialStep(PipelineStep):
             len(transcript.segments),
             context.state.duration_seconds,
             context.request.toggles.use_local_llm,
+        )
+        unified_transcript_artifact = context.save_json_artifact(
+            "05_story_lane_unified_transcript.json",
+            transcript,
         )
         context.report_progress(self.name, 10, "Analisi del transcript")
         bundle = context.decision_engine.build_editorial_bundle(
@@ -79,51 +68,15 @@ class EditorialStep(PipelineStep):
         context.state.render_plan = bundle.render_plan
 
         context.report_progress(self.name, 90, "Salvataggio artefatti editorial")
-        source_asset = next((asset for asset in project.assets if asset.origin == "ingest"), None)
-        if source_asset and story_lane:
-            primary_video_track = next(
-                (track for track in project.tracks if track.kind == TimelineTrackKind.video),
-                None,
+        if story_lane:
+            project = context.editorial_projects.clear_generated_clips(project)
+            project = context.editorial_projects.replace_editorial_result_captions(
+                project,
+                story_lane_id=story_lane.id,
+                spans=context.state.labeled_spans,
             )
-            if primary_video_track:
-                preserved = []
-                for clip in project.clips:
-                    if clip.origin != ClipOrigin.generated:
-                        preserved.append(clip)
-                        continue
-                    if clip.track_id not in {primary_video_track.id, story_lane.id}:
-                        preserved.append(clip)
-                project.clips = preserved
-                cursor = 0.0
-                for index, keep_range in enumerate(context.state.edl.keep_ranges):
-                    duration = max(0.02, keep_range.end - keep_range.start)
-                    linked_group_id = f"link_gen_{uuid4().hex[:8]}_{index:03d}"
-                    project.clips.append(
-                        TimelineClip(
-                            id=f"clip_gen_v_{uuid4().hex[:8]}_{index:03d}",
-                            asset_id=source_asset.id,
-                            track_id=primary_video_track.id,
-                            linked_group_id=linked_group_id,
-                            start=cursor,
-                            source_in=keep_range.start,
-                            source_out=keep_range.end,
-                            origin=ClipOrigin.generated,
-                        )
-                    )
-                    project.clips.append(
-                        TimelineClip(
-                            id=f"clip_gen_a_{uuid4().hex[:8]}_{index:03d}",
-                            asset_id=source_asset.id,
-                            track_id=story_lane.id,
-                            linked_group_id=linked_group_id,
-                            start=cursor,
-                            source_in=keep_range.start,
-                            source_out=keep_range.end,
-                            origin=ClipOrigin.generated,
-                        )
-                    )
-                    cursor += duration
-                project = context.editorial_projects.save(context.workspace, project)
+        if story_lane:
+            project = context.editorial_projects.save(context.workspace, project)
         spans_artifact = context.save_json_artifact(
             "05_spans_labeled.json",
             {"spans": [span.model_dump(mode="json") for span in spans]},
@@ -141,6 +94,7 @@ class EditorialStep(PipelineStep):
             len(context.state.captions.chunks) if context.state.captions else 0,
         )
         return [
+            unified_transcript_artifact,
             spans_artifact,
             edl_artifact,
             captions_artifact,

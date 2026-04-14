@@ -6,9 +6,43 @@ import {
   createSignal,
   on,
   onCleanup,
+  untrack,
   type Accessor,
   type Component,
 } from "solid-js";
+import {
+  IconArrowsLeftRight,
+  IconBracketsContain,
+  IconChevronRight,
+  IconCrop,
+  IconEye,
+  IconEyeOff,
+  IconLayoutGrid,
+  IconLayoutList,
+  IconLayoutSidebarLeftCollapse,
+  IconLayoutSidebarLeftExpand,
+  IconMinus,
+  IconPlayerPause,
+  IconPlayerPlay,
+  IconPlayerSkipBack,
+  IconPlayerSkipForward,
+  IconPlayerTrackNext,
+  IconPlayerTrackPrev,
+  IconPlus,
+  IconPointer,
+  IconRepeat,
+  IconScissors,
+  IconSearch,
+  IconSquareRoundedCheck,
+  IconSquareRoundedX,
+  IconTrash,
+  IconTrashX,
+  IconVideo,
+  IconVolume2,
+  IconVolumeOff,
+  IconWaveSquare,
+  IconX,
+} from "@tabler/icons-solidjs";
 import { useQueryClient } from "@tanstack/solid-query";
 import WaveSurfer, { type WaveSurferOptions } from "wavesurfer.js";
 import {
@@ -16,10 +50,13 @@ import {
   useJobPolling,
   useJobQuery,
   useRequestAssetPreviewsMutation,
+  useRunStepMutation,
   useUpdateEditorialProjectMutation,
+  useUpdateRequestMutation,
   useUploadEditorialAssetMutation,
 } from "../api/queries";
 import { fileUrl } from "../api/client";
+import { extractVideoThumbnail } from "../lib/monitor/thumbnail";
 import {
   autoFollow,
   frameStepRequest,
@@ -39,12 +76,17 @@ import {
   setSelectedClipId,
   setSelectedSubtitleId,
   setSelectedTrackId,
+  setTimelineRangeLoopEnabled,
+  setTimelineRangeSelection,
   updateTabLabel,
+  timelineRangeLoopEnabled,
+  timelineRangeSelection,
 } from "../store";
 import type {
   AssetPreviewBundle,
   AssetPreviewEntry,
   EditorialProject,
+  JobRequest,
   JobSnapshot,
   ProjectAsset,
   SubtitleBlock,
@@ -55,20 +97,27 @@ import {
   assetById,
   compatibleTrack,
   createClipsForAssetDrop,
+  editorialDecisionLabel,
   getClip,
   getSubtitleBlock,
   getTrack,
   generatedSubtitleGroupsForLane,
+  isEditorialResultCaption,
   laneContentRange,
   linkedClips,
   mediaPathForClip,
   normalizeEditorialProject,
   patchSubtitle,
   projectDuration,
+  removeClip,
+  rippleDeleteClip,
+  rippleDeleteRange,
   retargetClipGroup,
   resolveClipGroupStart,
+  resolveClipGroupSlipDelta,
   resolveClipGroupTrimEndDelta,
   resolveClipGroupTrimStartDelta,
+  setClipEnabled,
   sortedTracks,
   splitClip,
   subtitleTrack,
@@ -80,7 +129,10 @@ import {
   upsertClips,
   visibleTimelineCaptions,
 } from "../lib/editorial";
-import { compileMonitorComposition } from "../lib/monitor/composition";
+import {
+  compileMonitorComposition,
+  type MonitorComposition,
+} from "../lib/monitor/composition";
 import {
   CanvasMonitorRuntime,
   type MonitorDiagnostics,
@@ -92,6 +144,7 @@ import {
   humanizeMediaName,
 } from "../lib/utils";
 import PipelineBar from "./PipelineBar";
+import type { ToolStep } from "./PipelineBar";
 import ParamsInspector from "./ParamsInspector";
 
 const TIMELINE_SPLITTER_HEIGHT = 4;
@@ -100,6 +153,8 @@ const MIN_TIMELINE_HEIGHT = 180;
 const MIN_TOP_WORKSPACE_HEIGHT = 220;
 const MIN_BROWSER_WIDTH = 220;
 const MAX_BROWSER_WIDTH = 440;
+const MIN_MONITOR_DEBUG_WIDTH = 176;
+const MAX_MONITOR_DEBUG_WIDTH = 520;
 const BASE_PX_PER_SEC = 30;
 const ZOOM_STEPS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32];
 const DEFAULT_ZOOM_INDEX = 3;
@@ -107,6 +162,16 @@ const ZOOM_WHEEL_THRESHOLD = 18;
 const TIMELINE_TAIL_RATIO = 0.5;
 const TIMELINE_TAIL_MIN_SECONDS = 60;
 const TIMELINE_TAIL_MAX_SECONDS = 600;
+type TimelineTool =
+  | "select"
+  | "range"
+  | "cut"
+  | "delete"
+  | "ripple_delete"
+  | "trim"
+  | "slip"
+  | "disable"
+  | "enable";
 const RULER_MINOR_STEPS = [0.04, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
 const RULER_MINOR_TARGET_PX = 10;
 const RULER_LABEL_EVERY_N_TICKS = 10;
@@ -118,8 +183,17 @@ const WAVEFORM_SAMPLES_PER_DEVICE_PIXEL = 1;
 const WAVEFORM_MIN_RENDER_PEAKS = 64;
 const WAVEFORM_MAX_RENDER_PEAKS = 65536;
 const FRAME_STEP_EPSILON = 1e-9;
+const JOB_TOOL_SIDEBAR_WIDTH = 360;
+const EDITORIAL_STANDALONE_HEIGHT = Math.max(Math.ceil(trackHeight("subtitle") / 2), 36);
+const CANVAS_PRESETS = [
+  { id: "vertical", label: "Vertical", width: 1080, height: 1920 },
+  { id: "landscape", label: "Landscape", width: 1920, height: 1080 },
+  { id: "square", label: "Square", width: 1080, height: 1080 },
+  { id: "hd-vertical", label: "Vertical HD", width: 720, height: 1280 },
+] as const;
 
 type ProjectUpdater = EditorialProject | ((current: EditorialProject) => EditorialProject);
+type SidebarView = "assets" | "logs";
 type WaveformData = {
   version: number;
   metric: string;
@@ -130,6 +204,131 @@ type WaveformData = {
 };
 
 const waveformDataCache = new Map<string, Promise<WaveformData> | WaveformData>();
+
+function monitorCompositionSyncKey(value: MonitorComposition | null): string {
+  if (!value) return "null";
+  return JSON.stringify({
+    duration: value.duration,
+    sequence: value.sequence,
+    videoLayers: value.videoLayers,
+    audioClips: value.audioClips,
+  });
+}
+
+function formatMonitorDebugTime(value: number | null): string {
+  return value === null ? "—" : fmtTimePrecise(value);
+}
+
+function formatMonitorDebugUs(value: number | null): string {
+  return value === null ? "—" : `${(value / 1_000_000).toFixed(3)}s`;
+}
+
+function cloneJobRequest(request: JobRequest): JobRequest {
+  return JSON.parse(JSON.stringify(request)) as JobRequest;
+}
+
+function triggerBrowserDownload(url: string, filename: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  queueMicrotask(() => anchor.remove());
+}
+
+function evenDimension(value: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  const normalized = Math.max(256, Math.round(value));
+  return normalized % 2 === 0 ? normalized : normalized + 1;
+}
+
+const TimelineToolIcon: Component<{ tool: TimelineTool }> = (props) => {
+  switch (props.tool) {
+    case "select":
+      return <IconPointer aria-hidden="true" />;
+    case "range":
+      return <IconBracketsContain aria-hidden="true" />;
+    case "cut":
+      return <IconScissors aria-hidden="true" />;
+    case "delete":
+      return <IconTrash aria-hidden="true" />;
+    case "ripple_delete":
+      return <IconTrashX aria-hidden="true" />;
+    case "trim":
+      return <IconCrop aria-hidden="true" />;
+    case "slip":
+      return <IconArrowsLeftRight aria-hidden="true" />;
+    case "disable":
+      return <IconSquareRoundedX aria-hidden="true" />;
+    case "enable":
+      return <IconSquareRoundedCheck aria-hidden="true" />;
+  }
+};
+
+const TIMELINE_TOOL_BUTTONS: Array<{
+  tool: TimelineTool;
+  label: string;
+  tooltip: string;
+  danger?: boolean;
+}> = [
+  {
+    tool: "select",
+    label: "Select",
+    tooltip: "Select: seleziona le clip e trascinale sulla timeline.",
+  },
+  {
+    tool: "range",
+    label: "Range",
+    tooltip: "Range: trascina nel ruler o nello spazio vuoto per creare una selezione temporale.",
+  },
+  {
+    tool: "cut",
+    label: "Taglia",
+    tooltip: "Taglia: clicca una clip per dividerla nel punto del mouse.",
+  },
+  {
+    tool: "delete",
+    label: "Delete",
+    tooltip: "Delete: rimuove la clip selezionata e lascia il gap in timeline.",
+    danger: true,
+  },
+  {
+    tool: "ripple_delete",
+    label: "Ripple Delete",
+    tooltip: "Ripple Delete: rimuove la clip o la range attiva e richiude automaticamente il gap.",
+    danger: true,
+  },
+  {
+    tool: "trim",
+    label: "Trim",
+    tooltip: "Trim: trascina una clip per rifilarla dal lato più vicino al mouse.",
+  },
+  {
+    tool: "slip",
+    label: "Slip",
+    tooltip: "Slip: trascina una clip per spostare il contenuto interno senza muoverla in timeline.",
+  },
+  {
+    tool: "disable",
+    label: "Disable",
+    tooltip: "Disable: clicca una clip attiva per disabilitarla senza cancellarla.",
+  },
+  {
+    tool: "enable",
+    label: "Enable",
+    tooltip: "Enable: clicca una clip disabilitata per riattivarla.",
+  },
+];
+
+const TIMELINE_TOOL_GROUPS: TimelineTool[][] = [
+  ["select"],
+  ["range"],
+  ["cut", "delete", "ripple_delete"],
+  ["trim", "slip"],
+  ["disable", "enable"],
+];
 
 function previewBundleForClip(
   asset: ProjectAsset | null | undefined,
@@ -417,6 +616,391 @@ function renderContinuousWaveform(peaks: Array<Float32Array | number[]>, ctx: Ca
   ctx.fill();
   ctx.stroke();
 }
+
+function buildStepRequestPayload(step: ToolStep, draft: JobRequest): Record<string, unknown> {
+  if (step === "editorial") {
+    return {
+      language: draft.language.trim() || "it",
+      editorial_notes: draft.editorial_notes,
+      toggles: {
+        use_local_llm: draft.toggles.use_local_llm,
+      },
+    };
+  }
+
+  return {
+    render: {
+      ...draft.render,
+      width: evenDimension(draft.render.width, 1080),
+      height: evenDimension(draft.render.height, 1920),
+    },
+  };
+}
+
+const StepConfigSidebar: Component<{
+  step: Accessor<ToolStep | null>;
+  job: Accessor<JobSnapshot | undefined>;
+  onClose: () => void;
+}> = (props) => {
+  const updateRequest = useUpdateRequestMutation();
+  const runStep = useRunStepMutation();
+  const [draft, setDraft] = createSignal<JobRequest | null>(null);
+  const [error, setError] = createSignal("");
+
+  createEffect(
+    on(
+      () => [props.step(), props.job()?.id, props.job()?.updated_at] as const,
+      () => {
+        const currentStep = props.step();
+        const currentJob = props.job();
+        if (!currentStep || !currentJob) {
+          setDraft(null);
+          setError("");
+          return;
+        }
+        setDraft(cloneJobRequest(currentJob.request));
+        setError("");
+      },
+    ),
+  );
+
+  const activeStepLabel = createMemo(() =>
+    props.step() === "editorial" ? "Editorial" : props.step() === "render" ? "Render" : "",
+  );
+  const stepSnapshot = createMemo(() => {
+    const currentStep = props.step();
+    const currentJob = props.job();
+    if (!currentStep || !currentJob) return null;
+    return currentJob.steps.find((step) => step.name === currentStep) ?? null;
+  });
+  const running = () => updateRequest.isPending || runStep.isPending;
+
+  const updateDraft = (updater: (current: JobRequest) => JobRequest) => {
+    setDraft((current) => (current ? updater(current) : current));
+  };
+
+  const applyCanvasPreset = (presetId: string) => {
+    const preset = CANVAS_PRESETS.find((item) => item.id === presetId);
+    if (!preset) return;
+    updateDraft((current) => ({
+      ...current,
+      render: {
+        ...current.render,
+        width: preset.width,
+        height: preset.height,
+      },
+    }));
+  };
+
+  const submit = async () => {
+    const currentStep = props.step();
+    const currentJob = props.job();
+    const currentDraft = draft();
+    if (!currentStep || !currentJob || !currentDraft || !stepSnapshot()?.can_run) return;
+    setError("");
+    try {
+      const payload = buildStepRequestPayload(currentStep, currentDraft);
+      await updateRequest.mutateAsync({ jobId: currentJob.id, payload });
+      await runStep.mutateAsync({ jobId: currentJob.id, stepName: currentStep });
+      props.onClose();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Errore durante l'avvio del job.");
+    }
+  };
+
+  return (
+    <Show when={props.step() && draft()}>
+      <aside class="job-tool-sidebar">
+        <div class="job-tool-sidebar__body">
+          <div class="inspector-accordion-stack">
+          <Show when={props.step() === "editorial" && draft()}>
+            {(currentDraft) => (
+              <details class="inspector-accordion" open>
+                <summary class="inspector-accordion-summary">
+                  <div class="inspector-accordion-head">
+                    <span class="inspector-accordion-symbol" aria-hidden="true"><IconScissors /></span>
+                    <div class="inspector-accordion-copy">
+                      <span class="inspector-accordion-title">Decisione editoriale</span>
+                      <span class="inspector-accordion-meta">LLM + note</span>
+                    </div>
+                  </div>
+                  <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
+                </summary>
+                <div class="inspector-accordion-body">
+                  <label class="form-field">
+                    <span>Lingua</span>
+                    <input
+                      type="text"
+                      value={currentDraft().language}
+                      onInput={(event) =>
+                        updateDraft((request) => ({ ...request, language: event.currentTarget.value }))
+                      }
+                    />
+                  </label>
+                  <div class="inspector-card-row">
+                    <span>Usa local LLM</span>
+                    <input
+                      type="checkbox"
+                      checked={currentDraft().toggles.use_local_llm}
+                      onChange={(event) =>
+                        updateDraft((request) => ({
+                          ...request,
+                          toggles: {
+                            ...request.toggles,
+                            use_local_llm: event.currentTarget.checked,
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                  <label class="form-field">
+                    <span>Note editoriali</span>
+                    <textarea
+                      rows="8"
+                      value={currentDraft().editorial_notes}
+                      placeholder="Hook, tono, pacing, vincoli di taglio, CTA..."
+                      onInput={(event) =>
+                        updateDraft((request) => ({
+                          ...request,
+                          editorial_notes: event.currentTarget.value,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+              </details>
+            )}
+          </Show>
+
+          <Show when={props.step() === "render" && draft()}>
+            {(currentDraft) => (
+              <>
+                <details class="inspector-accordion" open>
+                  <summary class="inspector-accordion-summary">
+                    <div class="inspector-accordion-head">
+                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconVideo /></span>
+                      <div class="inspector-accordion-copy">
+                        <span class="inspector-accordion-title">Output</span>
+                        <span class="inspector-accordion-meta">Unico export finale</span>
+                      </div>
+                    </div>
+                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
+                  </summary>
+                  <div class="inspector-accordion-body">
+                    <p class="inspector-note">
+                      Il render esporta una sola versione finale della timeline, coerente con il canvas della preview.
+                    </p>
+                  </div>
+                </details>
+
+                <details class="inspector-accordion" open>
+                  <summary class="inspector-accordion-summary">
+                    <div class="inspector-accordion-head">
+                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconBracketsContain /></span>
+                      <div class="inspector-accordion-copy">
+                        <span class="inspector-accordion-title">Canvas</span>
+                        <span class="inspector-accordion-meta">
+                          {currentDraft().render.width}×{currentDraft().render.height}
+                        </span>
+                      </div>
+                    </div>
+                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
+                  </summary>
+                  <div class="inspector-accordion-body">
+                    <label class="form-field">
+                      <span>Preset</span>
+                      <select
+                        value={
+                          CANVAS_PRESETS.find(
+                            (preset) =>
+                              preset.width === currentDraft().render.width
+                              && preset.height === currentDraft().render.height,
+                          )?.id ?? ""
+                        }
+                        onInput={(event) => applyCanvasPreset(event.currentTarget.value)}
+                      >
+                        <option value="">Custom</option>
+                        <For each={CANVAS_PRESETS}>
+                          {(preset) => (
+                            <option value={preset.id}>
+                              {preset.label} {preset.width}×{preset.height}
+                            </option>
+                          )}
+                        </For>
+                      </select>
+                    </label>
+                    <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
+                      <label class="form-field">
+                        <span>Width</span>
+                        <input
+                          type="number"
+                          min="256"
+                          step="2"
+                          value={currentDraft().render.width}
+                          onInput={(event) =>
+                            updateDraft((request) => ({
+                              ...request,
+                              render: {
+                                ...request.render,
+                                width: Number(event.currentTarget.value || request.render.width),
+                              },
+                            }))
+                          }
+                        />
+                      </label>
+                      <label class="form-field">
+                        <span>Height</span>
+                        <input
+                          type="number"
+                          min="256"
+                          step="2"
+                          value={currentDraft().render.height}
+                          onInput={(event) =>
+                            updateDraft((request) => ({
+                              ...request,
+                              render: {
+                                ...request.render,
+                                height: Number(event.currentTarget.value || request.render.height),
+                              },
+                            }))
+                          }
+                        />
+                      </label>
+                    </div>
+                  </div>
+                </details>
+
+                <details class="inspector-accordion">
+                  <summary class="inspector-accordion-summary">
+                    <div class="inspector-accordion-head">
+                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconWaveSquare /></span>
+                      <div class="inspector-accordion-copy">
+                        <span class="inspector-accordion-title">Encoding</span>
+                        <span class="inspector-accordion-meta">ffmpeg</span>
+                      </div>
+                    </div>
+                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
+                  </summary>
+                  <div class="inspector-accordion-body">
+                    <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
+                      <label class="form-field">
+                        <span>Video codec</span>
+                        <select
+                          value={currentDraft().render.video_codec}
+                          onInput={(event) =>
+                            updateDraft((request) => ({
+                              ...request,
+                              render: { ...request.render, video_codec: event.currentTarget.value },
+                            }))
+                          }
+                        >
+                          <option value="libx264">libx264</option>
+                          <option value="h264_videotoolbox">h264_videotoolbox</option>
+                          <option value="hevc_videotoolbox">hevc_videotoolbox</option>
+                        </select>
+                      </label>
+                      <label class="form-field">
+                        <span>Audio codec</span>
+                        <select
+                          value={currentDraft().render.audio_codec}
+                          onInput={(event) =>
+                            updateDraft((request) => ({
+                              ...request,
+                              render: { ...request.render, audio_codec: event.currentTarget.value },
+                            }))
+                          }
+                        >
+                          <option value="aac">aac</option>
+                          <option value="mp3">mp3</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div class="form-row" style={{ "grid-template-columns": "1fr 1fr 1fr" }}>
+                    <label class="form-field">
+                      <span>Preset</span>
+                      <select
+                        value={currentDraft().render.preset}
+                        onInput={(event) =>
+                          updateDraft((request) => ({
+                            ...request,
+                            render: { ...request.render, preset: event.currentTarget.value },
+                          }))
+                        }
+                      >
+                        <option value="veryfast">veryfast</option>
+                        <option value="faster">faster</option>
+                        <option value="fast">fast</option>
+                        <option value="medium">medium</option>
+                        <option value="slow">slow</option>
+                        <option value="slower">slower</option>
+                      </select>
+                    </label>
+                    <label class="form-field">
+                      <span>CRF</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="35"
+                        value={currentDraft().render.crf}
+                        onInput={(event) =>
+                          updateDraft((request) => ({
+                            ...request,
+                            render: {
+                              ...request.render,
+                              crf: Number(event.currentTarget.value || request.render.crf),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label class="form-field">
+                      <span>Audio bitrate</span>
+                      <input
+                        type="text"
+                        value={currentDraft().render.audio_bitrate}
+                        onInput={(event) =>
+                          updateDraft((request) => ({
+                            ...request,
+                            render: {
+                              ...request.render,
+                              audio_bitrate: event.currentTarget.value,
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    </div>
+                  </div>
+                </details>
+
+              </>
+            )}
+          </Show>
+          </div>
+        </div>
+
+        <div class="job-tool-sidebar__footer">
+          <div class={`job-tool-sidebar__status${error() ? " error" : ""}`}>
+            {error()
+              || stepSnapshot()?.blocked_reason
+              || (running() ? "Salvataggio configurazione e avvio job..." : "")}
+          </div>
+          <button type="button" class="btn btn-ghost" onClick={props.onClose} disabled={running()}>
+            Annulla
+          </button>
+          <button
+            type="button"
+            class="btn btn-primary"
+            onClick={() => void submit()}
+            disabled={running() || !stepSnapshot()?.can_run}
+          >
+            Avvia {activeStepLabel()}
+          </button>
+        </div>
+      </aside>
+    </Show>
+  );
+};
 
 const WaveformClipPreview: Component<{
   src: string;
@@ -829,6 +1413,10 @@ const Workspace: Component = () => {
   const [timelineHeight, setTimelineHeight] = createSignal<number | null>(null);
   const [browserWidth, setBrowserWidth] = createSignal(280);
   const [sidebarCollapsed, setSidebarCollapsed] = createSignal(readPersistedSidebarCollapsed());
+  const [sidebarView, setSidebarView] = createSignal<SidebarView>("assets");
+  const [activeToolSidebar, setActiveToolSidebar] = createSignal<ToolStep | null>(null);
+  let pendingRenderDownloadJobId: string | null = null;
+  const downloadedRenderKeys = new Set<string>();
   let editorMainRef: HTMLDivElement | undefined;
   let saveHandle: ReturnType<typeof setTimeout> | undefined;
 
@@ -848,6 +1436,58 @@ const Workspace: Component = () => {
       (status) => {
         if (status === "running") polling.start();
         else polling.stop();
+      },
+    ),
+  );
+  createEffect(
+    on(
+      () => {
+        const snapshot = data();
+        const renderStep = snapshot?.steps.find((step) => step.name === "render") ?? null;
+        return {
+          jobId: selectedJobId(),
+          status: snapshot?.status ?? null,
+          currentStep: snapshot?.current_step ?? null,
+          output: snapshot?.outputs[0] ?? null,
+          renderStatus: renderStep?.status ?? null,
+          renderFinishedAt: renderStep?.finished_at ?? null,
+        } as const;
+      },
+      (state) => {
+        if (!state.jobId) {
+          pendingRenderDownloadJobId = null;
+          return;
+        }
+        if (pendingRenderDownloadJobId && pendingRenderDownloadJobId !== state.jobId) {
+          pendingRenderDownloadJobId = null;
+        }
+        if (state.status === "running" && state.currentStep === "render") {
+          pendingRenderDownloadJobId = state.jobId;
+          return;
+        }
+        if (state.status === "failed" && pendingRenderDownloadJobId === state.jobId) {
+          pendingRenderDownloadJobId = null;
+          return;
+        }
+        if (
+          state.status !== "completed"
+          || state.renderStatus !== "completed"
+          || pendingRenderDownloadJobId !== state.jobId
+          || !state.output
+        ) {
+          return;
+        }
+        const downloadKey = `${state.jobId}:${state.renderFinishedAt ?? ""}:${state.output}`;
+        if (downloadedRenderKeys.has(downloadKey)) {
+          pendingRenderDownloadJobId = null;
+          return;
+        }
+        downloadedRenderKeys.add(downloadKey);
+        pendingRenderDownloadJobId = null;
+        triggerBrowserDownload(
+          fileUrl(state.jobId, state.output, { download: true }),
+          baseName(state.output),
+        );
       },
     ),
   );
@@ -979,13 +1619,28 @@ const Workspace: Component = () => {
     return Math.max(MIN_TIMELINE_HEIGHT, Math.min(maxHeight, Math.round(height)));
   };
   const editorShellColumns = () =>
-    sidebarCollapsed()
-      ? `0px 0px minmax(0, 1fr)`
-      : `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`;
+    [
+      sidebarCollapsed()
+        ? "0px 0px minmax(0, 1fr)"
+        : `${browserWidth()}px ${PANEL_SPLITTER_WIDTH}px minmax(0, 1fr)`,
+      activeToolSidebar() ? `1px ${JOB_TOOL_SIDEBAR_WIDTH}px` : "0px 0px",
+    ].join(" ");
   const editorMainRows = () =>
     timelineHeight() === null
       ? `minmax(0, 1fr) ${TIMELINE_SPLITTER_HEIGHT}px minmax(0, 1fr)`
       : `minmax(0, 1fr) ${TIMELINE_SPLITTER_HEIGHT}px ${timelineHeight()}px`;
+  const onSidebarSegmentSelect = (view: SidebarView) => {
+    if (!sidebarCollapsed() && sidebarView() === view) {
+      setSidebarCollapsed(true);
+      return;
+    }
+    setSidebarView(view);
+    if (sidebarCollapsed()) setSidebarCollapsed(false);
+  };
+  const onToolSelect = (step: ToolStep) => {
+    setActiveToolSidebar((current) => (current === step ? null : step));
+  };
+  const closeToolSidebar = () => setActiveToolSidebar(null);
 
   const onBrowserResizeStart = (e: PointerEvent) => {
     e.preventDefault();
@@ -1040,9 +1695,20 @@ const Workspace: Component = () => {
     <main class="workspace">
       <Show when={data()} fallback={<div class="empty-state"><div class="empty-content"><p>Caricamento progetto...</p></div></div>}>
         <div class="project-workspace">
+          <div class="pipeline-bar-row">
+            <PipelineBar
+              assetCount={draftProject()?.assets.length ?? 0}
+              logCount={(data()?.logs ?? []).length}
+              sidebarOpen={!sidebarCollapsed()}
+              sidebarView={sidebarView()}
+              onSidebarSegmentSelect={onSidebarSegmentSelect}
+              activeToolSidebar={activeToolSidebar()}
+              onToolSelect={onToolSelect}
+            />
+          </div>
           <div class="editor-shell" style={{ "grid-template-columns": editorShellColumns() }}>
             <div class="browser-col" style={{ overflow: "hidden" }}>
-              <AssetBrowserPanel project={draftProject} />
+              <AssetBrowserPanel project={draftProject} view={sidebarView} />
             </div>
             <div
               class="browser-resize-handle"
@@ -1050,25 +1716,18 @@ const Workspace: Component = () => {
               onPointerDown={onBrowserResizeStart}
             />
             <div class="editor-main-wrap">
-              <div class="pipeline-bar-row">
-                <button
-                  type="button"
-                  class="sidebar-toggle-btn"
-                  title={sidebarCollapsed() ? "Mostra sidebar" : "Nascondi sidebar"}
-                  onClick={() => setSidebarCollapsed((value) => !value)}
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3" y="3" width="18" height="18" rx="2" />
-                    <line x1="9" y1="3" x2="9" y2="21" />
-                  </svg>
-                </button>
-                <PipelineBar />
-              </div>
               <div ref={editorMainRef} class="editor-main" style={{ "grid-template-rows": editorMainRows() }}>
                 <WorkspaceGrid project={draftProject} updateProject={updateProject} />
                 <div class="workspace-vsplit" onPointerDown={onTimelineResizeStart} />
                 <TimelinePanel project={draftProject} updateProject={updateProject} />
               </div>
+            </div>
+            <div
+              class="job-tool-sidebar-divider"
+              style={{ visibility: activeToolSidebar() ? "visible" : "hidden" }}
+            />
+            <div class="job-tool-sidebar-col">
+              <StepConfigSidebar step={activeToolSidebar} job={data} onClose={closeToolSidebar} />
             </div>
           </div>
         </div>
@@ -1112,7 +1771,10 @@ const WorkspaceGrid: Component<{
   );
 };
 
-const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
+const AssetBrowserPanel: Component<{
+  project: Accessor<EditorialProject | null>;
+  view: Accessor<SidebarView>;
+}> = (props) => {
   const job = useJobQuery(selectedJobId);
   const requestAssetPreviews = useRequestAssetPreviewsMutation();
   const uploadAsset = useUploadEditorialAssetMutation();
@@ -1120,7 +1782,8 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
   const [selectedAssetId, setSelectedAssetId] = createSignal<string | null>(null);
   const [previewAssetId, setPreviewAssetId] = createSignal<string | null>(null);
   const [draggingAssetId, setDraggingAssetId] = createSignal<string | null>(null);
-  const [activeTab, setActiveTab] = createSignal<"assets" | "logs">("assets");
+  const [viewMode, setViewMode] = createSignal<"grid" | "list">("grid");
+  const [thumbnails, setThumbnails] = createSignal<Map<string, string>>(new Map());
   let inputRef: HTMLInputElement | undefined;
 
   const project = () => props.project();
@@ -1140,6 +1803,24 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
     return current && jobId ? fileUrl(jobId, current.path) : null;
   });
   const logs = createMemo(() => (job.data as JobSnapshot | undefined)?.logs ?? []);
+
+  createEffect(() => {
+    const jobId = selectedJobId();
+    if (!jobId) return;
+    for (const asset of assets()) {
+      if (asset.kind !== "video") continue;
+      if (thumbnails().has(asset.id)) continue;
+      const url = fileUrl(jobId, asset.path);
+      extractVideoThumbnail(url).then((thumb) => {
+        if (!thumb) return;
+        setThumbnails((prev) => {
+          const next = new Map(prev);
+          next.set(asset.id, thumb);
+          return next;
+        });
+      });
+    }
+  });
 
   const openAssetPreview = (asset: ProjectAsset) => {
     setSelectedAssetId(asset.id);
@@ -1161,23 +1842,7 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
 
   return (
     <div class="panel asset-explorer">
-      <div class="sidebar-tabs">
-        <button type="button" class={`sidebar-tab${activeTab() === "assets" ? " active" : ""}`} onClick={() => setActiveTab("assets")}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2v11z" />
-          </svg>
-          Assets
-          <span class="sidebar-tab-badge">{assets().length}</span>
-        </button>
-        <button type="button" class={`sidebar-tab${activeTab() === "logs" ? " active" : ""}`} onClick={() => setActiveTab("logs")}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 6h16M4 10h16M4 14h10M4 18h12" />
-          </svg>
-          Log
-        </button>
-      </div>
-
-      <div class="sidebar-tab-body" style={{ display: activeTab() === "assets" ? "flex" : "none" }}>
+      <div class="sidebar-tab-body" style={{ display: props.view() === "assets" ? "flex" : "none" }}>
         <div class="asset-browser-actions">
           <button type="button" class="btn btn-primary btn-xs" onClick={() => inputRef?.click()}>
             Aggiungi asset
@@ -1190,12 +1855,27 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
             multiple
             onChange={(e) => onFiles(e.currentTarget.files)}
           />
+          <div class="asset-view-toggle">
+            <button
+              type="button"
+              class={`asset-view-btn${viewMode() === "grid" ? " active" : ""}`}
+              title="Vista griglia"
+              onClick={() => setViewMode("grid")}
+            >
+              <IconLayoutGrid />
+            </button>
+            <button
+              type="button"
+              class={`asset-view-btn${viewMode() === "list" ? " active" : ""}`}
+              title="Vista lista"
+              onClick={() => setViewMode("list")}
+            >
+              <IconLayoutList />
+            </button>
+          </div>
         </div>
         <div class="asset-explorer-search">
-          <svg class="asset-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
+          <IconSearch class="asset-search-icon" />
           <input
             type="text"
             class="asset-search-input"
@@ -1204,55 +1884,116 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
             onInput={(e) => setFilter(e.currentTarget.value)}
           />
         </div>
-        <div class="asset-explorer-content">
+        <div class={`asset-explorer-content${viewMode() === "grid" ? " asset-explorer-content--grid" : ""}`}>
           <Show when={assets().length > 0} fallback={<div class="asset-explorer-empty"><span>Nessun asset disponibile</span></div>}>
-            <For each={assets()}>
-              {(asset) => (
-                <div
-                  role="button"
-                  tabIndex={0}
-                  class={`asset-item${selectedAssetId() === asset.id || previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
-                  draggable={true}
-                  onDragStart={(e) => {
-                    setSelectedAssetId(asset.id);
-                    setDraggingAssetId(asset.id);
-                    if (!e.dataTransfer) return;
-                    e.dataTransfer.setData("application/x-fellini-asset", asset.id);
-                    e.dataTransfer.effectAllowed = "copy";
-                    e.dataTransfer.setDragImage(e.currentTarget, 18, 12);
-                  }}
-                  onDragEnd={() => {
-                    setDraggingAssetId(null);
-                    window.dispatchEvent(new CustomEvent("fellini:asset-drag-end"));
-                  }}
-                  onClick={() => setSelectedAssetId(asset.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      setSelectedAssetId(asset.id);
-                    }
-                  }}
-                >
-                  <FileTypeIcon type={asset.kind} />
-                  <span class="asset-item-name">{asset.label || humanizeMediaName(asset.path)}</span>
-                  <button
-                    type="button"
-                    class={`asset-item-action${previewAssetId() === asset.id ? " active" : ""}`}
-                    title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      openAssetPreview(asset);
-                    }}
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" />
-                      <circle cx="12" cy="12" r="3" />
-                    </svg>
-                  </button>
-                  <span class={`asset-item-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
-                </div>
-              )}
-            </For>
+            <Show
+              when={viewMode() === "grid"}
+              fallback={
+                <For each={assets()}>
+                  {(asset) => (
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      class={`asset-item${selectedAssetId() === asset.id || previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
+                      draggable={true}
+                      onDragStart={(e) => {
+                        setSelectedAssetId(asset.id);
+                        setDraggingAssetId(asset.id);
+                        if (!e.dataTransfer) return;
+                        e.dataTransfer.setData("application/x-fellini-asset", asset.id);
+                        e.dataTransfer.effectAllowed = "copy";
+                        e.dataTransfer.setDragImage(e.currentTarget, 18, 12);
+                      }}
+                      onDragEnd={() => {
+                        setDraggingAssetId(null);
+                        window.dispatchEvent(new CustomEvent("fellini:asset-drag-end"));
+                      }}
+                      onClick={() => setSelectedAssetId(asset.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedAssetId(asset.id);
+                        }
+                      }}
+                    >
+                      <FileTypeIcon type={asset.kind} />
+                      <span class="asset-item-name">{asset.label || humanizeMediaName(asset.path)}</span>
+                      <button
+                        type="button"
+                        class={`asset-item-action${previewAssetId() === asset.id ? " active" : ""}`}
+                        title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openAssetPreview(asset);
+                        }}
+                      >
+                        <IconEye />
+                      </button>
+                      <span class={`asset-item-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
+                    </div>
+                  )}
+                </For>
+              }
+            >
+              <div class="asset-grid">
+                <For each={assets()}>
+                  {(asset) => (
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      class={`asset-card${selectedAssetId() === asset.id || previewAsset()?.id === asset.id ? " active" : ""}${draggingAssetId() === asset.id ? " is-dragging" : ""}`}
+                      draggable={true}
+                      onDragStart={(e) => {
+                        setSelectedAssetId(asset.id);
+                        setDraggingAssetId(asset.id);
+                        if (!e.dataTransfer) return;
+                        e.dataTransfer.setData("application/x-fellini-asset", asset.id);
+                        e.dataTransfer.effectAllowed = "copy";
+                        e.dataTransfer.setDragImage(e.currentTarget, 18, 12);
+                      }}
+                      onDragEnd={() => {
+                        setDraggingAssetId(null);
+                        window.dispatchEvent(new CustomEvent("fellini:asset-drag-end"));
+                      }}
+                      onClick={() => setSelectedAssetId(asset.id)}
+                      onDblClick={() => openAssetPreview(asset)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedAssetId(asset.id);
+                        }
+                      }}
+                    >
+                      <div class="asset-card-thumb">
+                        <Show
+                          when={thumbnails().get(asset.id)}
+                          fallback={
+                            <div class="asset-card-thumb-placeholder">
+                              <FileTypeIcon type={asset.kind} />
+                            </div>
+                          }
+                        >
+                          <img class="asset-card-thumb-img" src={thumbnails().get(asset.id)} alt="" draggable={false} />
+                        </Show>
+                        <span class={`asset-card-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
+                        <button
+                          type="button"
+                          class={`asset-card-preview-btn${previewAssetId() === asset.id ? " active" : ""}`}
+                          title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openAssetPreview(asset);
+                          }}
+                        >
+                          <IconEye />
+                        </button>
+                      </div>
+                      <span class="asset-card-name">{asset.label || humanizeMediaName(asset.path)}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
           </Show>
         </div>
         <Show when={previewAsset()}>
@@ -1260,9 +2001,7 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
             <div class="asset-preview-header">
               <span class="asset-preview-title">{previewAsset()?.label || "Preview"}</span>
               <button type="button" class="asset-preview-close" title="Chiudi preview" onClick={closeAssetPreview}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-                  <path d="M6 6l12 12M18 6L6 18" />
-                </svg>
+                <IconX />
               </button>
             </div>
             <div class="asset-preview-body">
@@ -1280,7 +2019,7 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
         </Show>
       </div>
 
-      <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: activeTab() === "logs" ? "flex" : "none" }}>
+      <div class="sidebar-tab-body sidebar-tab-body--logs" style={{ display: props.view() === "logs" ? "flex" : "none" }}>
         <div class="sidebar-logs-content">
           <For each={[...logs()].reverse()}>
             {(line) => <div class="sidebar-log-line">{line}</div>}
@@ -1292,16 +2031,19 @@ const AssetBrowserPanel: Component<{ project: Accessor<EditorialProject | null> 
 };
 
 const FileTypeIcon: Component<{ type: "video" | "audio" }> = (props) => (
-  <svg class={`asset-type-icon asset-type-icon--${props.type}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <path d={props.type === "video"
-      ? "M15 10l5-3v10l-5-3zM4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"
-      : "M9 18V5l12-2v13M9 18a3 3 0 11-6 0 3 3 0 016 0zm12-2a3 3 0 11-6 0 3 3 0 016 0z"} />
-  </svg>
+  <Show
+    when={props.type === "video"}
+    fallback={<IconWaveSquare class={`asset-type-icon asset-type-icon--${props.type}`} />}
+  >
+    <IconVideo class={`asset-type-icon asset-type-icon--${props.type}`} />
+  </Show>
 );
 
 const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = (props) => {
   const [gpuStatus, setGpuStatus] = createSignal<"ready" | "unsupported">("unsupported");
   const [codecStatus, setCodecStatus] = createSignal<"ready" | "unsupported">("unsupported");
+  const [debugSidebarOpen, setDebugSidebarOpen] = createSignal(true);
+  const [debugSidebarWidth, setDebugSidebarWidth] = createSignal(MIN_MONITOR_DEBUG_WIDTH);
   const [stageSize, setStageSize] = createSignal({ width: 0, height: 0 });
   const [transportPlaying, setTransportPlaying] = createSignal(false);
   const [monitorDiagnostics, setMonitorDiagnostics] = createSignal<MonitorDiagnostics>({
@@ -1311,15 +2053,50 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     renderedLayers: 0,
     decodedFrames: 0,
     bufferedFrames: 0,
+    runtime: {
+      playing: false,
+      initialized: false,
+      renderQueued: false,
+      rendering: false,
+      rafActive: false,
+      pendingRenderTime: null,
+      pendingRenderBlocking: null,
+      lastRenderRequestTime: null,
+      lastRenderRequestBlocking: null,
+      lastCompletedRenderTime: null,
+      lastCompletedRenderBlocking: null,
+      compositionRevisionKey: null,
+      compositionDuration: 0,
+      demuxCacheEntries: 0,
+      audioBufferCacheEntries: 0,
+      videoPlayerEntries: 0,
+      readyVideoPlayers: 0,
+    },
+    audio: {
+      playing: false,
+      contextState: "uninitialized",
+      contextCurrentTime: null,
+      sampleRate: null,
+      startContextTime: 0,
+      startTimelineTime: 0,
+      duration: 0,
+      sessionToken: 0,
+      scheduledNodeCount: 0,
+    },
+    layers: [],
+    events: [],
     lastError: null,
   });
   let stageRef: HTMLDivElement | undefined;
   let canvasRef: HTMLCanvasElement | undefined;
   let runtime: CanvasMonitorRuntime | null = null;
-  let runtimeMounted = false;
+  const [runtimeReady, setRuntimeReady] = createSignal(false);
+  let rangeLoopSeekInFlight = false;
+  let compositionSyncToken = 0;
 
   const project = () => props.project();
   const composition = createMemo(() => (project() ? compileMonitorComposition(project()!) : null));
+  const compositionSyncKey = createMemo(() => monitorCompositionSyncKey(composition()));
   const frameRate = createMemo(() => Math.max(1, composition()?.sequence.fps ?? 30));
   const monitorDuration = createMemo(() => Math.max(0, composition()?.duration ?? 0));
   const sequenceWidth = createMemo(() => Math.max(1, Math.round(composition()?.sequence.width ?? 1080)));
@@ -1341,7 +2118,35 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   const monitorProgressPercent = createMemo(() =>
     monitorDuration() > 0 ? (monitorPlayhead() / monitorDuration()) * 100 : 0
   );
+  const timelineRange = createMemo(() => {
+    const current = timelineRangeSelection();
+    if (!current) return null;
+    const start = Math.min(current.start, current.end);
+    const end = Math.max(current.start, current.end);
+    return end - start >= 0.02 ? { start, end, duration: end - start } : null;
+  });
   const monitorUnsupported = createMemo(() => gpuStatus() === "unsupported" || codecStatus() === "unsupported");
+  const monitorBrowserCapabilities = createMemo(() => {
+    const browserWindow = typeof window !== "undefined"
+      ? window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }
+      : null;
+    const capabilityStatus = (supported: boolean): "ready" | "unsupported" => (
+      supported ? "ready" : "unsupported"
+    );
+    return [
+      { label: "webgpu", status: gpuStatus() },
+      { label: "webcodecs", status: codecStatus() },
+      { label: "video decoder", status: capabilityStatus(!!browserWindow && "VideoDecoder" in browserWindow) },
+      { label: "audio decoder", status: capabilityStatus(!!browserWindow && "AudioDecoder" in browserWindow) },
+      { label: "audio context", status: capabilityStatus(!!browserWindow && ("AudioContext" in browserWindow || "webkitAudioContext" in browserWindow)) },
+      { label: "worker", status: capabilityStatus(typeof Worker !== "undefined") },
+      { label: "resize observer", status: capabilityStatus(typeof ResizeObserver !== "undefined") },
+      { label: "video frame", status: capabilityStatus(!!browserWindow && "VideoFrame" in browserWindow) },
+    ];
+  });
+  const monitorDiagnosticsJson = createMemo(() => JSON.stringify(monitorDiagnostics(), null, 2));
+  const clampMonitorDebugWidth = (width: number) =>
+    Math.max(MIN_MONITOR_DEBUG_WIDTH, Math.min(MAX_MONITOR_DEBUG_WIDTH, Math.round(width)));
 
   const resolveMonitorMediaUrl = (path: string) => {
     const jobId = selectedJobId();
@@ -1372,6 +2177,45 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
     if (!runtime) return;
     void runtime.seek(Math.max(0, Math.min(monitorDuration(), time)));
   };
+  const onMonitorDebugResizeStart = (e: PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = debugSidebarWidth();
+    const onMove = (ev: PointerEvent) => {
+      setDebugSidebarWidth(clampMonitorDebugWidth(startWidth + ev.clientX - startX));
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  const syncRuntimeComposition = (currentComposition: ReturnType<typeof composition>) => {
+    if (!runtime) return;
+    const syncToken = ++compositionSyncToken;
+    const targetTime = currentComposition
+      ? Math.max(0, Math.min(currentComposition.duration, untrack(playheadTime)))
+      : 0;
+    void (async () => {
+      await runtime?.setComposition(currentComposition, resolveMonitorMediaUrl);
+      if (
+        syncToken !== compositionSyncToken
+        || !runtime
+        || !currentComposition
+      ) {
+        return;
+      }
+      if (!runtime.isPlaying()) {
+        await runtime.seek(targetTime);
+      }
+    })();
+  };
 
   createEffect(() => {
     sequenceWidth();
@@ -1398,9 +2242,27 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   });
 
   createEffect(() => {
-    if (!canvasRef || runtimeMounted) return;
+    if (!canvasRef || runtimeReady()) return;
     runtime = new CanvasMonitorRuntime(canvasRef, {
-      onTimeUpdate: (time) => setPlayheadTime(time),
+      onTimeUpdate: (time) => {
+        const range = timelineRange();
+        if (
+          runtime
+          && transportPlaying()
+          && timelineRangeLoopEnabled()
+          && range
+          && time >= range.end - FRAME_STEP_EPSILON
+          && !rangeLoopSeekInFlight
+        ) {
+          rangeLoopSeekInFlight = true;
+          setPlayheadTime(range.start);
+          void runtime.seek(range.start).finally(() => {
+            rangeLoopSeekInFlight = false;
+          });
+          return;
+        }
+        setPlayheadTime(time);
+      },
       onPlayingChange: (playing) => setTransportPlaying(playing),
       onGpuStatus: setGpuStatus,
       onCodecStatus: setCodecStatus,
@@ -1409,15 +2271,16 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
         console.error("[monitor-runtime]", error);
       },
     });
-    runtimeMounted = true;
-    void runtime.setComposition(composition(), resolveMonitorMediaUrl);
+    setRuntimeReady(true);
   });
 
   createEffect(() => {
-    const currentComposition = composition();
-    selectedJobId();
-    if (!runtimeMounted || !runtime) return;
-    void runtime.setComposition(currentComposition, resolveMonitorMediaUrl);
+    const currentJobId = selectedJobId();
+    const currentCompositionKey = compositionSyncKey();
+    if (!runtimeReady() || !runtime) return;
+    void currentJobId;
+    void currentCompositionKey;
+    syncRuntimeComposition(composition());
   });
 
   createEffect(
@@ -1453,146 +2316,409 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
   return (
     <div class="panel monitor-panel">
       <div class="panel-header">
-        <span class="panel-title">Monitor</span>
-        <div class="monitor-capabilities">
-          <span class={`monitor-capability monitor-capability--${gpuStatus()}`}>WebGPU {gpuStatus()}</span>
-          <span class={`monitor-capability monitor-capability--${codecStatus()}`}>WebCodecs {codecStatus()}</span>
-        </div>
-      </div>
-      <div ref={stageRef} class="monitor-stage">
-        <div
-          class="monitor-frame"
-          style={{
-            width: `${displayFrame().width}px`,
-            height: `${displayFrame().height}px`,
-          }}
+        <button
+          type="button"
+          class={`monitor-header-btn${debugSidebarOpen() ? " active" : ""}`}
+          title={
+            monitorUnsupported()
+              ? "Diagnostica non disponibile"
+              : debugSidebarOpen()
+                ? "Nascondi diagnostica"
+                : "Mostra diagnostica"
+          }
+          aria-label={
+            monitorUnsupported()
+              ? "Diagnostica non disponibile"
+              : debugSidebarOpen()
+                ? "Nascondi diagnostica"
+                : "Mostra diagnostica"
+          }
+          aria-pressed={debugSidebarOpen()}
+          disabled={monitorUnsupported()}
+          onClick={() => setDebugSidebarOpen((value) => !value)}
         >
-          <canvas
-            ref={canvasRef}
-            class="monitor-canvas active"
-            width={sequenceWidth()}
-            height={sequenceHeight()}
-          />
-          <Show when={!monitorUnsupported()}>
-            <div class="monitor-debug-panel">
-              <div>renderer {monitorDiagnostics().renderer}</div>
-              <div>layers {monitorDiagnostics().renderedLayers}/{monitorDiagnostics().activeLayers}</div>
-              <div>decoded {monitorDiagnostics().decodedFrames}</div>
-              <div>buffered {monitorDiagnostics().bufferedFrames}</div>
-              <Show when={monitorDiagnostics().lastError}>
-                <div class="monitor-debug-panel__error">{monitorDiagnostics().lastError}</div>
-              </Show>
-            </div>
+          <Show when={debugSidebarOpen()} fallback={<IconLayoutSidebarLeftExpand />}>
+            <IconLayoutSidebarLeftCollapse />
           </Show>
-          <Show when={monitorUnsupported()}>
-            <div class="monitor-stage-overlay">
-              <div class="monitor-stage-overlay-card">
-                <div class="monitor-stage-overlay-title">Monitor non supportato</div>
-                <div class="monitor-stage-overlay-copy">
-                  Il monitor realtime richiede Chromium con WebGPU e WebCodecs attivi.
+        </button>
+        <span class="panel-title">Monitor</span>
+      </div>
+      <div class="monitor-workbench">
+        <Show when={!monitorUnsupported() && debugSidebarOpen()}>
+          <aside
+            class="monitor-debug-shell"
+            style={{
+              width: `${debugSidebarWidth()}px`,
+              "flex-basis": `${debugSidebarWidth()}px`,
+            }}
+          >
+            <div class="monitor-debug-panel">
+              <div class="monitor-debug-section">
+                <div class="monitor-debug-title">runtime</div>
+                <div class="monitor-debug-row">
+                  <span>renderer</span>
+                  <strong>{monitorDiagnostics().renderer}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>playing</span>
+                  <strong>{monitorDiagnostics().runtime.playing ? "yes" : "no"}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>initialized</span>
+                  <strong>{monitorDiagnostics().runtime.initialized ? "yes" : "no"}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>raf / queued / render</span>
+                  <strong>
+                    {monitorDiagnostics().runtime.rafActive ? "1" : "0"}
+                    {" / "}
+                    {monitorDiagnostics().runtime.renderQueued ? "1" : "0"}
+                    {" / "}
+                    {monitorDiagnostics().runtime.rendering ? "1" : "0"}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>clock</span>
+                  <strong>{fmtTimePrecise(monitorDiagnostics().currentTime)}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>layers</span>
+                  <strong>{monitorDiagnostics().renderedLayers}/{monitorDiagnostics().activeLayers}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>decoded since seek</span>
+                  <strong>{monitorDiagnostics().decodedFrames}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>buffered</span>
+                  <strong>{monitorDiagnostics().bufferedFrames}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>pending render</span>
+                  <strong>
+                    {formatMonitorDebugTime(monitorDiagnostics().runtime.pendingRenderTime)}
+                    {" / "}
+                    {monitorDiagnostics().runtime.pendingRenderBlocking === null
+                      ? "—"
+                      : monitorDiagnostics().runtime.pendingRenderBlocking ? "blocking" : "async"}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>last req</span>
+                  <strong>
+                    {formatMonitorDebugTime(monitorDiagnostics().runtime.lastRenderRequestTime)}
+                    {" / "}
+                    {monitorDiagnostics().runtime.lastRenderRequestBlocking === null
+                      ? "—"
+                      : monitorDiagnostics().runtime.lastRenderRequestBlocking ? "blocking" : "async"}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>last done</span>
+                  <strong>
+                    {formatMonitorDebugTime(monitorDiagnostics().runtime.lastCompletedRenderTime)}
+                    {" / "}
+                    {monitorDiagnostics().runtime.lastCompletedRenderBlocking === null
+                      ? "—"
+                      : monitorDiagnostics().runtime.lastCompletedRenderBlocking ? "blocking" : "async"}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>players ready</span>
+                  <strong>
+                    {monitorDiagnostics().runtime.readyVideoPlayers}/{monitorDiagnostics().runtime.videoPlayerEntries}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>cache demux/audio</span>
+                  <strong>
+                    {monitorDiagnostics().runtime.demuxCacheEntries}
+                    {" / "}
+                    {monitorDiagnostics().runtime.audioBufferCacheEntries}
+                  </strong>
+                </div>
+                <div class="monitor-debug-kv">
+                  <span>revision</span>
+                  <code>{monitorDiagnostics().runtime.compositionRevisionKey ?? "—"}</code>
                 </div>
               </div>
+              <div class="monitor-debug-section">
+                <div class="monitor-debug-title">audio</div>
+                <div class="monitor-debug-row">
+                  <span>state</span>
+                  <strong>
+                    {monitorDiagnostics().audio.playing ? "playing" : "paused"}
+                    {" / "}
+                    {monitorDiagnostics().audio.contextState}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>ctx time</span>
+                  <strong>
+                    {(() => {
+                      const currentTime = monitorDiagnostics().audio.contextCurrentTime;
+                      return currentTime === null ? "—" : `${currentTime.toFixed(3)}s`;
+                    })()}
+                  </strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>start ctx</span>
+                  <strong>{monitorDiagnostics().audio.startContextTime.toFixed(3)}s</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>start tl</span>
+                  <strong>{fmtTimePrecise(monitorDiagnostics().audio.startTimelineTime)}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>scheduled nodes</span>
+                  <strong>{monitorDiagnostics().audio.scheduledNodeCount}</strong>
+                </div>
+                <div class="monitor-debug-row">
+                  <span>sample rate</span>
+                  <strong>{monitorDiagnostics().audio.sampleRate ?? "—"}</strong>
+                </div>
+              </div>
+              <Show when={monitorDiagnostics().layers.length > 0}>
+                <div class="monitor-debug-section">
+                  <div class="monitor-debug-title">layers</div>
+                  <For each={monitorDiagnostics().layers}>
+                    {(layer) => (
+                      <div class="monitor-debug-card">
+                        <div class="monitor-debug-row">
+                          <span>{layer.clipId}</span>
+                          <strong>{layer.includedInRender ? "render" : "skip"}</strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>target / frame</span>
+                          <strong>
+                            {formatMonitorDebugUs(layer.localTimeUs)}
+                            {" / "}
+                            {formatMonitorDebugUs(layer.frameTimestampUs)}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>worker / accel</span>
+                          <strong>
+                            {layer.player?.workerReady ? "ready" : "boot"}
+                            {" / "}
+                            {layer.player?.selectedAcceleration ?? "—"}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>cache</span>
+                          <strong>
+                            {layer.player?.bufferedFrames ?? 0}
+                            {" @ "}
+                            {formatMonitorDebugUs(layer.player?.bufferedRangeStartUs ?? null)}
+                            {".."}
+                            {formatMonitorDebugUs(layer.player?.bufferedRangeEndUs ?? null)}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>dispatch</span>
+                          <strong>
+                            {formatMonitorDebugUs(layer.player?.lastDispatchedTargetUs ?? null)}
+                            {" / "}
+                            {layer.player?.lastDispatchedPlaying === null
+                              ? "—"
+                              : layer.player?.lastDispatchedPlaying ? "play" : "pause"}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>request</span>
+                          <strong>
+                            {formatMonitorDebugUs(layer.player?.lastRequestedTargetUs ?? null)}
+                            {" / "}
+                            {layer.player?.lastForceSeek ? "seek" : "keep"}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>intent / session</span>
+                          <strong>
+                            {layer.player?.lastRequestedIntent ?? "—"}
+                            {" / "}
+                            {layer.player?.activeSessionToken ?? 0}
+                            {layer.player?.pendingSessionToken ? `>${layer.player.pendingSessionToken}` : ""}
+                          </strong>
+                        </div>
+                        <div class="monitor-debug-row">
+                          <span>had frame / resume seek</span>
+                          <strong>
+                            {layer.player?.lastHadFrameAtTarget ? "yes" : "no"}
+                            {" / "}
+                            {layer.player?.lastResumeRequiresSeek ? "yes" : "no"}
+                          </strong>
+                        </div>
+                        <Show when={layer.player?.lastError}>
+                          <div class="monitor-debug-kv">
+                            <span>player error</span>
+                            <code>{layer.player?.lastError}</code>
+                          </div>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+              <Show when={monitorDiagnostics().events.length > 0}>
+                <div class="monitor-debug-section">
+                  <div class="monitor-debug-title">events</div>
+                  <div class="monitor-debug-log">
+                    <For each={monitorDiagnostics().events.slice().reverse()}>
+                      {(event) => (
+                        <div class="monitor-debug-log-line">
+                          <span>[{(event.atMs / 1000).toFixed(3)}]</span>
+                          <strong>{event.scope}</strong>
+                          <span>{event.message}</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </div>
+              </Show>
+              <div class="monitor-debug-section">
+                <div class="monitor-debug-title">snapshot</div>
+                <pre class="monitor-debug-json">{monitorDiagnosticsJson()}</pre>
+              </div>
+              <div class="monitor-debug-section">
+                <div class="monitor-debug-title">browser</div>
+                <For each={monitorBrowserCapabilities()}>
+                  {(entry) => (
+                    <div class="monitor-debug-row">
+                      <span>{entry.label}</span>
+                      <span class={`monitor-debug-status monitor-debug-status--${entry.status}`}>{entry.status}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+              <Show when={monitorDiagnostics().lastError}>
+                <div class="monitor-debug-section monitor-debug-section--error">
+                  <div class="monitor-debug-title">error</div>
+                  <div class="monitor-debug-panel__error">{monitorDiagnostics().lastError}</div>
+                </div>
+              </Show>
             </div>
-          </Show>
-        </div>
-      </div>
-      <div class="monitor-controls-shell">
-        <div class="monitor-controls">
-          <div class="monitor-scrubber-row">
-            <input
-              class="monitor-scrubber"
-              type="range"
-              min="0"
-              max={Math.max(monitorDuration(), 0.001)}
-              step="0.01"
-              value={monitorPlayhead()}
-              aria-label="Posizione riproduzione"
-              disabled={!monitorHasMedia()}
+          </aside>
+          <div
+            class="monitor-debug-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Ridimensiona diagnostica monitor"
+            onPointerDown={onMonitorDebugResizeStart}
+          />
+        </Show>
+        <div class="monitor-main-col">
+          <div ref={stageRef} class="monitor-stage">
+            <div
+              class="monitor-frame"
               style={{
-                background: `linear-gradient(to right, var(--accent) 0%, var(--accent) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) 100%)`,
+                width: `${displayFrame().width}px`,
+                height: `${displayFrame().height}px`,
               }}
-              onInput={(event) => scrubMonitor(Number(event.currentTarget.value))}
-            />
+            >
+              <canvas
+                ref={canvasRef}
+                class="monitor-canvas active"
+                width={sequenceWidth()}
+                height={sequenceHeight()}
+              />
+              <Show when={monitorUnsupported()}>
+                <div class="monitor-stage-overlay">
+                  <div class="monitor-stage-overlay-card">
+                    <div class="monitor-stage-overlay-title">Monitor non supportato</div>
+                    <div class="monitor-stage-overlay-copy">
+                      Il monitor realtime richiede Chromium con WebGPU e WebCodecs attivi.
+                    </div>
+                  </div>
+                </div>
+              </Show>
+            </div>
           </div>
-          <div class="monitor-controls-row">
-            <div class="monitor-timecodes monitor-timecodes--left" aria-live="off">
-              <span class="monitor-timecode">{fmtTimePrecise(monitorPlayhead())}</span>
-            </div>
-            <div class="monitor-transport">
-              <button
-                type="button"
-                class="monitor-control-btn"
-                title="Vai all'inizio"
-                aria-label="Vai all'inizio"
-                disabled={!monitorHasMedia()}
-                onClick={() => scrubMonitor(0)}
-              >
-                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                  <path d="M3 3.5h1.5v9H3zM5.5 8l7 4.5v-9z" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="monitor-control-btn"
-                title="Frame precedente"
-                aria-label="Frame precedente"
-                disabled={!monitorHasMedia()}
-                onClick={() => stepFrame(-1)}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12.5 3.5L6 8l6.5 4.5v-9z" />
-                  <path d="M3.5 3.5v9" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="monitor-control-btn monitor-control-btn--primary"
-                title={transportPlaying() ? "Pausa" : "Play"}
-                aria-label={transportPlaying() ? "Pausa" : "Play"}
-                disabled={!monitorHasMedia()}
-                onClick={togglePlayback}
-              >
-                <Show
-                  when={transportPlaying()}
-                  fallback={
-                    <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                      <path d="M5 3.25v9.5L12.5 8 5 3.25z" />
-                    </svg>
-                  }
-                >
-                  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                    <path d="M4.5 3h2.5v10H4.5zM9 3h2.5v10H9z" />
-                  </svg>
-                </Show>
-              </button>
-              <button
-                type="button"
-                class="monitor-control-btn"
-                title="Frame successivo"
-                aria-label="Frame successivo"
-                disabled={!monitorHasMedia()}
-                onClick={() => stepFrame(1)}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M3.5 3.5L10 8l-6.5 4.5v-9z" />
-                  <path d="M12.5 3.5v9" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="monitor-control-btn"
-                title="Vai alla fine"
-                aria-label="Vai alla fine"
-                disabled={!monitorHasMedia()}
-                onClick={() => scrubMonitor(monitorDuration())}
-              >
-                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                  <path d="M10.5 8L3.5 3.5v9zM11.5 3.5h1.5v9h-1.5z" />
-                </svg>
-              </button>
-            </div>
-            <div class="monitor-timecodes monitor-timecodes--right" aria-live="off">
-              <span class="monitor-timecode monitor-timecode--total">{fmtTimePrecise(monitorDuration())}</span>
+          <div class="monitor-controls-shell">
+            <div class="monitor-controls">
+              <div class="monitor-scrubber-row">
+                <input
+                  class="monitor-scrubber"
+                  type="range"
+                  min="0"
+                  max={Math.max(monitorDuration(), 0.001)}
+                  step="0.01"
+                  value={monitorPlayhead()}
+                  aria-label="Posizione riproduzione"
+                  disabled={!monitorHasMedia()}
+                  style={{
+                    background: `linear-gradient(to right, var(--accent) 0%, var(--accent) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) ${monitorProgressPercent()}%, rgba(255,255,255,0.12) 100%)`,
+                  }}
+                  onInput={(event) => scrubMonitor(Number(event.currentTarget.value))}
+                />
+              </div>
+              <div class="monitor-controls-row">
+                <div class="monitor-timecodes monitor-timecodes--left" aria-live="off">
+                  <span class="monitor-timecode">{fmtTimePrecise(monitorPlayhead())}</span>
+                </div>
+                <div class="monitor-transport">
+                  <button
+                    type="button"
+                    class="monitor-control-btn"
+                    title="Vai all'inizio"
+                    aria-label="Vai all'inizio"
+                    disabled={!monitorHasMedia()}
+                    onClick={() => scrubMonitor(0)}
+                  >
+                    <IconPlayerSkipBack aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    class="monitor-control-btn"
+                    title="Frame precedente"
+                    aria-label="Frame precedente"
+                    disabled={!monitorHasMedia()}
+                    onClick={() => stepFrame(-1)}
+                  >
+                    <IconPlayerTrackPrev aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    class="monitor-control-btn monitor-control-btn--primary"
+                    title={transportPlaying() ? "Pausa" : "Play"}
+                    aria-label={transportPlaying() ? "Pausa" : "Play"}
+                    disabled={!monitorHasMedia()}
+                    onClick={togglePlayback}
+                  >
+                    <Show
+                      when={transportPlaying()}
+                      fallback={
+                        <IconPlayerPlay aria-hidden="true" />
+                      }
+                    >
+                      <IconPlayerPause aria-hidden="true" />
+                    </Show>
+                  </button>
+                  <button
+                    type="button"
+                    class="monitor-control-btn"
+                    title="Frame successivo"
+                    aria-label="Frame successivo"
+                    disabled={!monitorHasMedia()}
+                    onClick={() => stepFrame(1)}
+                  >
+                    <IconPlayerTrackNext aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    class="monitor-control-btn"
+                    title="Vai alla fine"
+                    aria-label="Vai alla fine"
+                    disabled={!monitorHasMedia()}
+                    onClick={() => scrubMonitor(monitorDuration())}
+                  >
+                    <IconPlayerSkipForward aria-hidden="true" />
+                  </button>
+                </div>
+                <div class="monitor-timecodes monitor-timecodes--right" aria-live="off">
+                  <span class="monitor-timecode monitor-timecode--total">{fmtTimePrecise(monitorDuration())}</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1618,6 +2744,8 @@ const TimelinePanel: Component<{
   } | null>(null);
   const [editingSubtitleId, setEditingSubtitleId] = createSignal<string | null>(null);
   const [editingSubtitleText, setEditingSubtitleText] = createSignal("");
+  const [timelineTool, setTimelineTool] = createSignal<TimelineTool>("select");
+  const [editorialLaneVisible, setEditorialLaneVisible] = createSignal(false);
   const project = () => props.project();
   const projectFrameRate = createMemo(() => Math.max(1, project()?.sequence.fps ?? 30));
   const [zoomIdx, setZoomIdx] = createSignal(DEFAULT_ZOOM_INDEX);
@@ -1631,10 +2759,13 @@ const TimelinePanel: Component<{
   let rulerViewportRef: HTMLDivElement | undefined;
   let rulerInnerRef: HTMLDivElement | undefined;
   let assetViewportRef: HTMLDivElement | undefined;
+  let editorialViewportRef: HTMLDivElement | undefined;
   let audioViewportRef: HTMLDivElement | undefined;
   let assetLabelsRef: HTMLDivElement | undefined;
+  let editorialLabelsRef: HTMLDivElement | undefined;
   let audioLabelsRef: HTMLDivElement | undefined;
   let assetInnerRef: HTMLDivElement | undefined;
+  let editorialInnerRef: HTMLDivElement | undefined;
   let audioInnerRef: HTMLDivElement | undefined;
   let horizontalSyncHandle: number | undefined;
   let verticalSyncHandle: number | undefined;
@@ -1660,7 +2791,8 @@ const TimelinePanel: Component<{
     return offset === null ? null : pxToSec(viewportLeft() + offset);
   });
   const tracks = createMemo(() => (project() ? sortedTracks(project()!) : []));
-  const assetTracks = createMemo(() => tracks().filter((track) => track.kind !== "audio"));
+  const videoTracks = createMemo(() => tracks().filter((track) => track.kind === "video"));
+  const editorialTrack = createMemo(() => tracks().find((track) => track.kind === "subtitle") ?? null);
   const audioTracks = createMemo(() => tracks().filter((track) => track.kind === "audio"));
   const captionHostTrackId = createMemo(() => {
     const current = project();
@@ -1711,7 +2843,9 @@ const TimelinePanel: Component<{
     return [...lanePending, ...clipPending];
   });
   const visibleStandaloneSubtitles = (trackId: string) =>
-    trackSubtitles(project()!, trackId).filter((caption) => caption.origin !== "generated");
+    trackSubtitles(project()!, trackId).filter((caption) => (
+      caption.origin !== "generated" || isEditorialResultCaption(caption)
+    ));
   const pendingTrackSubtitleRanges = (trackId: string) =>
     pendingSubtitleRanges().filter((item) => item.trackId === trackId);
   const generatedTrackSubtitleGroups = (trackId: string) =>
@@ -1720,6 +2854,18 @@ const TimelinePanel: Component<{
       : generatedSubtitleGroupsForLane(project()!, trackId).filter((group) => (
           !group.sourceClipId || !runningSubtitleClipIds().has(group.sourceClipId)
         ));
+  const editorialDecisionSegmentClass = (caption: SubtitleBlock) => {
+    const label = editorialDecisionLabel(caption);
+    return label ? `tl-seg--word ${label}` : undefined;
+  };
+  const renderedTrackHeight = (track: TimelineTrack) => (
+    track.kind === "subtitle" ? EDITORIAL_STANDALONE_HEIGHT : trackHeight(track.kind)
+  );
+  const timelineViewportForTrack = (track: TimelineTrack) => {
+    if (track.kind === "audio") return audioViewportRef;
+    if (track.kind === "subtitle") return editorialViewportRef;
+    return assetViewportRef;
+  };
   const cancelSubtitleEditing = () => {
     setEditingSubtitleId(null);
     setEditingSubtitleText("");
@@ -1809,6 +2955,78 @@ const TimelinePanel: Component<{
   const selectedSubtitle = createMemo(() =>
     project() ? getSubtitleBlock(project()!, selectedSubtitleId()) : null
   );
+  const timelineRange = createMemo(() => {
+    const current = timelineRangeSelection();
+    if (!current) return null;
+    const start = Math.min(current.start, current.end);
+    const end = Math.max(current.start, current.end);
+    return end - start >= 0.02 ? { start, end, duration: end - start } : null;
+  });
+  const timelineToolClassName = createMemo(() => timelineTool().replace(/_/g, "-"));
+  const clearTimelineRange = () => setTimelineRangeSelection(null);
+  const toggleTimelineTool = (tool: TimelineTool) => {
+    setTimelineTool((current) => (current === tool ? "select" : tool));
+  };
+  const toggleTimelineRangeLoop = () => {
+    const range = timelineRange();
+    if (!range) return;
+    const next = !timelineRangeLoopEnabled();
+    setTimelineRangeLoopEnabled(next);
+    if (next && (playheadTime() < range.start || playheadTime() > range.end)) {
+      setSeekRequest(range.start);
+    }
+  };
+  const selectClip = (clip: TimelineClip, trackId: string) => {
+    setSelectedClipId(clip.id);
+    setSelectedTrackId(trackId);
+    setSelectedSubtitleId(null);
+  };
+  const applyRippleDeleteToSelectedRange = () => {
+    const range = timelineRange();
+    if (!range) return false;
+    props.updateProject((current) => rippleDeleteRange(current, range.start, range.end));
+    clearTimelineRange();
+    setSelectedClipId(null);
+    setSelectedSubtitleId(null);
+    return true;
+  };
+  const shouldApplyRippleRangeAtPointer = (clientX: number) => {
+    if (timelineTool() !== "ripple_delete") return false;
+    const range = timelineRange();
+    if (!range) return false;
+    const time = getTimeFromPointer(clientX);
+    return time >= range.start && time <= range.end;
+  };
+  const applyTimelineToolToClip = (event: MouseEvent, clip: TimelineClip, track: TimelineTrack) => {
+    const tool = timelineTool();
+    if (tool === "select" || tool === "range" || tool === "trim" || tool === "slip") return false;
+    if (tool === "disable" && !clip.enabled) return false;
+    if (tool === "enable" && clip.enabled) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    selectClip(clip, track.id);
+    if (tool === "cut") {
+      const splitTime = getTimeFromPointer(event.clientX);
+      props.updateProject((current) => splitClip(current, clip.id, splitTime));
+      return true;
+    }
+    if (tool === "delete") {
+      props.updateProject((current) => removeClip(current, clip.id));
+      setSelectedClipId(null);
+      setSelectedSubtitleId(null);
+      setSelectedTrackId(track.id);
+      return true;
+    }
+    if (tool === "ripple_delete") {
+      props.updateProject((current) => rippleDeleteClip(current, clip.id));
+      setSelectedClipId(null);
+      setSelectedSubtitleId(null);
+      setSelectedTrackId(track.id);
+      return true;
+    }
+    props.updateProject((current) => setClipEnabled(current, clip.id, tool === "enable"));
+    return true;
+  };
   const overviewClips = createMemo(() => {
     const current = project();
     if (!current) return [] as Array<{
@@ -1874,6 +3092,11 @@ const TimelinePanel: Component<{
       if (editingId && subtitleId !== editingId) cancelSubtitleEditing();
     }),
   );
+  createEffect(() => {
+    if (!timelineRange()) {
+      setTimelineRangeLoopEnabled(false);
+    }
+  });
   const visiblePreviewState = createMemo(() => {
     const current = project();
     if (!current) return { requests: [] as Array<{ assetId: string; key: string }>, hasGenerating: false };
@@ -1882,7 +3105,7 @@ const TimelinePanel: Component<{
     const nextRequests = new Map<string, string>();
     let hasGenerating = false;
 
-    for (const track of [...assetTracks(), ...audioTracks()]) {
+    for (const track of [...videoTracks(), ...audioTracks()]) {
       const previewKind = track.kind === "audio" ? "audio" : "video";
       for (const clip of trackClips(current, track.id)) {
         const clipWidth = Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond());
@@ -1906,9 +3129,10 @@ const TimelinePanel: Component<{
     };
   });
   const horizontalViewports = () =>
-    [rulerViewportRef, assetViewportRef, audioViewportRef].filter(Boolean) as HTMLDivElement[];
+    [rulerViewportRef, assetViewportRef, editorialViewportRef, audioViewportRef]
+      .filter(Boolean) as HTMLDivElement[];
   const syncViewportMetrics = (source?: HTMLDivElement) => {
-    const viewport = source ?? rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    const viewport = source ?? rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
     if (!viewport) return;
     setViewportLeft(viewport.scrollLeft);
     setViewportWidth(viewport.clientWidth);
@@ -1984,7 +3208,7 @@ const TimelinePanel: Component<{
   };
 
   const getTimeFromPointer = (clientX: number) => {
-    const rect = (rulerInnerRef ?? assetInnerRef ?? audioInnerRef)?.getBoundingClientRect();
+    const rect = (rulerInnerRef ?? assetInnerRef ?? editorialInnerRef ?? audioInnerRef)?.getBoundingClientRect();
     if (!rect) return 0;
     return pxToSec(clientX - rect.left);
   };
@@ -2000,9 +3224,9 @@ const TimelinePanel: Component<{
   };
   const trackGroupOffset = (kind: "video" | "audio") => {
     const inner = kind === "audio" ? audioInnerRef : assetInnerRef;
-    const trackList = kind === "audio" ? audioTracks() : assetTracks();
+    const trackList = kind === "audio" ? audioTracks() : videoTracks();
     if (!inner || !trackList.length || kind === "audio") return 0;
-    const totalHeight = trackList.reduce((sum, track) => sum + trackHeight(track.kind), 0);
+    const totalHeight = trackList.reduce((sum, track) => sum + renderedTrackHeight(track), 0);
     return Math.max(0, inner.clientHeight - totalHeight);
   };
   const getTrackFromPointerY = (
@@ -2010,14 +3234,14 @@ const TimelinePanel: Component<{
     kind: "video" | "audio",
   ) => {
     const inner = kind === "audio" ? audioInnerRef : assetInnerRef;
-    const trackList = kind === "audio" ? audioTracks() : assetTracks();
+    const trackList = kind === "audio" ? audioTracks() : videoTracks();
     const rect = inner?.getBoundingClientRect();
     if (!rect || clientY < rect.top || clientY > rect.bottom) return null;
     const pointerY = clientY - rect.top;
     let cursor = trackGroupOffset(kind);
     const rows = trackList.map((track) => {
       const top = cursor;
-      cursor += trackHeight(track.kind);
+      cursor += renderedTrackHeight(track);
       return {
         track,
         top,
@@ -2061,7 +3285,7 @@ const TimelinePanel: Component<{
   const setZoomIndex = (nextIdx: number, anchorClientX?: number) => {
     const clamped = Math.max(0, Math.min(ZOOM_STEPS.length - 1, nextIdx));
     if (clamped === zoomIdx()) return;
-    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    const viewport = rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
     const nextPxPerSecond = BASE_PX_PER_SEC * ZOOM_STEPS[clamped];
     const anchorOffset = viewport && anchorClientX !== undefined
       ? anchorClientX - viewport.getBoundingClientRect().left
@@ -2071,7 +3295,7 @@ const TimelinePanel: Component<{
       : null;
     setZoomIdx(clamped);
     requestAnimationFrame(() => {
-      const nextViewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+      const nextViewport = rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
       if (!nextViewport || anchorOffset === null || anchorTime === null) {
         syncViewportMetrics();
         return;
@@ -2086,7 +3310,7 @@ const TimelinePanel: Component<{
     });
   };
   const centerViewportAtTime = (time: number) => {
-    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    const viewport = rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
     if (!viewport) return;
     const maxScroll = Math.max(contentWidth() - viewport.clientWidth, 0);
     const nextLeft = toPx(time) - (viewport.clientWidth / 2);
@@ -2109,7 +3333,7 @@ const TimelinePanel: Component<{
     setZoomIndex(zoomIdx() + (direction * stepCount), event.clientX);
   };
   const onMinimapPointerDown = (event: PointerEvent) => {
-    if (!rulerViewportRef && !assetViewportRef && !audioViewportRef) return;
+    if (!rulerViewportRef && !assetViewportRef && !editorialViewportRef && !audioViewportRef) return;
     const target = event.currentTarget as HTMLDivElement | null;
     if (!target) return;
     const rect = target.getBoundingClientRect();
@@ -2118,7 +3342,7 @@ const TimelinePanel: Component<{
     centerViewportAtTime(nextTime);
   };
   const beginMinimapViewportDrag = (event: PointerEvent) => {
-    if (!rulerViewportRef && !assetViewportRef && !audioViewportRef) return;
+    if (!rulerViewportRef && !assetViewportRef && !editorialViewportRef && !audioViewportRef) return;
     event.preventDefault();
     event.stopPropagation();
     const viewportEl = event.currentTarget as HTMLDivElement | null;
@@ -2135,7 +3359,7 @@ const TimelinePanel: Component<{
     let didDrag = false;
 
     const updateFromClientX = (clientX: number) => {
-      const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+      const viewport = rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
       if (!viewport) return;
       const pointerFrac = Math.max(0, Math.min(1, (clientX - contentRect.left) / contentRect.width));
       const visibleFrac = Math.min(viewportFrac(), 1);
@@ -2170,13 +3394,23 @@ const TimelinePanel: Component<{
 
   const beginTrackViewportPan = (event: PointerEvent, track: TimelineTrack) => {
     if (event.button !== 0 || event.target !== event.currentTarget) return;
-    const viewport = track.kind === "audio" ? audioViewportRef : assetViewportRef;
+    if (timelineTool() === "range") {
+      beginTimelineRangeSelection(event);
+      return;
+    }
+    if (shouldApplyRippleRangeAtPointer(event.clientX)) {
+      event.preventDefault();
+      event.stopPropagation();
+      applyRippleDeleteToSelectedRange();
+      return;
+    }
+    const viewport = timelineViewportForTrack(track);
     const target = event.currentTarget as HTMLDivElement | null;
     if (!viewport || !target) return;
     event.preventDefault();
 
     const pointerId = event.pointerId;
-    const group = track.kind === "audio" ? "audio" : "asset";
+    const group = track.kind === "audio" ? "audio" : track.kind === "video" ? "asset" : null;
     const originLeft = viewport.scrollLeft;
     const originTop = viewport.scrollTop;
     const startX = event.clientX;
@@ -2197,9 +3431,9 @@ const TimelinePanel: Component<{
       const nextLeft = Math.max(0, originLeft - (moveEvent.clientX - startX));
       const nextTop = Math.max(0, originTop - (moveEvent.clientY - startY));
       if (Math.abs(viewport.scrollLeft - nextLeft) > 0.5) viewport.scrollLeft = nextLeft;
-      if (Math.abs(viewport.scrollTop - nextTop) > 0.5) viewport.scrollTop = nextTop;
+      if (group && Math.abs(viewport.scrollTop - nextTop) > 0.5) viewport.scrollTop = nextTop;
       syncHorizontalScroll(viewport);
-      syncMirroredVerticalScroll(group, viewport);
+      if (group) syncMirroredVerticalScroll(group, viewport);
     };
 
     const onUp = (moveEvent: PointerEvent) => {
@@ -2216,7 +3450,50 @@ const TimelinePanel: Component<{
     document.addEventListener("pointercancel", onUp);
   };
 
+  const beginTimelineRangeSelection = (event: PointerEvent) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget as HTMLDivElement | null;
+    const pointerId = event.pointerId;
+    const originTime = getTimeFromPointer(event.clientX);
+    setTimelineRangeSelection({ start: originTime, end: originTime });
+    const cleanup = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      if (target?.hasPointerCapture?.(pointerId)) target.releasePointerCapture(pointerId);
+    };
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      setTimelineRangeSelection({
+        start: originTime,
+        end: getTimeFromPointer(moveEvent.clientX),
+      });
+    };
+    const onUp = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      const endTime = getTimeFromPointer(moveEvent.clientX);
+      if (Math.abs(endTime - originTime) < 0.02) {
+        clearTimelineRange();
+      } else {
+        setTimelineRangeSelection({ start: originTime, end: endTime });
+      }
+      cleanup();
+    };
+
+    target?.setPointerCapture?.(pointerId);
+    document.body.style.cursor = "crosshair";
+    document.body.style.userSelect = "none";
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  };
+
   const beginClipDrag = (event: PointerEvent, clip: TimelineClip) => {
+    if (timelineTool() !== "select") return;
     event.preventDefault();
     event.stopPropagation();
     const currentProject = project();
@@ -2275,6 +3552,63 @@ const TimelinePanel: Component<{
     document.addEventListener("pointerup", onUp);
   };
 
+  const beginClipSlip = (event: PointerEvent, clip: TimelineClip) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const currentProject = project();
+    if (!currentProject) return;
+    const linked = linkedClips(currentProject, clip.id);
+    const origins = new Map(
+      linked.map((item) => [item.id, { sourceIn: item.source_in, sourceOut: item.source_out }]),
+    );
+    const startX = event.clientX;
+    selectClip(clip, clip.track_id);
+    const onMove = (moveEvent: PointerEvent) => {
+      const desiredDelta = (moveEvent.clientX - startX) / pxPerSecond();
+      props.updateProject((current) => {
+        const resolvedDelta = resolveClipGroupSlipDelta(current, linked, desiredDelta);
+        const updates = linked.flatMap((item) => {
+          const currentClip = getClip(current, item.id);
+          const origin = origins.get(item.id);
+          if (!currentClip || !origin) return [];
+          return [{
+            ...currentClip,
+            source_in: origin.sourceIn + resolvedDelta,
+            source_out: origin.sourceOut + resolvedDelta,
+          }];
+        });
+        return upsertClips(current, updates);
+      });
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  };
+
+  const trimEdgeFromPointer = (event: PointerEvent): "start" | "end" => {
+    const target = event.currentTarget as HTMLElement | null;
+    const rect = target?.getBoundingClientRect();
+    if (!rect) return "end";
+    return event.clientX - rect.left <= rect.right - event.clientX ? "start" : "end";
+  };
+
+  const beginClipToolInteraction = (event: PointerEvent, clip: TimelineClip) => {
+    const tool = timelineTool();
+    if (tool === "trim") {
+      selectClip(clip, clip.track_id);
+      beginTrim(event, clip, trimEdgeFromPointer(event));
+      return;
+    }
+    if (tool === "slip") {
+      beginClipSlip(event, clip);
+      return;
+    }
+    beginClipDrag(event, clip);
+  };
+
   const beginSubtitleDrag = (event: PointerEvent, caption: SubtitleBlock, trackId: string) => {
     event.preventDefault();
     event.stopPropagation();
@@ -2311,6 +3645,7 @@ const TimelinePanel: Component<{
   const beginTrim = (event: PointerEvent, clip: TimelineClip, edge: "start" | "end") => {
     event.preventDefault();
     event.stopPropagation();
+    selectClip(clip, clip.track_id);
     const linked = linkedClips(project()!, clip.id);
     const draggedOrigin = {
       start: clip.start,
@@ -2418,6 +3753,16 @@ const TimelinePanel: Component<{
 
   const beginRulerScrub = (event: PointerEvent) => {
     if (event.button !== 0) return;
+    if (timelineTool() === "range") {
+      beginTimelineRangeSelection(event);
+      return;
+    }
+    if (shouldApplyRippleRangeAtPointer(event.clientX)) {
+      event.preventDefault();
+      event.stopPropagation();
+      applyRippleDeleteToSelectedRange();
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const target = event.currentTarget as HTMLDivElement | null;
@@ -2461,12 +3806,40 @@ const TimelinePanel: Component<{
   const onGroupLabelsScroll = (group: "asset" | "audio") => (event: Event) => {
     syncMirroredVerticalScroll(group, event.currentTarget as HTMLDivElement);
   };
-  const renderTrackLabel = (track: TimelineTrack) => (
+  const trackTimelineClips = (current: EditorialProject, trackId: string) =>
+    current.clips
+      .filter((clip) => clip.track_id === trackId)
+      .sort((left, right) => (
+        (left.start - right.start)
+        || (Number(left.enabled) - Number(right.enabled))
+        || (left.z_index - right.z_index)
+        || left.id.localeCompare(right.id)
+      ));
+  const renderTimelineRangeOverlay = (variant: "ruler" | "body") => {
+    const currentRange = timelineRange();
+    if (!currentRange) return null;
+    return (
+      <div
+        class={`tl-range-selection tl-range-selection--${variant}`}
+        style={{
+          left: `${toPx(currentRange.start)}px`,
+          width: `${Math.max(1, currentRange.duration * pxPerSecond())}px`,
+        }}
+      >
+        <Show when={variant === "ruler"}>
+          <span class="tl-range-selection-label">
+            {fmtTimePrecise(currentRange.start)} - {fmtTimePrecise(currentRange.end)}
+          </span>
+        </Show>
+      </div>
+    );
+  };
+  const renderTrackLabel = (track: TimelineTrack, variant: "default" | "editorial" = "default") => (
     <div
       role="button"
       tabIndex={0}
-      class={`tl-label tl-label--dynamic${selectedTrackId() === track.id ? " active" : ""}`}
-      style={{ height: `${trackHeight(track.kind)}px` }}
+      class={`tl-label tl-label--dynamic${variant === "editorial" ? " tl-label--middle-lane" : ""}${selectedTrackId() === track.id ? " active" : ""}`}
+      style={{ height: `${renderedTrackHeight(track)}px` }}
       onClick={() => selectTrack(track.id)}
       onKeyDown={(event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
@@ -2476,14 +3849,19 @@ const TimelinePanel: Component<{
     >
       <div class="tl-lane-card">
         <div class="tl-lane-head">
+          <Show when={track.kind === "subtitle"}>
+            <span class="tl-lane-icon tl-lane-icon--subtitle">
+              <IconBracketsContain />
+            </span>
+          </Show>
           <Show when={track.kind === "audio"}>
             <span class="tl-lane-icon tl-lane-icon--audio">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 6v4M5 4v8M8 2v12M11 4v8M14 6v4"/></svg>
+              <IconWaveSquare />
             </span>
           </Show>
           <Show when={track.kind === "video"}>
             <span class="tl-lane-icon tl-lane-icon--video">
-              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10" height="9" rx="1.5"/><path d="M11.5 6.5L14.5 4.5v7l-3-2"/></svg>
+              <IconVideo />
             </span>
           </Show>
           <span class="tl-lane-name">{track.name}</span>
@@ -2495,6 +3873,9 @@ const TimelinePanel: Component<{
           <Show when={track.kind === "video"}>
             <span class="tl-lane-meta">Canvas</span>
           </Show>
+          <Show when={track.kind === "subtitle"}>
+            <span class="tl-lane-meta">Edits</span>
+          </Show>
         </div>
 
         <Show when={track.kind === "audio"}>
@@ -2505,10 +3886,8 @@ const TimelinePanel: Component<{
               title={track.muted ? "Riattiva audio lane" : "Metti in muto la lane"}
               onClick={() => updateTrack(track.id, { muted: !track.muted })}
             >
-              <Show when={!track.muted} fallback={
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L4 5.5H1.5v5H4L8 14V2z"/><path d="M12 5l-5 6M7 5l5 6"/></svg>
-              }>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2L4 5.5H1.5v5H4L8 14V2z"/><path d="M11 6.5c.6.7 1 1.6 1 2.5s-.4 1.8-1 2.5"/></svg>
+              <Show when={!track.muted} fallback={<IconVolumeOff />}>
+                <IconVolume2 />
               </Show>
             </button>
           </div>
@@ -2522,10 +3901,8 @@ const TimelinePanel: Component<{
               title={track.visible ? "Nascondi dal canvas questa lane video" : "Mostra nel canvas questa lane video"}
               onClick={() => updateTrack(track.id, { visible: !track.visible })}
             >
-              <Show when={track.visible} fallback={
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3l12 10M6.5 6.5a2 2 0 002.8 2.8M13.4 10.6C14.4 9.6 15 8.8 15 8c0-2.5-3.1-5-7-5-.8 0-1.6.1-2.3.3M1 8c0 2.5 3.1 5 7 5 .8 0 1.6-.1 2.3-.3"/></svg>
-              }>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2"/><path d="M1 8c0-2.5 3.1-5 7-5s7 2.5 7 5-3.1 5-7 5-7-2.5-7-5z"/></svg>
+              <Show when={track.visible} fallback={<IconEyeOff />}>
+                <IconEye />
               </Show>
             </button>
           </div>
@@ -2556,8 +3933,8 @@ const TimelinePanel: Component<{
     const hasAudioSubtitleBand = pendingRanges.length > 0 || generatedGroups.length > 0;
     return (
     <div
-      class={`tl-track tl-track--project tl-track--${track.kind}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}`}
-      style={{ height: `${trackHeight(track.kind)}px` }}
+      class={`tl-track tl-track--project tl-track--${track.kind}${track.kind === "subtitle" ? " tl-track--standalone-editorial" : ""}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}`}
+      style={{ height: `${renderedTrackHeight(track)}px` }}
       onPointerDown={(event) => beginTrackViewportPan(event, track)}
       onDragOver={(e) => {
         e.preventDefault();
@@ -2651,21 +4028,25 @@ const TimelinePanel: Component<{
         </div>
       </Show>
       <Show when={track.kind !== "subtitle"}>
-        <For each={trackClips(project()!, track.id)}>
+        <For each={trackTimelineClips(project()!, track.id)}>
           {(clip) => (
             <button
               type="button"
-              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${track.kind === "audio" && splitAudioClipIds.has(clip.id) ? " tl-seg--audio-split" : ""}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}`}
+              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${track.kind === "audio" && splitAudioClipIds.has(clip.id) ? " tl-seg--audio-split" : ""}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}${clip.enabled ? "" : " is-disabled"}`}
               style={{
                 left: `${toPx(clip.start)}px`,
                 width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
               }}
-              onPointerDown={(e) => beginClipDrag(e, clip)}
+              onPointerDown={(e) => beginClipToolInteraction(e, clip)}
               onClick={(e) => {
+                if (applyTimelineToolToClip(e, clip, track)) return;
+                if (timelineTool() === "range") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  return;
+                }
                 e.stopPropagation();
-                setSelectedClipId(clip.id);
-                setSelectedTrackId(track.id);
-                setSelectedSubtitleId(null);
+                selectClip(clip, track.id);
               }}
             >
               {(() => {
@@ -2691,8 +4072,14 @@ const TimelinePanel: Component<{
                   </>
                 );
               })()}
-              <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => beginTrim(e, clip, "start")} />
-              <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => beginTrim(e, clip, "end")} />
+              <div class="tl-clip-handle tl-clip-handle--start" onPointerDown={(e) => {
+                if (timelineTool() !== "select") return;
+                beginTrim(e, clip, "start");
+              }} />
+              <div class="tl-clip-handle tl-clip-handle--end" onPointerDown={(e) => {
+                if (timelineTool() !== "select") return;
+                beginTrim(e, clip, "end");
+              }} />
             </button>
           )}
         </For>
@@ -2707,6 +4094,7 @@ const TimelinePanel: Component<{
               selected={selectedSubtitleId() === caption.id}
               editing={editingSubtitleId() === caption.id}
               editText={editingSubtitleId() === caption.id ? editingSubtitleText() : caption.text}
+              segmentClass={track.kind === "subtitle" ? editorialDecisionSegmentClass(caption) : undefined}
               onPointerDown={(event, currentCaption) => beginSubtitleDrag(event, currentCaption, track.id)}
               onTrimPointerDown={(event, currentCaption, edge) => beginSubtitleTrim(event, currentCaption, edge, track.id)}
               onSelect={(currentCaption) => selectSubtitle(currentCaption, track.id)}
@@ -2723,7 +4111,7 @@ const TimelinePanel: Component<{
   };
 
   createEffect(() => {
-    const viewport = rulerViewportRef ?? assetViewportRef ?? audioViewportRef;
+    const viewport = rulerViewportRef ?? assetViewportRef ?? editorialViewportRef ?? audioViewportRef;
     if (!viewport || !autoFollow()) return;
     const px = toPx(playheadTime());
     const vw = viewport.clientWidth;
@@ -2739,6 +4127,7 @@ const TimelinePanel: Component<{
     requestAnimationFrame(() => syncViewportMetrics());
   });
   createEffect(() => {
+    editorialLaneVisible();
     const viewports = horizontalViewports();
     if (!viewports.length) return;
     syncViewportMetrics(viewports[0]);
@@ -2755,6 +4144,16 @@ const TimelinePanel: Component<{
       window.removeEventListener("fellini:asset-drag-end", onAssetDragEnd as EventListener);
     });
   });
+  createEffect(
+    on(editorialLaneVisible, (visible) => {
+      if (!visible) return;
+      requestAnimationFrame(() => {
+        if (!editorialViewportRef) return;
+        editorialViewportRef.scrollLeft = viewportLeft();
+        syncHorizontalScroll(editorialViewportRef);
+      });
+    }),
+  );
   createEffect(
     on(
       () => selectedJobId(),
@@ -2812,43 +4211,104 @@ const TimelinePanel: Component<{
 
   return (
     <div class="panel timeline-panel">
-      <div class="panel-header">
-        <span class="panel-title">Timeline</span>
-        <div class="timeline-toolbar">
-          <Show when={hoverTime() !== null}>
-            <span class="timeline-zoom-label" style={{ "min-width": "96px" }}>
-              Cursor {fmtTimePrecise(hoverTime()!)}
-            </span>
-          </Show>
-          <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
-          <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
-            Follow
-          </button>
-          <button type="button" class="btn btn-ghost btn-xs" onClick={() => setZoomIndex(zoomIdx() - 1)}>-</button>
-          <span class="timeline-zoom-label">{zoom()}x</span>
-          <button type="button" class="btn btn-ghost btn-xs" onClick={() => setZoomIndex(zoomIdx() + 1)}>+</button>
-          <Show when={selectedClip()}>
+      <div class="panel-header timeline-panel-header">
+        <div class="timeline-header-side">
+          <div class="timeline-header-label">
+            <span class="panel-title">Timeline</span>
             <button
               type="button"
-              class="btn btn-ghost btn-xs"
-              onClick={() => {
-                if (!selectedClip()) return;
-                props.updateProject((current) => splitClip(current, selectedClip()!.id, playheadTime()));
-              }}
+              class={`btn btn-ghost btn-xs timeline-header-lane-toggle${editorialLaneVisible() ? " is-active" : ""}`}
+              aria-pressed={editorialLaneVisible()}
+              disabled={!editorialTrack()}
+              title={editorialLaneVisible() ? "Nascondi lane Editorial" : "Mostra lane Editorial"}
+              onClick={() => setEditorialLaneVisible((current) => !current)}
             >
-              Split
+              <Show when={editorialLaneVisible()} fallback={<IconEyeOff size={12} aria-hidden="true" />}>
+                <IconEye size={12} aria-hidden="true" />
+              </Show>
+              <span>Editorial</span>
             </button>
-          </Show>
+          </div>
+        </div>
+        <div class="timeline-header-center">
+          <div class="timeline-tools">
+            <For each={TIMELINE_TOOL_GROUPS}>
+              {(group) => (
+                <div class="timeline-tool-group">
+                  <For each={group}>
+                    {(tool) => {
+                      const entry = TIMELINE_TOOL_BUTTONS.find((item) => item.tool === tool)!;
+                      return (
+                        <button
+                          type="button"
+                          class={`btn btn-xs timeline-tool-btn${entry.danger ? " timeline-tool-btn--danger" : ""}${timelineTool() === entry.tool ? " is-active" : ""}`}
+                          aria-label={entry.label}
+                          aria-pressed={timelineTool() === entry.tool}
+                          title={entry.tooltip}
+                          onClick={() => toggleTimelineTool(entry.tool)}
+                        >
+                          <TimelineToolIcon tool={entry.tool} />
+                        </button>
+                      );
+                    }}
+                  </For>
+                  <Show when={group.length === 1 && group[0] === "range"}>
+                    <button
+                      type="button"
+                      class={`btn btn-xs timeline-tool-btn timeline-tool-btn--range-loop${timelineRangeLoopEnabled() ? " is-active" : ""}`}
+                      aria-label="Loop Range"
+                      aria-pressed={timelineRangeLoopEnabled()}
+                      title="Loop Range: ripete in playback la selezione temporale attiva."
+                      disabled={!timelineRange()}
+                      onClick={toggleTimelineRangeLoop}
+                    >
+                      <IconRepeat aria-hidden="true" />
+                    </button>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        </div>
+        <div class="timeline-header-side timeline-header-side--right">
+          <div class="timeline-toolbar-meta">
+            <Show when={hoverTime() !== null}>
+              <span class="timeline-zoom-label" style={{ "min-width": "96px" }}>
+                Cursor {fmtTimePrecise(hoverTime()!)}
+              </span>
+            </Show>
+            <Show when={timelineRange()}>
+              {(range) => (
+                <span class="timeline-selection-readout">
+                  Range {fmtTimePrecise(range().start)} - {fmtTimePrecise(range().end)} / {fmtTimePrecise(range().duration)}
+                </span>
+              )}
+            </Show>
+            <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
+            <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
+              Follow
+            </button>
+            <button type="button" class="btn btn-ghost btn-xs" aria-label="Riduci zoom timeline" onClick={() => setZoomIndex(zoomIdx() - 1)}>
+              <IconMinus size={12} />
+            </button>
+            <span class="timeline-zoom-label">{zoom()}x</span>
+            <button type="button" class="btn btn-ghost btn-xs" aria-label="Aumenta zoom timeline" onClick={() => setZoomIndex(zoomIdx() + 1)}>
+              <IconPlus size={12} />
+            </button>
+          </div>
         </div>
       </div>
       <Show when={project()} fallback={<div class="placeholder">Timeline non disponibile</div>}>
         <div
-          class="timeline-shell"
+          class={`timeline-shell${timelineTool() !== "select" ? " has-active-tool" : ""} is-tool-${timelineToolClassName()}`}
           onPointerEnter={updateTimelineHover}
           onPointerMove={updateTimelineHover}
           onPointerLeave={() => setHoverOffset(null)}
         >
-          <div class="timeline-body">
+          <div
+            class={`timeline-body${editorialLaneVisible() && editorialTrack() ? " has-editorial-lane" : ""}`}
+            style={{ "--timeline-middle-lane-height": `${EDITORIAL_STANDALONE_HEIGHT}px` }}
+          >
             <div class="tl-label tl-label--ruler" />
             <div
               ref={rulerViewportRef}
@@ -2861,6 +4321,7 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner"
                 style={{ width: `${contentWidth()}px` }}
               >
+                {renderTimelineRangeOverlay("ruler")}
                 <Show when={hoverTime() !== null}>
                   <div class="tl-hover-line tl-hover-line--ruler" style={{ left: `${toPx(hoverTime()!)}px` }} />
                 </Show>
@@ -2886,7 +4347,7 @@ const TimelinePanel: Component<{
               onScroll={onGroupLabelsScroll("asset")}
             >
               <div class="tl-labels-inner tl-labels-inner--assets">
-                <For each={assetTracks()}>{renderTrackLabel}</For>
+                <For each={videoTracks()}>{(track) => renderTrackLabel(track)}</For>
               </div>
             </div>
             <div
@@ -2906,13 +4367,48 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner timeline-scroll-inner--assets"
                 style={{ width: `${contentWidth()}px` }}
               >
+                {renderTimelineRangeOverlay("body")}
                 <Show when={hoverTime() !== null}>
                   <div class="tl-hover-line tl-hover-line--body" style={{ left: `${toPx(hoverTime()!)}px` }} />
                 </Show>
                 <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
-                <For each={assetTracks()}>{renderTrackRow}</For>
+                <For each={videoTracks()}>{(track) => renderTrackRow(track)}</For>
               </div>
             </div>
+
+            <Show when={editorialLaneVisible() && editorialTrack()}>
+              {(track) => (
+                <>
+                  <div
+                    ref={editorialLabelsRef}
+                    class="tl-labels tl-labels--editorial"
+                  >
+                    <div class="tl-labels-inner tl-labels-inner--editorial">
+                      {renderTrackLabel(track(), "editorial")}
+                    </div>
+                  </div>
+                  <div
+                    ref={editorialViewportRef}
+                    class="timeline-viewport timeline-viewport--editorial"
+                    onWheel={onTimelineWheel}
+                    onScroll={(event) => syncHorizontalScroll(event.currentTarget as HTMLDivElement)}
+                  >
+                    <div
+                      ref={editorialInnerRef}
+                      class="timeline-scroll-inner timeline-scroll-inner--editorial"
+                      style={{ width: `${contentWidth()}px` }}
+                    >
+                      {renderTimelineRangeOverlay("body")}
+                      <Show when={hoverTime() !== null}>
+                        <div class="tl-hover-line tl-hover-line--body" style={{ left: `${toPx(hoverTime()!)}px` }} />
+                      </Show>
+                      <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
+                      {renderTrackRow(track())}
+                    </div>
+                  </div>
+                </>
+              )}
+            </Show>
 
             <div
               ref={audioLabelsRef}
@@ -2920,7 +4416,7 @@ const TimelinePanel: Component<{
               onScroll={onGroupLabelsScroll("audio")}
             >
               <div class="tl-labels-inner tl-labels-inner--audio">
-                <For each={audioTracks()}>{renderTrackLabel}</For>
+                <For each={audioTracks()}>{(track) => renderTrackLabel(track)}</For>
               </div>
             </div>
             <div
@@ -2940,11 +4436,12 @@ const TimelinePanel: Component<{
                 class="timeline-scroll-inner timeline-scroll-inner--audio"
                 style={{ width: `${contentWidth()}px` }}
               >
+                {renderTimelineRangeOverlay("body")}
                 <Show when={hoverTime() !== null}>
                   <div class="tl-hover-line tl-hover-line--body" style={{ left: `${toPx(hoverTime()!)}px` }} />
                 </Show>
                 <div class="tl-playhead tl-playhead--body" style={{ left: `${toPx(playheadTime())}px` }} />
-                <For each={audioTracks()}>{renderTrackRow}</For>
+                <For each={audioTracks()}>{(track) => renderTrackRow(track)}</For>
               </div>
             </div>
           </div>
@@ -2962,17 +4459,19 @@ const TimelinePanel: Component<{
                   />
                 )}
               </For>
-              <For each={overviewSubtitles()}>
-                {(caption) => (
-                  <div
-                    class="tl-mini-seg tl-mini-seg--subtitle"
-                    style={{
-                      left: `${(caption.start / duration()) * 100}%`,
-                      width: `${Math.max(0.5, ((caption.end - caption.start) / duration()) * 100)}%`,
-                    }}
-                  />
-                )}
-              </For>
+              <Show when={editorialLaneVisible()}>
+                <For each={overviewSubtitles()}>
+                  {(caption) => (
+                    <div
+                      class="tl-mini-seg tl-mini-seg--subtitle"
+                      style={{
+                        left: `${(caption.start / duration()) * 100}%`,
+                        width: `${Math.max(0.5, ((caption.end - caption.start) / duration()) * 100)}%`,
+                      }}
+                    />
+                  )}
+                </For>
+              </Show>
               <div class="tl-mini-playhead" style={{ left: `${(playheadTime() / duration()) * 100}%` }} />
               <div
                 class="tl-mini-viewport"

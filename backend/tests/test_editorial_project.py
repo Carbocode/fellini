@@ -14,10 +14,12 @@ from fellini.domain.models import (
     EditorialProject,
     LaneTranscription,
     LaneTranscriptionStatus,
+    LabeledSpan,
     ProjectAsset,
     ProjectAssetKind,
     ProjectSelection,
     ProjectSequence,
+    SpanLabel,
     SourceWordRef,
     SubtitleBlock,
     TranscriptArtifact,
@@ -235,10 +237,11 @@ def test_normalize_track_layout_bootstraps_two_mirrored_pairs(tmp_path):
     assert [track.name for track in normalized.tracks] == [
         "Video 2",
         "Video 1",
+        "Editorial",
         "Audio 1",
         "Audio 2",
     ]
-    assert [track.order for track in normalized.tracks] == [0, 1, 2, 3]
+    assert [track.order for track in normalized.tracks] == [0, 1, 2, 3, 4]
 
 
 def test_normalize_track_layout_adds_new_pair_when_all_pairs_are_occupied(tmp_path):
@@ -298,13 +301,14 @@ def test_normalize_track_layout_adds_new_pair_when_all_pairs_are_occupied(tmp_pa
         "Video 3",
         "Video 2",
         "Video 1",
+        "Editorial",
         "Audio 1",
         "Audio 2",
         "Audio 3",
     ]
 
 
-def test_set_lane_transcription_uses_free_video_lane_for_generated_subtitles(tmp_path):
+def test_set_lane_transcription_uses_editorial_lane_for_generated_subtitles(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
     workspace = JobWorkspace(settings.jobs_root, "job_subtitles_host")
@@ -376,8 +380,178 @@ def test_set_lane_transcription_uses_free_video_lane_for_generated_subtitles(tmp
     )
 
     assert updated.lane_transcriptions[0].lane_id == "track_audio_1"
-    assert [caption.track_id for caption in updated.captions] == ["track_video_2", "track_video_2"]
+    assert [caption.track_id for caption in updated.captions] == ["track_subtitle_1", "track_subtitle_1"]
     assert [caption.text for caption in updated.captions] == ["ciao", "lane"]
+
+
+def test_story_lane_editorial_transcript_uses_story_clip_transcriptions(tmp_path):
+    store = EditorialProjectStore(AppSettings(workspace_root=tmp_path / "workspace"))
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        assets=[
+            ProjectAsset(
+                id="asset_source",
+                kind=ProjectAssetKind.audio,
+                label="Audio source",
+                path="uploads/source.wav",
+                duration=4.0,
+                has_audio=True,
+                transcript_ref="asset_source",
+            )
+        ],
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(id="track_subtitle_1", kind=TimelineTrackKind.subtitle, name="Editorial", order=1),
+            TimelineTrack(
+                id="track_audio_1",
+                kind=TimelineTrackKind.audio,
+                name="Audio 1",
+                order=2,
+                role=AudioTrackRole.story,
+            ),
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_audio_1",
+                asset_id="asset_source",
+                track_id="track_audio_1",
+                start=5.0,
+                source_in=1.0,
+                source_out=2.0,
+                origin=ClipOrigin.manual,
+            ),
+        ],
+        asset_transcriptions=[
+            AssetTranscription(
+                asset_id="asset_source",
+                language="it",
+                words=[
+                    AssetTranscriptionWord(id="word_before", start=0.5, end=0.7, text="prima"),
+                    AssetTranscriptionWord(id="word_ciao", start=1.0, end=1.24, text="ciao"),
+                    AssetTranscriptionWord(id="word_clip", start=1.28, end=1.52, text="clip"),
+                    AssetTranscriptionWord(id="word_after", start=2.2, end=2.4, text="dopo"),
+                ],
+                source_lane_id="track_audio_1",
+                source_audio_path="temp/clip_audio_1_bounce.wav",
+            )
+        ],
+    )
+
+    transcript = store.story_lane_editorial_transcript(project)
+
+    assert transcript is not None
+    assert transcript.source == "story-lane-clips:track_audio_1"
+    assert [word.text for word in transcript.words] == ["ciao", "clip"]
+    assert [(round(word.start, 2), round(word.end, 2)) for word in transcript.words] == [
+        (5.0, 5.24),
+        (5.28, 5.52),
+    ]
+
+
+def test_normalize_generated_subtitles_preserves_editorial_result_blocks(tmp_path):
+    store = EditorialProjectStore(AppSettings(workspace_root=tmp_path / "workspace"))
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(id="track_subtitle_1", kind=TimelineTrackKind.subtitle, name="Editorial", order=1),
+            TimelineTrack(id="track_audio_1", kind=TimelineTrackKind.audio, name="Audio 1", order=2),
+        ],
+        captions=[
+            SubtitleBlock(
+                id="editorial_result_1",
+                track_id="track_subtitle_1",
+                source_lane_id="editorial:track_audio_1",
+                start=0.0,
+                end=0.8,
+                text="ciao clip",
+                origin=ClipOrigin.generated,
+            )
+        ],
+        asset_transcriptions=[
+            AssetTranscription(
+                asset_id="asset_source",
+                language="it",
+                words=[],
+                source_lane_id="track_audio_1",
+                source_audio_path="temp/clip_audio_1_bounce.wav",
+            )
+        ],
+    )
+
+    normalized, changed = store._normalize_generated_subtitles(project)
+
+    assert changed is False
+    assert [caption.id for caption in normalized.captions] == ["editorial_result_1"]
+
+
+def test_replace_editorial_result_captions_uses_labeled_spans_for_editorial_lane(tmp_path):
+    store = EditorialProjectStore(AppSettings(workspace_root=tmp_path / "workspace"))
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1", order=0),
+            TimelineTrack(id="track_subtitle_1", kind=TimelineTrackKind.subtitle, name="Editorial", order=1),
+            TimelineTrack(
+                id="track_audio_1",
+                kind=TimelineTrackKind.audio,
+                name="Audio 1",
+                order=2,
+                role=AudioTrackRole.story,
+            ),
+        ],
+        captions=[
+            SubtitleBlock(
+                id="editorial_result_legacy",
+                track_id="track_subtitle_1",
+                source_lane_id="editorial:track_audio_1",
+                start=0.0,
+                end=0.5,
+                text="legacy",
+                origin=ClipOrigin.generated,
+            )
+        ],
+    )
+
+    updated = store.replace_editorial_result_captions(
+        project,
+        story_lane_id="track_audio_1",
+        spans=[
+            LabeledSpan(
+                text="eh",
+                display_text="eh",
+                start=0.0,
+                end=0.2,
+                label=SpanLabel.cut,
+                reason="filler",
+            ),
+            LabeledSpan(
+                text="ciao",
+                display_text="ciao",
+                start=0.35,
+                end=0.6,
+                label=SpanLabel.keep,
+                reason="content keep",
+            ),
+            LabeledSpan(
+                text="oggi",
+                display_text="oggi",
+                start=0.62,
+                end=0.82,
+                label=SpanLabel.keep,
+                reason="content keep",
+            ),
+        ],
+    )
+
+    assert [caption.source_lane_id for caption in updated.captions] == [
+        "editorial:track_audio_1:CUT",
+        "editorial:track_audio_1:KEEP",
+    ]
+    assert [caption.text for caption in updated.captions] == [
+        "CUT: eh",
+        "KEEP: ciao oggi",
+    ]
 
 
 def test_set_clip_transcription_replaces_only_the_selected_clip_range(tmp_path):

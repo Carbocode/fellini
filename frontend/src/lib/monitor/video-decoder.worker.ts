@@ -41,6 +41,7 @@ function findSeekStartIndex(samples: EncodedVideoSampleRecord[], targetUs: numbe
   let fallbackIndex = 0;
   let bestIndex = -1;
   let bestTimestampUs = Number.NEGATIVE_INFINITY;
+  let bestSequenceNumber = Number.NEGATIVE_INFINITY;
 
   for (let index = 0; index < samples.length; index += 1) {
     const sample = samples[index];
@@ -48,9 +49,16 @@ function findSeekStartIndex(samples: EncodedVideoSampleRecord[], targetUs: numbe
     if (bestIndex < 0) {
       fallbackIndex = index;
     }
-    if (sample.timestampUs <= targetUs && sample.timestampUs >= bestTimestampUs) {
+    if (
+      sample.timestampUs <= targetUs
+      && (
+        sample.timestampUs > bestTimestampUs
+        || (sample.timestampUs === bestTimestampUs && sample.sequenceNumber > bestSequenceNumber)
+      )
+    ) {
       bestIndex = index;
       bestTimestampUs = sample.timestampUs;
+      bestSequenceNumber = sample.sequenceNumber;
     }
   }
 
@@ -71,6 +79,7 @@ function postWorkerMessage(message: VideoDecoderWorkerEvent, transfer: Transfera
 }
 
 function signalError(error: unknown): void {
+  if (disposed) return;
   postWorkerMessage({
     type: "error",
     message: describeError(error),
@@ -154,6 +163,10 @@ async function configureDecoder(localGeneration: number): Promise<void> {
     },
     error: (error) => {
       if (localGeneration !== generation || disposed) return;
+      if (error.message.includes("Codec reclaimed due to inactivity")) {
+        decoder = null;
+        return;
+      }
       signalError(error);
     },
   });
@@ -220,7 +233,13 @@ async function seekTo(nextTargetUs: number): Promise<void> {
   sampleCursorIndex = findSeekStartIndex(track.samples, decodeStartUs);
   emittedUntilUs = Math.min(
     nextTargetUs,
-    track.samples[sampleCursorIndex]?.timestampUs ?? nextTargetUs,
+    sampleEndUs(track.samples[sampleCursorIndex] ?? {
+      timestampUs: nextTargetUs,
+      durationUs: 1,
+      sequenceNumber: -1,
+      isKeyFrame: false,
+      data: new Uint8Array(),
+    }),
   );
   await configureDecoder(localGeneration);
   if (localGeneration !== generation || disposed) return;

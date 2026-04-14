@@ -1,4 +1,4 @@
-import { createEffect, createSignal } from "solid-js";
+import { createEffect, createSignal, onCleanup } from "solid-js";
 
 // ---- Tab system ----
 // Each tab is either a job ID (string) or null (new tab page)
@@ -51,27 +51,31 @@ export function updateTabLabel(jobId: string, label: string) {
   setTabs((prev) => prev.map((t) => (t.id === jobId ? { ...t, label } : t)));
 }
 
-// Sync active tab -> URL hash
-createEffect(() => {
-  const id = selectedJobId();
-  const newHash = id ? `#/project/${id}` : "";
-  if (location.hash !== newHash) {
-    history.replaceState(null, "", newHash || location.pathname);
-  }
-});
-
-window.addEventListener("hashchange", () => {
-  const id = readJobIdFromHash();
-  if (id && id !== selectedJobId()) {
-    // Check if already open in a tab
-    const existing = tabs().findIndex((t) => t.id === id);
-    if (existing >= 0) {
-      setActiveTabIdx(existing);
-    } else {
-      openTab(id);
+export function initTabLocationSync() {
+  createEffect(() => {
+    const id = selectedJobId();
+    const newHash = id ? `#/project/${id}` : "";
+    if (location.hash !== newHash) {
+      history.replaceState(null, "", newHash || location.pathname);
     }
-  }
-});
+  });
+
+  const handleHashChange = () => {
+    const id = readJobIdFromHash();
+    if (id && id !== selectedJobId()) {
+      // Check if already open in a tab
+      const existing = tabs().findIndex((t) => t.id === id);
+      if (existing >= 0) {
+        setActiveTabIdx(existing);
+      } else {
+        openTab(id);
+      }
+    }
+  };
+
+  window.addEventListener("hashchange", handleHashChange);
+  onCleanup(() => window.removeEventListener("hashchange", handleHashChange));
+}
 
 export const [selectedStep, setSelectedStep] = createSignal<string | null>(null);
 export const [dialogOpen, setDialogOpen] = createSignal(false);
@@ -107,6 +111,11 @@ export const [playheadTime, setPlayheadTime] = createSignal(0);
 export const [seekRequest, setSeekRequest] = createSignal<number | null>(null);
 export const [playPauseRequest, setPlayPauseRequest] = createSignal(0);
 export const [autoFollow, setAutoFollow] = createSignal(true);
+export const [timelineRangeSelection, setTimelineRangeSelection] = createSignal<{
+  start: number;
+  end: number;
+} | null>(null);
+export const [timelineRangeLoopEnabled, setTimelineRangeLoopEnabled] = createSignal(false);
 
 // Frame step
 export const [frameStepRequest, setFrameStepRequest] = createSignal<number>(0);

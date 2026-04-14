@@ -174,6 +174,11 @@ export async function fetchArtifact(
   }
 }
 
-export function fileUrl(jobId: string, relativePath: string): string {
-  return `/jobs/${jobId}/files/${encodeURI(relativePath)}`;
+export function fileUrl(
+  jobId: string,
+  relativePath: string,
+  options?: { download?: boolean },
+): string {
+  const base = `/jobs/${jobId}/files/${encodeURI(relativePath)}`;
+  return options?.download ? `${base}?download=1` : base;
 }

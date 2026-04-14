@@ -1,4 +1,4 @@
-flatpak run com.brave.Browser \
+flatpak run com.google.Chrome \
 --ozone-platform=x11 \
 --enable-unsafe-webgpu \
 --enable-features=Vulkan \

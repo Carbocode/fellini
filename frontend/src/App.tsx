@@ -4,7 +4,7 @@ import Workspace from "./components/Workspace";
 import NewTabPage from "./components/NewTabPage";
 import NewProjectDialog from "./components/NewProjectDialog";
 import AboutDialog from "./components/AboutDialog";
-import { selectedJobId } from "./store";
+import { initTabLocationSync, selectedJobId } from "./store";
 
 const CUSTOM_WHEEL_ZOOM_SELECTOR = ".timeline-ruler-viewport, .timeline-viewport";
 
@@ -13,6 +13,8 @@ function allowsCustomWheelZoom(target: EventTarget | null): boolean {
 }
 
 const App: Component = () => {
+  initTabLocationSync();
+
   onMount(() => {
     const listenerOptions: AddEventListenerOptions = { passive: false };
     const preventNativePinchGesture = (event: Event) => {

@@ -225,7 +225,7 @@ def test_request_update_resets_only_affected_downstream_steps(tmp_path):
 
     def mark_all_steps_completed(snapshot) -> None:
         snapshot.status = JobStatus.completed
-        snapshot.outputs = ["output/master_vertical_clean.mp4"]
+        snapshot.outputs = ["output/edited_master.mp4"]
         for step in snapshot.steps:
             step.status = StepStatus.completed
             step.message = "done"
@@ -245,7 +245,7 @@ def test_request_update_resets_only_affected_downstream_steps(tmp_path):
         "completed",
         "completed",
     ]
-    assert chunk_job["outputs"] == ["output/master_vertical_clean.mp4"]
+    assert chunk_job["outputs"] == ["output/edited_master.mp4"]
 
     app.state.store.update(created_job["id"], mark_all_steps_completed)
 
@@ -264,7 +264,7 @@ def test_request_update_resets_only_affected_downstream_steps(tmp_path):
         "completed",
         "completed",
     ]
-    assert style_job["outputs"] == ["output/master_vertical_clean.mp4"]
+    assert style_job["outputs"] == ["output/edited_master.mp4"]
 
 
 def test_partial_request_update_preserves_existing_state_for_render_tuning(tmp_path):
@@ -295,7 +295,7 @@ def test_partial_request_update_preserves_existing_state_for_render_tuning(tmp_p
 
     def mark_all_steps_completed(snapshot) -> None:
         snapshot.status = JobStatus.completed
-        snapshot.outputs = ["output/master_vertical_clean.mp4"]
+        snapshot.outputs = ["output/edited_master.mp4"]
         for step in snapshot.steps:
             step.status = StepStatus.completed
             step.message = "done"
@@ -326,7 +326,7 @@ def test_partial_request_update_preserves_existing_state_for_render_tuning(tmp_p
         "completed",
         "completed",
     ]
-    assert updated["outputs"] == ["output/master_vertical_clean.mp4"]
+    assert updated["outputs"] == ["output/edited_master.mp4"]
 
 
 def test_transcript_updates_target_correct_artifact_and_downstream_step(tmp_path):
@@ -511,6 +511,41 @@ def test_existing_workspace_transcript_marks_transcription_as_completed(tmp_path
     assert recovered_job["steps"][2]["can_run"] is True
 
 
+def test_job_file_endpoint_supports_attachment_download(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Download output job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    target = workspace.output_path("edited_master.mp4")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"video-bytes")
+
+    response = client.get(
+        f"/jobs/{created_job['id']}/files/output/edited_master.mp4?download=1"
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"video-bytes"
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert "edited_master.mp4" in response.headers["content-disposition"]
+
+
 def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatch):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     app = create_app(settings)
@@ -573,12 +608,14 @@ def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatc
     assert [track["kind"] for track in project["tracks"]] == [
         "video",
         "video",
+        "subtitle",
         "audio",
         "audio",
     ]
     assert [track["name"] for track in project["tracks"]] == [
         "Video 2",
         "Video 1",
+        "Editorial",
         "Audio 1",
         "Audio 2",
     ]

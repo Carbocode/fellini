@@ -14,6 +14,7 @@ from fellini.domain.models import (
     ClipOrigin,
     EditorialProject,
     InputAsset,
+    LabeledSpan,
     LaneTranscription,
     LaneTranscriptionStatus,
     ProjectAsset,
@@ -26,6 +27,8 @@ from fellini.domain.models import (
     TimelineTrack,
     TimelineTrackKind,
     TranscriptArtifact,
+    TranscriptSegment,
+    WordTiming,
     utcnow,
 )
 from fellini.log import get_logger
@@ -36,6 +39,9 @@ logger = get_logger(__name__)
 DEFAULT_TRACK_PAIR_COUNT = 2
 # Legacy-only track id kept for migration of older saved projects.
 CAPTION_TRACK_ID = "track_subtitle_1"
+EDITORIAL_RESULT_SOURCE_PREFIX = "editorial:"
+EDITORIAL_GROUP_MAX_WORDS = 4
+EDITORIAL_GROUP_MAX_GAP_SECONDS = 0.18
 
 if TYPE_CHECKING:
     from fellini.pipeline.context import PipelineContext
@@ -354,6 +360,17 @@ class EditorialProjectStore:
         )
 
     def subtitle_track(self, project: EditorialProject) -> TimelineTrack:
+        subtitle_track = next(
+            (
+                track
+                for track in sorted(project.tracks, key=lambda track: track.order)
+                if track.kind == TimelineTrackKind.subtitle or track.id == CAPTION_TRACK_ID
+            ),
+            None,
+        )
+        if subtitle_track:
+            return subtitle_track
+
         video_tracks = sorted(
             (track for track in project.tracks if track.kind == TimelineTrackKind.video),
             key=lambda track: track.order,
@@ -374,9 +391,120 @@ class EditorialProjectStore:
                 None,
             )
         if not match:
-            msg = "Editorial project is missing a video lane for subtitles."
+            msg = "Editorial project is missing an editorial results lane."
             raise ValueError(msg)
         return match
+
+    def story_lane_editorial_transcript(
+        self,
+        project: EditorialProject,
+    ) -> TranscriptArtifact | None:
+        story_lane = self.story_lane(project)
+        if not story_lane:
+            return None
+
+        asset_transcriptions = {
+            item.asset_id: item
+            for item in project.asset_transcriptions
+            if item.words
+        }
+        lane_clips = sorted(
+            [
+                clip
+                for clip in self.track_clips(project, story_lane.id)
+                if clip.origin != ClipOrigin.generated
+            ],
+            key=lambda clip: (clip.start, clip.id),
+        )
+        segments: list[TranscriptSegment] = []
+        notes: list[str] = []
+        language = "it"
+
+        for clip in lane_clips:
+            transcription = asset_transcriptions.get(clip.asset_id)
+            if transcription is None:
+                notes.append(f"Missing clip transcription for {clip.id}")
+                continue
+
+            clip_words = [
+                WordTiming(
+                    text=word.text,
+                    start=clip.start + (max(word.start, clip.source_in) - clip.source_in),
+                    end=max(
+                        clip.start + (max(word.start, clip.source_in) - clip.source_in) + 0.02,
+                        clip.start + (min(word.end, clip.source_out) - clip.source_in),
+                    ),
+                    confidence=1.0,
+                )
+                for word in transcription.words
+                if word.end > clip.source_in and word.start < clip.source_out
+            ]
+            if not clip_words:
+                notes.append(f"No transcript words on story lane clip {clip.id}")
+                continue
+
+            clip_words.sort(key=lambda word: (word.start, word.end, word.text))
+            language = transcription.language or language
+            segments.append(
+                TranscriptSegment(
+                    id=f"story_lane_clip_{clip.id}",
+                    start=clip_words[0].start,
+                    end=clip_words[-1].end,
+                    text=" ".join(word.text for word in clip_words),
+                    words=clip_words,
+                )
+            )
+
+        if segments:
+            return TranscriptArtifact(
+                language=language,
+                segments=segments,
+                source=f"story-lane-clips:{story_lane.id}",
+                notes=notes,
+            )
+
+        lane_transcription = self.story_lane_transcription(project)
+        if lane_transcription and lane_transcription.segments:
+            return TranscriptArtifact(
+                language=lane_transcription.language,
+                segments=lane_transcription.segments,
+                source=f"lane:{lane_transcription.lane_id}",
+                notes=notes,
+            )
+        return None
+
+    def replace_editorial_result_captions(
+        self,
+        project: EditorialProject,
+        *,
+        story_lane_id: str,
+        spans: list[LabeledSpan],
+    ) -> EditorialProject:
+        updated = project.model_copy(deep=True)
+        subtitle_track = self.subtitle_track(updated)
+        updated.captions = [
+            caption
+            for caption in updated.captions
+            if not self._is_editorial_result_caption(caption)
+        ]
+        updated.captions.extend(
+            self._editorial_decision_blocks(
+                subtitle_track_id=subtitle_track.id,
+                story_lane_id=story_lane_id,
+                spans=spans,
+            )
+        )
+        return updated
+
+    def clear_generated_clips(self, project: EditorialProject) -> EditorialProject:
+        updated = project.model_copy(deep=True)
+        generated_ids = {clip.id for clip in updated.clips if clip.origin == ClipOrigin.generated}
+        if not generated_ids:
+            return updated
+        updated.clips = [clip for clip in updated.clips if clip.id not in generated_ids]
+        if updated.selection.clip_id in generated_ids:
+            updated.selection.clip_id = None
+        return updated
 
     def track_clips(self, project: EditorialProject, track_id: str) -> list[TimelineClip]:
         return [clip for clip in project.clips if clip.track_id == track_id and clip.enabled]
@@ -514,6 +642,18 @@ class EditorialProjectStore:
             role=role,
         )
 
+    def _create_subtitle_track(self, order: int) -> TimelineTrack:
+        return TimelineTrack(
+            id=CAPTION_TRACK_ID,
+            kind=TimelineTrackKind.subtitle,
+            name="Editorial",
+            order=order,
+            visible=True,
+            muted=False,
+            locked=False,
+            auto_generated=True,
+        )
+
     def _normalize_track_layout(
         self, project: EditorialProject
     ) -> tuple[EditorialProject, bool]:
@@ -596,9 +736,18 @@ class EditorialProjectStore:
                     deep=True,
                 )
             )
+        subtitle_track = (legacy_caption_track or self._create_subtitle_track(0)).model_copy(
+            update={
+                "kind": TimelineTrackKind.subtitle,
+                "name": "Editorial",
+                "order": 0,
+                "role": None,
+            },
+            deep=True,
+        )
         next_tracks = [
             track.model_copy(update={"order": index}, deep=True)
-            for index, track in enumerate([*reversed(next_video_tracks), *next_audio_tracks])
+            for index, track in enumerate([*reversed(next_video_tracks), subtitle_track, *next_audio_tracks])
         ]
 
         story_assigned = False
@@ -618,10 +767,7 @@ class EditorialProjectStore:
             if first_audio:
                 first_audio.role = AudioTrackRole.story
 
-        host_track = self.subtitle_track(
-            updated.model_copy(update={"tracks": next_tracks}, deep=True)
-        )
-        host_track_id = host_track.id
+        host_track_id = subtitle_track.id
         next_captions = updated.captions
         if host_track_id:
             legacy_track_id = legacy_caption_track.id if legacy_caption_track else None
@@ -1188,13 +1334,21 @@ class EditorialProjectStore:
 
         materialized = self._materialized_generated_subtitle_blocks(updated)
         manual = [caption for caption in updated.captions if caption.origin != ClipOrigin.generated]
+        editorial_results = [
+            caption for caption in updated.captions if self._is_editorial_result_caption(caption)
+        ]
         legacy_generated = [
             caption
             for caption in updated.captions
-            if caption.origin == ClipOrigin.generated and not caption.source_asset_id
+            if (
+                caption.origin == ClipOrigin.generated
+                and not caption.source_asset_id
+                and not self._is_editorial_result_caption(caption)
+            )
         ]
         next_captions = [
             *manual,
+            *editorial_results,
             *(legacy_generated if not updated.asset_transcriptions else []),
             *sorted(materialized, key=lambda caption: (caption.start, caption.end, caption.id)),
         ]
@@ -1202,3 +1356,58 @@ class EditorialProjectStore:
             updated.captions = next_captions
             changed = True
         return updated, changed
+
+    @staticmethod
+    def _is_editorial_result_caption(caption: SubtitleBlock) -> bool:
+        return caption.source_lane_id.startswith(EDITORIAL_RESULT_SOURCE_PREFIX)
+
+    def _editorial_decision_blocks(
+        self,
+        *,
+        subtitle_track_id: str,
+        story_lane_id: str,
+        spans: list[LabeledSpan],
+    ) -> list[SubtitleBlock]:
+        blocks: list[SubtitleBlock] = []
+        for index, group in enumerate(self._group_editorial_spans(spans)):
+            label = group[0].label
+            text_tokens = [span.display_text.strip() for span in group if span.display_text.strip()]
+            preview = " ".join(text_tokens[:EDITORIAL_GROUP_MAX_WORDS]).strip()
+            if len(text_tokens) > EDITORIAL_GROUP_MAX_WORDS:
+                preview = f"{preview}..."
+            text = f"{label.value}: {preview}" if preview else label.value
+            blocks.append(
+                SubtitleBlock(
+                    id=f"editorial_caption_{uuid4().hex[:8]}_{index:03d}",
+                    track_id=subtitle_track_id,
+                    source_lane_id=f"{EDITORIAL_RESULT_SOURCE_PREFIX}{story_lane_id}:{label.value}",
+                    start=group[0].start,
+                    end=max(group[0].start + 0.02, group[-1].end),
+                    text=text,
+                    origin=ClipOrigin.generated,
+                )
+            )
+        return blocks
+
+    @staticmethod
+    def _group_editorial_spans(spans: list[LabeledSpan]) -> list[list[LabeledSpan]]:
+        ordered = sorted(spans, key=lambda span: (span.start, span.end, span.text))
+        if not ordered:
+            return []
+
+        groups: list[list[LabeledSpan]] = []
+        current: list[LabeledSpan] = [ordered[0]]
+        for span in ordered[1:]:
+            previous = current[-1]
+            can_merge = (
+                span.label == current[0].label
+                and span.start - previous.end <= EDITORIAL_GROUP_MAX_GAP_SECONDS
+                and len(current) < EDITORIAL_GROUP_MAX_WORDS
+            )
+            if can_merge:
+                current.append(span)
+                continue
+            groups.append(current)
+            current = [span]
+        groups.append(current)
+        return groups

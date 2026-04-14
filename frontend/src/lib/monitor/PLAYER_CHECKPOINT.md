@@ -9,7 +9,7 @@ Questo documento descrive il monitor realtime attualmente funzionante. Serve com
 Il monitor principale non usa piu` elementi HTML `<video>` o `<audio>` per la preview centrale. Il path attivo e`:
 
 1. composizione timeline compilata una volta per revisione
-2. demux MP4 via `mp4box`
+2. demux ISOBMFF (`MP4` / `MOV`) via `MediaBunny`
 3. decode audio via `WebCodecs.AudioDecoder`
 4. transport audio via `WebAudio` con `AudioContext` come clock master
 5. decode video via `WebCodecs.VideoDecoder` dentro un `DedicatedWorker`
@@ -22,7 +22,7 @@ La sidebar preview degli asset resta separata e continua a usare i media element
 
 - Browser target: Chromium / Brave
 - Capability richieste: `WebGPU`, `VideoDecoder`, `AudioDecoder`
-- Formato media supportato dal monitor: MP4 con video H.264 (`avc1` / `avc3`) e audio AAC (`mp4a`)
+- Formato media supportato dal monitor: MP4 / MOV con video H.264 (`avc1` / `avc3`) e audio AAC (`mp4a`)
 - Video monitor supporta: multi-lane, `z_index`, `visible`, trim, `original/cutout`, `x/y`, `scale`, `rotation`, `opacity`, `crop`
 - Audio monitor supporta: mix di tutte le lane audio non mute con gain per clip
 - Non supportato nel monitor v1: sottotitoli, fallback a `<video>` nel monitor, codec fuori da MP4/H.264/AAC

@@ -1,5 +1,10 @@
 from fellini.adapters.ass import AssSubtitleBuilder
-from fellini.domain.models import CaptionArtifact, CaptionChunk, SubtitleConfig, WordTiming
+from fellini.domain.models import (
+    CaptionArtifact,
+    CaptionChunk,
+    SubtitleConfig,
+    WordTiming,
+)
 
 
 def test_ass_builder_generates_highlight_dialogues():

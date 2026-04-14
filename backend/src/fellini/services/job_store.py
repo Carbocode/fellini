@@ -180,7 +180,6 @@ class JobStore:
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
                 "07_caption_display.json",
-                "08_subtitles.ass",
                 "09_render_plan.json",
             ),
             StepName.transcription: (
@@ -190,7 +189,6 @@ class JobStore:
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
                 "07_caption_display.json",
-                "08_subtitles.ass",
                 "09_render_plan.json",
             ),
             StepName.alignment: (
@@ -198,17 +196,15 @@ class JobStore:
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
                 "07_caption_display.json",
-                "08_subtitles.ass",
                 "09_render_plan.json",
             ),
             StepName.editorial: (
                 "05_spans_labeled.json",
                 "06_edit_decision_list.json",
                 "07_caption_display.json",
-                "08_subtitles.ass",
                 "09_render_plan.json",
             ),
-            StepName.render: ("08_subtitles.ass",),
+            StepName.render: (),
         }
 
         for artifact_name in artifact_map.get(step_name, ()):
@@ -223,11 +219,7 @@ class JobStore:
                     temp_file.unlink()
 
         if not preserve_outputs:
-            for output_name in (
-                "edited_master.mp4",
-                "master_vertical_clean.mp4",
-                "master_vertical_captioned.mp4",
-            ):
+            for output_name in ("edited_master.mp4",):
                 output = workspace.output_path(output_name)
                 if output.exists():
                     output.unlink()

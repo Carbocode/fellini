@@ -123,7 +123,14 @@ class AssSubtitleBuilder:
 
     @staticmethod
     def _escape(text: str) -> str:
-        return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
+        return (
+            text.replace("\\", "\\\\")
+            .replace("{", "(")
+            .replace("}", ")")
+            .replace("\r\n", "\\N")
+            .replace("\n", "\\N")
+            .replace("\r", "\\N")
+        )
 
     @staticmethod
     def _ass_color(rgb_hex: str) -> str:
