@@ -111,6 +111,7 @@ function layerUniforms(sequence: MonitorSequenceSpec, layer: RenderVideoLayer): 
   const translateY = (-2 * (layer.spec.transform.y || 0)) / sequence.height;
   const radians = (layer.spec.transform.rotation || 0) * (Math.PI / 180);
 
+  const aspect = sequence.width / Math.max(1, sequence.height);
   return new Float32Array([
     baseScaleX * userScale,
     baseScaleY * userScale,
@@ -123,7 +124,7 @@ function layerUniforms(sequence: MonitorSequenceSpec, layer: RenderVideoLayer): 
     Math.cos(radians),
     Math.sin(radians),
     clamp(layer.spec.transform.opacity ?? 1, 0, 1),
-    0,
+    aspect,
     0,
     0,
     0,
@@ -189,7 +190,7 @@ export class MonitorWebGpuRenderer {
               uv_scale: vec2f,
               rotation: vec2f,
               opacity: f32,
-              _pad0: f32,
+              aspect: f32,
               _pad1: vec2f,
             };
             struct VertexOut {
@@ -210,10 +211,14 @@ export class MonitorWebGpuRenderer {
                 vec2f(0.0, 0.0), vec2f(1.0, 1.0), vec2f(1.0, 0.0)
               );
               let scaled = quad[index] * uniforms.scale;
-              let rotated = vec2f(
-                scaled.x * uniforms.rotation.x - scaled.y * uniforms.rotation.y,
-                scaled.x * uniforms.rotation.y + scaled.y * uniforms.rotation.x
+              // Ruota in spazio aspect-corrected per evitare la distorsione
+              // dovuta al fatto che NDC è [-1,1] ma il viewport non è quadrato.
+              let square = vec2f(scaled.x * uniforms.aspect, scaled.y);
+              let rotatedSquare = vec2f(
+                square.x * uniforms.rotation.x - square.y * uniforms.rotation.y,
+                square.x * uniforms.rotation.y + square.y * uniforms.rotation.x
               );
+              let rotated = vec2f(rotatedSquare.x / uniforms.aspect, rotatedSquare.y);
               var out: VertexOut;
               out.position = vec4f(rotated + uniforms.translate, 0.0, 1.0);
               out.uv = uniforms.uv_origin + (uv[index] * uniforms.uv_scale);

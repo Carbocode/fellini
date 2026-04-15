@@ -69,6 +69,8 @@ const DragNumber: Component<{
   max?: number;
   step?: number;
   unitsPerPixel?: number;
+  snapTargets?: number[];
+  snapRadiusPx?: number;
   format?: (v: number) => string;
   onChange: (v: number) => void;
 }> = (props) => {
@@ -116,7 +118,13 @@ const DragNumber: Component<{
         document.body.style.cursor = "ew-resize";
       }
       const raw = startValue + totalDx * unitsPerPixel();
-      const next = clamp(snap(raw));
+      const snapRadius = (props.snapRadiusPx ?? 6) * unitsPerPixel();
+      const targets = props.snapTargets ?? [];
+      let snapped = raw;
+      for (const t of targets) {
+        if (Math.abs(raw - t) <= snapRadius) { snapped = t; break; }
+      }
+      const next = clamp(snap(snapped));
       if (next !== last) {
         last = next;
         props.onChange(next);
@@ -173,28 +181,33 @@ const DragNumber: Component<{
 // --------------- JoystickPad ---------------
 // Pad 2D trascinabile: ogni pixel di drag = delta su X/Y.
 const JoystickPad: Component<{
-  onDelta: (dx: number, dy: number) => void;
+  getValue: () => { x: number; y: number };
+  onSet: (x: number, y: number) => void;
 }> = (props) => {
   const [handlePos, setHandlePos] = createSignal({ x: 0, y: 0 });
   const [active, setActive] = createSignal(false);
   const PAD = 56; // raggio pad in px
+  const SNAP_RADIUS = 6; // pixel
 
   const onMouseDown = (e: MouseEvent) => {
     e.preventDefault();
     setActive(true);
-    let lastX = e.clientX;
-    let lastY = e.clientY;
+    const start = props.getValue();
+    const startMouseX = e.clientX;
+    const startMouseY = e.clientY;
 
     const onMove = (ev: MouseEvent) => {
-      const dx = ev.clientX - lastX;
-      const dy = ev.clientY - lastY;
-      lastX = ev.clientX;
-      lastY = ev.clientY;
-      setHandlePos((prev) => ({
-        x: Math.max(-PAD, Math.min(PAD, prev.x + dx)),
-        y: Math.max(-PAD, Math.min(PAD, prev.y + dy)),
-      }));
-      props.onDelta(dx, dy);
+      const totalDx = ev.clientX - startMouseX;
+      const totalDy = ev.clientY - startMouseY;
+      setHandlePos({
+        x: Math.max(-PAD, Math.min(PAD, totalDx)),
+        y: Math.max(-PAD, Math.min(PAD, totalDy)),
+      });
+      let nx = start.x + totalDx;
+      let ny = start.y + totalDy;
+      if (Math.abs(nx) <= SNAP_RADIUS) nx = 0;
+      if (Math.abs(ny) <= SNAP_RADIUS) ny = 0;
+      props.onSet(nx, ny);
     };
 
     const onUp = () => {
@@ -1027,6 +1040,7 @@ const ParamsInspector: Component<{
                     value={tx()}
                     step={1}
                     unitsPerPixel={1}
+                    snapTargets={[0]}
                     onChange={(v) => updateClipTransform({ x: v })}
                   />
                 </div>
@@ -1036,16 +1050,17 @@ const ParamsInspector: Component<{
                     value={ty()}
                     step={1}
                     unitsPerPixel={1}
+                    snapTargets={[0]}
                     onChange={(v) => updateClipTransform({ y: v })}
                   />
                 </div>
               </div>
               <JoystickPad
-                onDelta={(dx, dy) => {
+                getValue={() => {
                   const c = currentClip();
-                  if (!c) return;
-                  updateClipTransform({ x: c.transform.x + dx, y: c.transform.y + dy });
+                  return { x: c?.transform.x ?? 0, y: c?.transform.y ?? 0 };
                 }}
+                onSet={(x, y) => updateClipTransform({ x, y })}
               />
             </div>
 
@@ -1058,6 +1073,7 @@ const ParamsInspector: Component<{
                   min={0.01}
                   step={0.01}
                   unitsPerPixel={0.01}
+                  snapTargets={[1]}
                   format={(v) => v.toFixed(2)}
                   onChange={(v) => updateClipTransform({ scale: Math.max(0.01, v) })}
                 />
@@ -1070,6 +1086,7 @@ const ParamsInspector: Component<{
                   max={360}
                   step={1}
                   unitsPerPixel={1}
+                  snapTargets={[-270, -180, -90, 0, 90, 180, 270]}
                   onChange={(v) => updateClipTransform({ rotation: v })}
                 />
               </div>
@@ -1081,6 +1098,7 @@ const ParamsInspector: Component<{
                   max={1}
                   step={0.01}
                   unitsPerPixel={0.005}
+                  snapTargets={[0, 0.5, 1]}
                   format={(v) => v.toFixed(2)}
                   onChange={(v) => updateClipTransform({ opacity: v })}
                 />
@@ -1122,6 +1140,7 @@ const ParamsInspector: Component<{
                 <DragNumber
                   value={cropLeft()}
                   min={0} max={1} step={0.01} unitsPerPixel={0.005}
+                  snapTargets={[0]}
                   format={(v) => `${Math.round(v * 100)}%`}
                   onChange={(v) => updateClipCrop({ left: v })}
                 />
@@ -1131,6 +1150,7 @@ const ParamsInspector: Component<{
                 <DragNumber
                   value={cropRight()}
                   min={0} max={1} step={0.01} unitsPerPixel={0.005}
+                  snapTargets={[0]}
                   format={(v) => `${Math.round(v * 100)}%`}
                   onChange={(v) => updateClipCrop({ right: v })}
                 />
@@ -1140,6 +1160,7 @@ const ParamsInspector: Component<{
                 <DragNumber
                   value={cropTop()}
                   min={0} max={1} step={0.01} unitsPerPixel={0.005}
+                  snapTargets={[0]}
                   format={(v) => `${Math.round(v * 100)}%`}
                   onChange={(v) => updateClipCrop({ top: v })}
                 />
@@ -1149,6 +1170,7 @@ const ParamsInspector: Component<{
                 <DragNumber
                   value={cropBottom()}
                   min={0} max={1} step={0.01} unitsPerPixel={0.005}
+                  snapTargets={[0]}
                   format={(v) => `${Math.round(v * 100)}%`}
                   onChange={(v) => updateClipCrop({ bottom: v })}
                 />
