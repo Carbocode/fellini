@@ -2,6 +2,7 @@ import { createMemo, createSignal, For, Show, type Component } from "solid-js";
 import { useJobsQuery, useDeleteJobMutation } from "../api/queries";
 import { selectProjectInTab, updateTabLabel, setDialogOpen, tabs, closeTab } from "../store";
 import type { JobSnapshot } from "../types";
+import { Button, Input } from "./ui";
 
 function projectCanvasLabel(job: JobSnapshot): string {
   return `${job.request.render.width}×${job.request.render.height}`;
@@ -63,16 +64,11 @@ const NewTabPage: Component = () => {
         </div>
 
         <div class="ntp-actions">
-          <button
-            type="button"
-            class="btn btn-primary"
-            onClick={() => setDialogOpen(true)}
-          >
+          <Button onClick={() => setDialogOpen(true)}>
             Nuovo progetto
-          </button>
+          </Button>
           <div class="ntp-search">
-            <input
-              type="text"
+            <Input
               placeholder="Cerca progetti..."
               value={filter()}
               onInput={(e) => setFilter(e.currentTarget.value)}

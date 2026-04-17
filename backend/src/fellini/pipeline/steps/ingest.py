@@ -4,6 +4,7 @@ from fellini.domain.models import StepName
 from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+from fellini.workspace_layout import ARTIFACT_MEDIA_PROBE_FILENAME
 
 logger = get_logger(__name__)
 
@@ -23,10 +24,10 @@ class IngestStep(PipelineStep):
         context.state.probe_info = probes
         context.state.duration_seconds = sum(item.duration_seconds for item in probes)
 
-        mezzanine_path = context.workspace.temp_path("source_mezzanine.mp4")
+        mezzanine_path = context.workspace.mezzanine_path
         context.report_progress(self.name, 35, "Creazione del mezzanine")
         context.ffmpeg.create_mezzanine(sources, mezzanine_path, context.workspace.temp_dir)
-        audio_path = context.workspace.temp_path("audio_16k_mono.wav")
+        audio_path = context.workspace.audio_path
         context.report_progress(self.name, 75, "Estrazione dell'audio canonico")
         context.ffmpeg.extract_audio(mezzanine_path, audio_path)
 
@@ -35,7 +36,7 @@ class IngestStep(PipelineStep):
 
         context.report_progress(self.name, 90, "Salvataggio artefatti ingest")
         artifact = context.save_json_artifact(
-            "01_media_probe.json",
+            ARTIFACT_MEDIA_PROBE_FILENAME,
             {"sources": [probe.model_dump(mode="json") for probe in probes]},
         )
         context.editorial_projects.ensure(context)

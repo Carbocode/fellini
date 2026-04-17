@@ -794,44 +794,17 @@ def create_sam2_mask(
         "best_heuristic": best_heuristic,
         "person_detection": detection,
     }
-def has_audio_stream(video_path: Path) -> bool:
-    command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "json",
-        str(video_path),
-    ]
-    raw = capture_command(command)
-    payload = json.loads(raw)
-    return bool(payload.get("streams"))
-
-
-def mux_original_audio(foreground_video: Path, audio_source_video: Path, output_video: Path) -> None:
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(foreground_video),
-        "-i",
-        str(audio_source_video),
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-c:v",
-        "copy",
-        "-c:a",
-        "copy",
-        "-shortest",
-        str(output_video),
-    ]
-    run_command(command)
+def remove_superfluous_outputs(workdir: Path, *, keep_paths: set[Path]) -> None:
+    removable_patterns = (
+        "*_fgr.mp4",
+        "foreground-with-audio.mp4",
+    )
+    for pattern in removable_patterns:
+        for candidate in workdir.glob(pattern):
+            resolved = candidate.resolve()
+            if resolved in keep_paths:
+                continue
+            candidate.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -915,11 +888,6 @@ def parse_args() -> argparse.Namespace:
         "--enable-mps-fallback",
         action="store_true",
         help="Set PYTORCH_ENABLE_MPS_FALLBACK=1 for the inference subprocess.",
-    )
-    parser.add_argument(
-        "--preserve-audio",
-        action="store_true",
-        help="Mux the original audio back into the foreground output when the source video has audio.",
     )
     return parser.parse_args()
 
@@ -1113,13 +1081,10 @@ def main() -> int:
     run_command(command, cwd=REPO_ROOT, env=env)
     wall_seconds = time.perf_counter() - start_time
 
-    foreground_candidates = sorted(workdir.glob("*_fgr.mp4"))
-    foreground_path = foreground_candidates[0] if foreground_candidates else None
-    foreground_with_audio_path = workdir / "foreground-with-audio.mp4"
-
-    if foreground_path is not None and args.preserve_audio and has_audio_stream(video_path):
-        write_progress(progress_path, phase="muxing_audio", message="Muxing original audio into foreground video.")
-        mux_original_audio(foreground_path, video_path, foreground_with_audio_path)
+    alpha_candidates = sorted(workdir.glob("*_pha.mp4"))
+    alpha_path = alpha_candidates[0] if alpha_candidates else None
+    keep_paths = {path.resolve() for path in (alpha_path,) if path is not None}
+    remove_superfluous_outputs(workdir, keep_paths=keep_paths)
 
     benchmark = {
         "created_at": datetime.now().isoformat(),
@@ -1142,8 +1107,7 @@ def main() -> int:
         "mask_generator": args.mask_generator if not args.mask else "user-supplied",
         "sam2_model": (args.sam2_model if not args.mask and args.mask_generator == "sam2" else None),
         "sam2_device": (args.sam2_device if not args.mask and args.mask_generator == "sam2" else None),
-        "foreground_path": str(foreground_path) if foreground_path else None,
-        "foreground_with_audio_path": (str(foreground_with_audio_path) if foreground_with_audio_path.exists() else None),
+        "alpha_path": str(alpha_path) if alpha_path else None,
         "command": command,
     }
     benchmark_path.write_text(json.dumps(benchmark, indent=2), encoding="utf-8")
@@ -1157,10 +1121,8 @@ def main() -> int:
 
     print("\nRun complete.")
     print(f"benchmark_json: {benchmark_path}")
-    if foreground_path:
-        print(f"foreground_video: {foreground_path}")
-    if foreground_with_audio_path.exists():
-        print(f"foreground_with_audio_video: {foreground_with_audio_path}")
+    if alpha_path:
+        print(f"alpha_video: {alpha_path}")
 
     return 0
 

@@ -1,7 +1,6 @@
-import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, type Accessor, type Component, type JSX } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createMemo, createSignal, on, type Accessor, type Component } from "solid-js";
 import {
   IconArrowsMoveHorizontal,
-  IconChevronRight,
   IconCrop,
   IconMovie,
   IconScissors,
@@ -33,6 +32,18 @@ import {
   trackClips,
 } from "../lib/editorial";
 import { baseName, fmtTimePrecise } from "../lib/utils";
+import {
+  Button,
+  FormField,
+  InfoRow,
+  Input,
+  Select,
+  Textarea,
+  Toggle,
+  DragNumber,
+  JoystickPad,
+  InspectorAccordion,
+} from "./ui";
 
 const ASR_LANGUAGE_OPTIONS = [
   { value: "it" },
@@ -58,210 +69,6 @@ const ASR_MODEL_OPTIONS = [
 ];
 
 type InspectorTab = "video" | "lane" | "audio" | "file";
-
-// --------------- DragNumber ---------------
-// Click senza drag → entra in edit mode. Drag orizzontale → cambia valore.
-// Lo stato di drag viene tracciato internamente: snapshot di props.value al mousedown,
-// accumulo delta in locale, così non dipende dalla reattività del parent durante il drag.
-const DragNumber: Component<{
-  value: number;
-  min?: number;
-  max?: number;
-  step?: number;
-  unitsPerPixel?: number;
-  snapTargets?: number[];
-  snapRadiusPx?: number;
-  format?: (v: number) => string;
-  onChange: (v: number) => void;
-}> = (props) => {
-  let inputRef: HTMLInputElement | undefined;
-  const [editing, setEditing] = createSignal(false);
-  const [dragging, setDragging] = createSignal(false);
-  const [draft, setDraft] = createSignal("");
-
-  const step = () => props.step ?? 1;
-  const unitsPerPixel = () => props.unitsPerPixel ?? step();
-  const fmt = () => props.format ?? ((v: number) => {
-    const s = step();
-    if (s >= 1) return String(Math.round(v));
-    if (s >= 0.1) return v.toFixed(1);
-    if (s >= 0.01) return v.toFixed(2);
-    return v.toFixed(3);
-  });
-  const clamp = (v: number) => {
-    let out = v;
-    if (props.min !== undefined) out = Math.max(props.min, out);
-    if (props.max !== undefined) out = Math.min(props.max, out);
-    return out;
-  };
-  const snap = (v: number) => {
-    const s = step();
-    return parseFloat((Math.round(v / s) * s).toFixed(10));
-  };
-
-  const onMouseDown = (e: MouseEvent) => {
-    if (editing()) return;
-    if (e.button !== 0) return;
-    e.preventDefault();
-
-    const startX = e.clientX;
-    const startValue = props.value;
-    let last = startValue;
-    let moved = false;
-
-    const onMove = (ev: MouseEvent) => {
-      const totalDx = ev.clientX - startX;
-      if (!moved) {
-        if (Math.abs(totalDx) < 3) return;
-        moved = true;
-        setDragging(true);
-        document.body.style.cursor = "ew-resize";
-      }
-      const raw = startValue + totalDx * unitsPerPixel();
-      const snapRadius = (props.snapRadiusPx ?? 6) * unitsPerPixel();
-      const targets = props.snapTargets ?? [];
-      let snapped = raw;
-      for (const t of targets) {
-        if (Math.abs(raw - t) <= snapRadius) { snapped = t; break; }
-      }
-      const next = clamp(snap(snapped));
-      if (next !== last) {
-        last = next;
-        props.onChange(next);
-      }
-    };
-
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      setDragging(false);
-      if (!moved) {
-        setDraft(String(props.value));
-        setEditing(true);
-        setTimeout(() => { inputRef?.focus(); inputRef?.select(); }, 0);
-      }
-    };
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  const commitDraft = () => {
-    const v = parseFloat(draft());
-    if (!Number.isNaN(v)) props.onChange(clamp(v));
-    setEditing(false);
-  };
-
-  return (
-    <div class={`drag-number${dragging() ? " is-dragging" : ""}`} onMouseDown={onMouseDown}>
-      <Show
-        when={editing()}
-        fallback={<span class="drag-number-value">{fmt()(props.value)}</span>}
-      >
-        <input
-          ref={inputRef}
-          class="drag-number-input"
-          type="number"
-          step={step()}
-          value={draft()}
-          onMouseDown={(e) => e.stopPropagation()}
-          onInput={(e) => setDraft(e.currentTarget.value)}
-          onBlur={commitDraft}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commitDraft();
-            if (e.key === "Escape") setEditing(false);
-          }}
-        />
-      </Show>
-    </div>
-  );
-};
-
-// --------------- JoystickPad ---------------
-// Pad 2D trascinabile: ogni pixel di drag = delta su X/Y.
-const JoystickPad: Component<{
-  getValue: () => { x: number; y: number };
-  onSet: (x: number, y: number) => void;
-}> = (props) => {
-  const [handlePos, setHandlePos] = createSignal({ x: 0, y: 0 });
-  const [active, setActive] = createSignal(false);
-  const PAD = 56; // raggio pad in px
-  const SNAP_RADIUS = 6; // pixel
-
-  const onMouseDown = (e: MouseEvent) => {
-    e.preventDefault();
-    setActive(true);
-    const start = props.getValue();
-    const startMouseX = e.clientX;
-    const startMouseY = e.clientY;
-
-    const onMove = (ev: MouseEvent) => {
-      const totalDx = ev.clientX - startMouseX;
-      const totalDy = ev.clientY - startMouseY;
-      setHandlePos({
-        x: Math.max(-PAD, Math.min(PAD, totalDx)),
-        y: Math.max(-PAD, Math.min(PAD, totalDy)),
-      });
-      let nx = start.x + totalDx;
-      let ny = start.y + totalDy;
-      if (Math.abs(nx) <= SNAP_RADIUS) nx = 0;
-      if (Math.abs(ny) <= SNAP_RADIUS) ny = 0;
-      props.onSet(nx, ny);
-    };
-
-    const onUp = () => {
-      setActive(false);
-      // snap back to center
-      setHandlePos({ x: 0, y: 0 });
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
-  return (
-    <div
-      class={`joystick-pad${active() ? " is-active" : ""}`}
-      onMouseDown={onMouseDown}
-      title="Trascina per spostare la clip"
-    >
-      <div class="joystick-crosshair joystick-crosshair--h" />
-      <div class="joystick-crosshair joystick-crosshair--v" />
-      <div
-        class="joystick-handle"
-        style={{ transform: `translate(calc(-50% + ${handlePos().x}px), calc(-50% + ${handlePos().y}px))` }}
-      />
-    </div>
-  );
-};
-
-const InspectorAccordion: Component<{
-  icon: JSX.Element;
-  title: string;
-  meta?: string;
-  open?: boolean;
-  class?: string;
-  children?: JSX.Element;
-}> = (props) => (
-  <details class={`inspector-accordion${props.class ? ` ${props.class}` : ""}`} open={props.open}>
-    <summary class="inspector-accordion-summary">
-      <div class="inspector-accordion-head">
-        <span class="inspector-accordion-symbol" aria-hidden="true">{props.icon}</span>
-        <div class="inspector-accordion-copy">
-          <span class="inspector-accordion-title">{props.title}</span>
-          <Show when={props.meta}>
-            <span class="inspector-accordion-meta">{props.meta}</span>
-          </Show>
-        </div>
-      </div>
-      <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
-    </summary>
-    <div class="inspector-accordion-body">{props.children}</div>
-  </details>
-);
 
 const ParamsInspector: Component<{
   project: Accessor<EditorialProject | null>;
@@ -405,17 +212,16 @@ const ParamsInspector: Component<{
     if (clip.transcription_status === "failed") return "Riprova trascrizione";
     return "Genera sottotitoli";
   };
-  const switchClipVariant = (variant: "original" | "cutout") => {
+  const setClipMaskEnabled = (maskEnabled: boolean) => {
     const clip = currentClip();
     const asset = currentAsset();
     const track = currentTrack();
     if (!clip || !asset || asset.kind !== "video" || track?.kind !== "video") return;
-    if (variant === "cutout" && !asset.background_removal?.cutout_path) return;
     props.updateProject((project) => ({
       ...project,
       clips: project.clips.map((item) => (
         item.id === clip.id
-          ? { ...item, asset_variant: variant }
+          ? { ...item, mask_enabled: maskEnabled }
           : item
       )),
     }));
@@ -523,13 +329,13 @@ const ParamsInspector: Component<{
             </div>
           </div>
           <Show when={track.kind === "audio"}>
-            <button
-              type="button"
-              class={`btn btn-xs ${track.role === "story" ? "btn-primary" : "btn-ghost"}`}
+            <Button
+              variant={track.role === "story" ? "primary" : "ghost"}
+              size="xs"
               onClick={() => props.updateProject((project) => setStoryLane(project, track.id))}
             >
               {track.role === "story" ? "Story lane" : "Set story"}
-            </button>
+            </Button>
           </Show>
         </div>
 
@@ -562,32 +368,16 @@ const ParamsInspector: Component<{
 
         <div class="inspector-subsection">
           <div class="inspector-card-title">Dettagli</div>
-          <div class="inspector-card-row">
-            <span>Nome</span>
-            <span>{track.name}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Ordine timeline</span>
-            <span>{track.order + 1}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Tipo</span>
+          <InfoRow label="Nome" value={track.name} />
+          <InfoRow label="Ordine timeline" value={track.order + 1} />
+          <InfoRow label="Tipo">
             <span class="timeline-mode-tag">{track.kind}</span>
-          </div>
+          </InfoRow>
           <Show when={track.kind === "audio" && track.role}>
-            <div class="inspector-card-row">
-              <span>Ruolo</span>
-              <span>{track.role}</span>
-            </div>
+            <InfoRow label="Ruolo" value={track.role} />
           </Show>
-          <div class="inspector-card-row">
-            <span>Sottotitoli generati</span>
-            <span>{stats.generatedCaptionCount}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Sottotitoli manuali</span>
-            <span>{stats.manualCaptionCount}</span>
-          </div>
+          <InfoRow label="Sottotitoli generati" value={stats.generatedCaptionCount} />
+          <InfoRow label="Sottotitoli manuali" value={stats.manualCaptionCount} />
         </div>
       </div>
     );
@@ -632,20 +422,18 @@ const ParamsInspector: Component<{
           </div>
         </div>
 
-        <label class="param-field">
-          <span>Testo</span>
-          <textarea
+        <FormField label="Testo" variant="compact">
+          <Textarea
             value={subtitle.text}
             onInput={(e) =>
               props.updateProject((project) =>
                 patchSubtitle(project, subtitle.id, { text: e.currentTarget.value })
               )}
           />
-        </label>
+        </FormField>
         <div class="inspector-lane-field-row">
-          <label class="param-field">
-            <span>Start</span>
-            <input
+          <FormField label="Start" variant="compact">
+            <Input
               type="number"
               step="0.01"
               value={subtitle.start}
@@ -654,10 +442,9 @@ const ParamsInspector: Component<{
                   patchSubtitle(project, subtitle.id, { start: Number(e.currentTarget.value) })
                 )}
             />
-          </label>
-          <label class="param-field">
-            <span>End</span>
-            <input
+          </FormField>
+          <FormField label="End" variant="compact">
+            <Input
               type="number"
               step="0.01"
               value={subtitle.end}
@@ -666,16 +453,12 @@ const ParamsInspector: Component<{
                   patchSubtitle(project, subtitle.id, { end: Number(e.currentTarget.value) })
                 )}
             />
-          </label>
+          </FormField>
         </div>
         <div class="inspector-card-actions">
-          <button
-            type="button"
-            class="btn btn-xs btn-danger"
-            onClick={deleteSelectedSubtitle}
-          >
+          <Button variant="danger" size="xs" onClick={deleteSelectedSubtitle}>
             Elimina blocco
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -690,7 +473,8 @@ const ParamsInspector: Component<{
     const resolution = asset.width > 0 && asset.height > 0 ? `${asset.width} x ${asset.height}` : "n/a";
     const sampleRate = asset.sample_rate ? `${(asset.sample_rate / 1000).toFixed(asset.sample_rate % 1000 === 0 ? 0 : 1)} kHz` : "n/a";
     const fps = asset.fps > 0 ? asset.fps.toFixed(asset.fps % 1 === 0 ? 0 : 2) : "n/a";
-    const previewReady = asset.preview?.original || asset.preview?.cutout ? "Available" : "Missing";
+    const previewReady = asset.preview?.original || asset.preview?.mask ? "Available" : "Missing";
+    const clipMaskState = clip.mask_enabled ? "Enabled" : "Disabled";
     return (
       <div class="inspector-lane-panel">
         <div class="inspector-lane-head">
@@ -699,7 +483,7 @@ const ParamsInspector: Component<{
             <div class="inspector-lane-title-row">
               <span class="inspector-lane-title">{asset.label || baseName(asset.path)}</span>
               <span class="timeline-mode-tag">{asset.kind}</span>
-              <span class="inspector-lane-chip">{clip.asset_variant}</span>
+              <span class="inspector-lane-chip">{clipMaskState}</span>
             </div>
             <div class="inspector-lane-meta">{baseName(asset.path)}</div>
           </div>
@@ -734,52 +518,25 @@ const ParamsInspector: Component<{
 
         <div class="inspector-subsection">
           <div class="inspector-card-title">Uso nella clip</div>
-          <div class="inspector-card-row">
-            <span>Timeline</span>
-            <span>{fmtTimePrecise(clip.start)} - {fmtTimePrecise(clipEnd)}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Source range</span>
-            <span>{fmtTimePrecise(clip.source_in)} - {fmtTimePrecise(clip.source_out)}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Origine clip</span>
-            <span>{clip.origin}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Link</span>
-            <span>{clip.linked_group_id ? "A/V linked" : "Independent"}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Captions</span>
-            <span>{clip.captions_enabled ? "Enabled" : "Disabled"}</span>
-          </div>
+          <InfoRow label="Timeline" value={`${fmtTimePrecise(clip.start)} - ${fmtTimePrecise(clipEnd)}`} />
+          <InfoRow label="Source range" value={`${fmtTimePrecise(clip.source_in)} - ${fmtTimePrecise(clip.source_out)}`} />
+          <InfoRow label="Origine clip" value={clip.origin} />
+          <InfoRow label="Link" value={clip.linked_group_id ? "A/V linked" : "Independent"} />
+          <InfoRow label="Captions" value={clip.captions_enabled ? "Enabled" : "Disabled"} />
+          <Show when={currentTrack()?.kind === "video" && asset.kind === "video"}>
+            <InfoRow label="Mask" value={clipMaskState} />
+          </Show>
         </div>
 
         <div class="inspector-subsection">
           <div class="inspector-card-title">Metadata file</div>
-          <div class="inspector-card-row">
-            <span>Asset id</span>
-            <span>{asset.id}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Origine file</span>
-            <span>{asset.origin}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Audio embedded</span>
-            <span>{asset.has_audio ? "Yes" : "No"}</span>
-          </div>
+          <InfoRow label="Asset id" value={asset.id} />
+          <InfoRow label="Origine file" value={asset.origin} />
+          <InfoRow label="Audio embedded" value={asset.has_audio} />
           <Show when={asset.transcript_ref}>
-            <div class="inspector-card-row">
-              <span>Transcript ref</span>
-              <span>{asset.transcript_ref}</span>
-            </div>
+            <InfoRow label="Transcript ref" value={asset.transcript_ref} />
           </Show>
-          <div class="inspector-card-row inspector-card-row--stack">
-            <span>Percorso</span>
-            <span class="inspector-card-value--code">{asset.path}</span>
-          </div>
+          <InfoRow label="Percorso" value={asset.path} stack code />
         </div>
       </div>
     );
@@ -791,26 +548,11 @@ const ParamsInspector: Component<{
     return (
       <div class="inspector-accordion-stack">
         <InspectorAccordion icon={<IconMovie />} title="Clip" meta={currentAsset()?.label || "Clip"}>
-          <div class="inspector-card-row">
-            <span>Timeline</span>
-            <span>{fmtTimePrecise(clip.start)} - {fmtTimePrecise(clip.start + (clip.source_out - clip.source_in))}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Source in</span>
-            <span>{fmtTimePrecise(clip.source_in)}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Source out</span>
-            <span>{fmtTimePrecise(clip.source_out)}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Origine</span>
-            <span>{clip.origin}</span>
-          </div>
-          <div class="inspector-card-row">
-            <span>Link</span>
-            <span>{clip.linked_group_id ? "A/V linked" : "Independent"}</span>
-          </div>
+          <InfoRow label="Timeline" value={`${fmtTimePrecise(clip.start)} - ${fmtTimePrecise(clip.start + (clip.source_out - clip.source_in))}`} />
+          <InfoRow label="Source in" value={fmtTimePrecise(clip.source_in)} />
+          <InfoRow label="Source out" value={fmtTimePrecise(clip.source_out)} />
+          <InfoRow label="Origine" value={clip.origin} />
+          <InfoRow label="Link" value={clip.linked_group_id ? "A/V linked" : "Independent"} />
         </InspectorAccordion>
       </div>
     );
@@ -828,82 +570,52 @@ const ParamsInspector: Component<{
         >
           <div class="inspector-subsection">
             <div class="inspector-card-title">Transcript</div>
-            <div class="inspector-card-row">
-              <span>Transcription</span>
-              <span>{clip.transcription_status}</span>
-            </div>
+            <InfoRow label="Transcription" value={clip.transcription_status} />
             <Show when={clip.transcription_message}>
-              <div class="inspector-card-row">
-                <span>Stato</span>
-                <span>{clip.transcription_message}</span>
-              </div>
+              <InfoRow label="Stato" value={clip.transcription_message} />
             </Show>
             <Show when={clip.transcription_status === "running" && currentTranscriptionStep()}>
               {(step) => (
                 <>
-                  <div class="inspector-card-row">
-                    <span>Progresso</span>
-                    <span>{step().progress}%</span>
-                  </div>
+                  <InfoRow label="Progresso" value={`${step().progress}%`} />
                   <Show when={step().message}>
-                    <div class="inspector-card-row">
-                      <span>Fase</span>
-                      <span>{step().message}</span>
-                    </div>
+                    <InfoRow label="Fase" value={step().message} />
                   </Show>
                 </>
               )}
             </Show>
-            <div class="inspector-card-row">
-              <span>Parole</span>
-              <span>{currentClipTranscriptionWordCount()}</span>
-            </div>
+            <InfoRow label="Parole" value={currentClipTranscriptionWordCount()} />
             <Show when={clip.transcription_source_audio_path}>
-              <div class="inspector-card-row">
-                <span>Audio bounce</span>
-                <span>{clip.transcription_source_audio_path}</span>
-              </div>
+              <InfoRow label="Audio bounce" value={clip.transcription_source_audio_path} />
             </Show>
             <Show when={currentClipTranscriptPreview()}>
-              <label class="param-field">
-                <span>Anteprima transcript</span>
-                <textarea value={currentClipTranscriptPreview()} readonly rows={4} />
-              </label>
+              <FormField label="Anteprima transcript" variant="compact">
+                <Textarea value={currentClipTranscriptPreview()} readonly rows={4} />
+              </FormField>
             </Show>
             <Show when={clip.transcription_status === "completed" && !currentClipTranscriptPreview() && !clip.transcription_message}>
-              <div class="inspector-card-row">
-                <span>Risultato</span>
-                <span>Nessuna parola disponibile</span>
-              </div>
+              <InfoRow label="Risultato" value="Nessuna parola disponibile" />
             </Show>
             <Show when={clip.transcription_error}>
               <div class="step-message">{clip.transcription_error}</div>
             </Show>
             <div class="inspector-card-actions">
-              <button
-                type="button"
-                class="btn btn-xs btn-primary"
+              <Button
+                size="xs"
                 disabled={!canTranscribeClip()}
                 onClick={runClipTranscription}
               >
                 {clipTranscriptionButtonLabel()}
-              </button>
+              </Button>
             </div>
           </div>
 
           <div class="inspector-subsection">
             <div class="inspector-card-title">Setup ASR</div>
-            <div class="inspector-card-row">
-              <span>Lingua effettiva</span>
-              <span>{effectiveClipLanguage()}</span>
-            </div>
-            <div class="inspector-card-row">
-              <span>Modello</span>
-              <span>{effectiveClipModel()}</span>
-            </div>
-            <label class="param-field">
-              <span>Lingua clip</span>
-              <select
+            <InfoRow label="Lingua effettiva" value={effectiveClipLanguage()} />
+            <InfoRow label="Modello" value={effectiveClipModel()} />
+            <FormField label="Lingua clip" variant="compact">
+              <Select
                 value={effectiveClipLanguage()}
                 onChange={(e) => {
                   const value = e.currentTarget.value.trim();
@@ -913,20 +625,19 @@ const ParamsInspector: Component<{
                 <For each={ASR_LANGUAGE_OPTIONS}>
                   {(option) => <option value={option.value}>{option.value}</option>}
                 </For>
-              </select>
+              </Select>
               <Show when={clip.transcription_options.language !== null}>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs"
+                <Button
+                  variant="ghost"
+                  size="xs"
                   onClick={() => updateClipTranscriptionOptions({ language: null })}
                 >
                   Reset
-                </button>
+                </Button>
               </Show>
-            </label>
-            <label class="param-field">
-              <span>Modello ASR</span>
-              <select
+            </FormField>
+            <FormField label="Modello ASR" variant="compact">
+              <Select
                 value={effectiveClipModel()}
                 onChange={(e) => {
                   const value = e.currentTarget.value.trim();
@@ -936,20 +647,19 @@ const ParamsInspector: Component<{
                 <For each={ASR_MODEL_OPTIONS}>
                   {(option) => <option value={option.value}>{option.label}</option>}
                 </For>
-              </select>
+              </Select>
               <Show when={clip.transcription_options.model !== null}>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs"
+                <Button
+                  variant="ghost"
+                  size="xs"
                   onClick={() => updateClipTranscriptionOptions({ model: null })}
                 >
                   Reset
-                </button>
+                </Button>
               </Show>
-            </label>
-            <label class="param-field">
-              <span>Beam size</span>
-              <input
+            </FormField>
+            <FormField label="Beam size" variant="compact">
+              <Input
                 type="number"
                 min="1"
                 max="10"
@@ -960,45 +670,39 @@ const ParamsInspector: Component<{
                   updateClipTranscriptionOptions({ beam_size: value ? Number(value) : null });
                 }}
               />
-            </label>
-            <div class="inspector-card-row">
-              <label class="toggle">
-                <input
-                  type="checkbox"
-                  checked={effectiveClipVadFilter()}
-                  onChange={(e) => updateClipTranscriptionOptions({ vad_filter: e.currentTarget.checked })}
-                />
-                <span>VAD filter</span>
-              </label>
+            </FormField>
+            <InfoRow label="">
+              <Toggle
+                label="VAD filter"
+                checked={effectiveClipVadFilter()}
+                onChange={(e) => updateClipTranscriptionOptions({ vad_filter: (e.currentTarget as HTMLInputElement).checked })}
+              />
               <Show when={clip.transcription_options.vad_filter !== null}>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs"
+                <Button
+                  variant="ghost"
+                  size="xs"
                   onClick={() => updateClipTranscriptionOptions({ vad_filter: null })}
                 >
                   Reset
-                </button>
+                </Button>
               </Show>
-            </div>
-            <div class="inspector-card-row">
-              <label class="toggle">
-                <input
-                  type="checkbox"
-                  checked={effectiveClipWhisperX()}
-                  onChange={(e) => updateClipTranscriptionOptions({ use_whisperx: e.currentTarget.checked })}
-                />
-                <span>WhisperX align</span>
-              </label>
+            </InfoRow>
+            <InfoRow label="">
+              <Toggle
+                label="WhisperX align"
+                checked={effectiveClipWhisperX()}
+                onChange={(e) => updateClipTranscriptionOptions({ use_whisperx: (e.currentTarget as HTMLInputElement).checked })}
+              />
               <Show when={clip.transcription_options.use_whisperx !== null}>
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-xs"
+                <Button
+                  variant="ghost"
+                  size="xs"
                   onClick={() => updateClipTranscriptionOptions({ use_whisperx: null })}
                 >
                   Reset
-                </button>
+                </Button>
               </Show>
-            </div>
+            </InfoRow>
           </div>
         </InspectorAccordion>
       </div>
@@ -1006,8 +710,6 @@ const ParamsInspector: Component<{
   };
 
   const renderVideoAccordion = () => {
-    // Accessors reattivi — NON catturare il clip in una const locale,
-    // altrimenti le JSX expressions leggono sempre lo snapshot iniziale.
     const tx = () => currentClip()?.transform.x ?? 0;
     const ty = () => currentClip()?.transform.y ?? 0;
     const tScale = () => currentClip()?.transform.scale ?? 1;
@@ -1031,7 +733,6 @@ const ParamsInspector: Component<{
             meta={`x:${Math.round(tx())} y:${Math.round(ty())} s:${tScale().toFixed(2)}`}
             open
           >
-            {/* Posizione: campi X/Y verticali + joystick 2D */}
             <div class="transform-position-row">
               <div class="transform-xy-fields">
                 <div class="transform-field">
@@ -1064,7 +765,6 @@ const ParamsInspector: Component<{
               />
             </div>
 
-            {/* Scala, Rotazione, Opacità */}
             <div class="transform-grid">
               <div class="transform-field">
                 <span class="transform-field-label">Scala</span>
@@ -1106,13 +806,13 @@ const ParamsInspector: Component<{
             </div>
 
             <div class="inspector-card-actions">
-              <button
-                type="button"
-                class="btn btn-xs btn-ghost"
+              <Button
+                variant="ghost"
+                size="xs"
                 onClick={() => updateClipTransform({ x: 0, y: 0, scale: 1, rotation: 0, opacity: 1 })}
               >
                 Reset
-              </button>
+              </Button>
             </div>
           </InspectorAccordion>
 
@@ -1121,7 +821,6 @@ const ParamsInspector: Component<{
             title="Crop"
             meta={`L:${Math.round(cropLeft() * 100)}% T:${Math.round(cropTop() * 100)}% R:${Math.round(cropRight() * 100)}% B:${Math.round(cropBottom() * 100)}%`}
           >
-            {/* Visualizzatore crop */}
             <div class="crop-preview">
               <div
                 class="crop-preview-inner"
@@ -1177,72 +876,51 @@ const ParamsInspector: Component<{
               </div>
             </div>
             <div class="inspector-card-actions">
-              <button
-                type="button"
-                class="btn btn-xs btn-ghost"
+              <Button
+                variant="ghost"
+                size="xs"
                 onClick={() => updateClipCrop({ left: 0, top: 0, right: 0, bottom: 0 })}
               >
                 Reset crop
-              </button>
+              </Button>
             </div>
           </InspectorAccordion>
 
           <InspectorAccordion
             icon={<IconScissors />}
-            title="Scontorno"
+            title="Mask"
             meta={backgroundRemoval()?.status ?? "idle"}
           >
             <div class="inspector-card-actions inspector-card-actions--spread">
-              <button
-                type="button"
-                class="btn btn-xs btn-primary"
+              <Button
+                size="xs"
                 disabled={startBackgroundRemoval.isPending || backgroundRemoval()?.status === "running"}
                 onClick={runBackgroundRemoval}
               >
-                {backgroundRemoval()?.cutout_path ? "Rigenera scontorno" : "Scontorna video"}
-              </button>
-              <div class="inspector-segmented" role="group" aria-label="Variante clip">
-                <button
-                  type="button"
-                  class={`inspector-segmented__option ${currentClip()?.asset_variant === "original" ? "is-active" : ""}`}
-                  aria-pressed={currentClip()?.asset_variant === "original"}
-                  disabled={backgroundRemoval()?.status === "running" || !backgroundRemoval()?.original_path}
-                  onClick={() => switchClipVariant("original")}
-                >
-                  Originale
-                </button>
-                <button
-                  type="button"
-                  class={`inspector-segmented__option ${currentClip()?.asset_variant === "cutout" ? "is-active" : ""}`}
-                  aria-pressed={currentClip()?.asset_variant === "cutout"}
-                  disabled={backgroundRemoval()?.status === "running" || !backgroundRemoval()?.cutout_path}
-                  onClick={() => switchClipVariant("cutout")}
-                >
-                  Scontornato
-                </button>
-              </div>
+                {backgroundRemoval()?.mask_video_path ? "Rigenera mask" : "Genera mask"}
+              </Button>
+              <Toggle
+                label="Usa mask su questo clip"
+                checked={currentClip()?.mask_enabled ?? false}
+                onChange={(event) => setClipMaskEnabled((event.currentTarget as HTMLInputElement).checked)}
+              />
             </div>
-            <div class="inspector-card-row">
-              <span>Background removal</span>
-              <span>{backgroundRemoval()?.status ?? "idle"}</span>
-            </div>
+            <InfoRow label="Mask asset" value={backgroundRemoval()?.status ?? "idle"} />
             <Show when={backgroundRemoval()}>
-              {(cutout) => (
+              {(mask) => (
                 <>
-                  <Show when={cutout().message}>
-                    <div class="inspector-card-row">
-                      <span>Stato</span>
-                      <span>{cutout().message}</span>
-                    </div>
+                  <Show when={mask().message}>
+                    <InfoRow label="Stato" value={mask().message} />
                   </Show>
-                  <Show when={cutout().status === "running"}>
-                    <div class="inspector-card-row">
-                      <span>Progresso</span>
-                      <span>{Math.round((cutout().progress ?? 0) * 100)}%</span>
-                    </div>
+                  <InfoRow label="Mask clip" value={currentClip()?.mask_enabled ? "enabled" : "disabled"} />
+                  <Show when={mask().mask_video_path}>
+                    <InfoRow label="Video mask" value={mask().mask_video_path} />
                   </Show>
-                  <Show when={cutout().error}>
-                    <div class="step-message">{cutout().error}</div>
+                  <Show when={mask().status === "running"}>
+                    <InfoRow label="Progresso" value={`${Math.round((mask().progress ?? 0) * 100)}%`} />
+                  </Show>
+                  <Show when={mask().error}>
+                    <div class="step-message">{mask().error}</div>
                   </Show>
                 </>
               )}

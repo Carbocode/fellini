@@ -6,6 +6,7 @@ import type {
 import {
   assetById,
   getTrack,
+  maskPathForClip,
   mediaPathForClip,
   projectDuration,
   sortedTracks,
@@ -24,7 +25,7 @@ export interface MonitorVideoLayer {
   clipId: string;
   assetId: string;
   mediaPath: string;
-  variant: TimelineClip["asset_variant"];
+  maskMediaPath: string | null;
   start: number;
   end: number;
   sourceIn: number;
@@ -103,7 +104,7 @@ export function compileMonitorComposition(project: EditorialProject): MonitorCom
         clipId: clip.id,
         assetId: clip.asset_id,
         mediaPath,
-        variant: clip.asset_variant,
+        maskMediaPath: maskPathForClip(project, clip),
         start: clip.start,
         end,
         sourceIn: clip.source_in,

@@ -13,7 +13,6 @@ import {
 import {
   IconArrowsLeftRight,
   IconBracketsContain,
-  IconChevronRight,
   IconCrop,
   IconEye,
   IconEyeOff,
@@ -45,7 +44,9 @@ import {
 } from "@tabler/icons-solidjs";
 import { useQueryClient } from "@tanstack/solid-query";
 import WaveSurfer, { type WaveSurferOptions } from "wavesurfer.js";
+import { Button, FormField, InfoRow, Input, Select, Textarea, Toggle, InspectorAccordion } from "./ui";
 import {
+  useDeleteEditorialAssetMutation,
   useEditorialProjectQuery,
   useJobPolling,
   useJobQuery,
@@ -83,6 +84,7 @@ import {
   timelineRangeSelection,
 } from "../store";
 import type {
+  AssetPreviewVariantKind,
   AssetPreviewBundle,
   AssetPreviewEntry,
   EditorialProject,
@@ -126,7 +128,9 @@ import {
   trackHeight,
   trackSubtitles,
   type SubtitleVisualGroup,
+  type VideoMaskVisualGroup,
   upsertClips,
+  videoMaskGroupsForLane,
   visibleTimelineCaptions,
 } from "../lib/editorial";
 import {
@@ -332,21 +336,21 @@ const TIMELINE_TOOL_GROUPS: TimelineTool[][] = [
 
 function previewBundleForClip(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): AssetPreviewBundle | null {
   if (!asset?.preview) return null;
-  const variant = trackKind === "video" ? clip.asset_variant ?? "original" : "original";
-  return variant === "cutout" ? asset.preview.cutout ?? null : asset.preview.original ?? null;
+  if (trackKind === "audio") return asset.preview.original ?? null;
+  return previewVariant === "mask" ? asset.preview.mask ?? null : asset.preview.original ?? null;
 }
 
 function clipPreviewEntry(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): AssetPreviewEntry | null {
   if (!asset) return null;
-  const bundle = previewBundleForClip(asset, clip, trackKind);
+  const bundle = previewBundleForClip(asset, trackKind, previewVariant);
   if (trackKind === "video") {
     if (asset.kind !== "video") return null;
     return bundle?.filmstrip ?? null;
@@ -357,63 +361,68 @@ function clipPreviewEntry(
 
 function clipPreviewStatus(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): "missing" | "generating" | "ready" | "failed" {
-  return clipPreviewEntry(asset, clip, trackKind)?.status ?? "missing";
+  return clipPreviewEntry(asset, trackKind, previewVariant)?.status ?? "missing";
 }
 
 function assetSupportsClipPreview(
   asset: ProjectAsset | null | undefined,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): boolean {
   if (!asset) return false;
-  if (trackKind === "video") return asset.kind === "video";
+  if (trackKind === "video") {
+    if (asset.kind !== "video") return false;
+    return previewVariant !== "mask" || !!asset.background_removal?.mask_video_path;
+  }
   return asset.kind === "audio" || asset.has_audio;
 }
 
 function shouldRequestClipPreview(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): boolean {
-  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, clip, trackKind) === "missing";
+  return (
+    assetSupportsClipPreview(asset, trackKind, previewVariant)
+    && clipPreviewStatus(asset, trackKind, previewVariant) === "missing"
+  );
 }
 
 function hasGeneratingClipPreview(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): boolean {
-  return assetSupportsClipPreview(asset, trackKind) && clipPreviewStatus(asset, clip, trackKind) === "generating";
+  return (
+    assetSupportsClipPreview(asset, trackKind, previewVariant)
+    && clipPreviewStatus(asset, trackKind, previewVariant) === "generating"
+  );
 }
 
 function shouldRequestAnyAssetPreview(asset: ProjectAsset | null | undefined): boolean {
   if (!asset) return false;
   const needsVideoOriginal = asset.kind === "video"
     && ((asset.preview?.original?.filmstrip?.status ?? "missing") === "missing");
-  const needsVideoCutout = asset.kind === "video"
-    && !!asset.background_removal?.cutout_path
-    && ((asset.preview?.cutout?.filmstrip?.status ?? "missing") === "missing");
+  const needsVideoMask = asset.kind === "video"
+    && !!asset.background_removal?.mask_video_path
+    && ((asset.preview?.mask?.filmstrip?.status ?? "missing") === "missing");
   const needsAudioOriginal = (asset.kind === "audio" || asset.has_audio)
     && ((asset.preview?.original?.waveform?.status ?? "missing") === "missing");
-  const needsAudioCutout = asset.kind === "video"
-    && !!asset.background_removal?.cutout_path
-    && asset.has_audio
-    && ((asset.preview?.cutout?.waveform?.status ?? "missing") === "missing");
-  return needsVideoOriginal || needsVideoCutout || needsAudioOriginal || needsAudioCutout;
+  return needsVideoOriginal || needsVideoMask || needsAudioOriginal;
 }
 
 function previewRequestKey(
   asset: ProjectAsset | null | undefined,
-  clip: TimelineClip,
   trackKind: "video" | "audio",
+  previewVariant: AssetPreviewVariantKind = "original",
 ): string | null {
   if (!asset) return null;
-  const variant = trackKind === "video" ? clip.asset_variant ?? "original" : "original";
-  const status = clipPreviewStatus(asset, clip, trackKind);
-  const cutoutPath = variant === "cutout" ? (asset.background_removal?.cutout_path ?? "") : "";
-  return `${asset.id}:${trackKind}:${variant}:${status}:${cutoutPath}`;
+  const status = clipPreviewStatus(asset, trackKind, previewVariant);
+  const maskPath = previewVariant === "mask" ? (asset.background_removal?.mask_video_path ?? "") : "";
+  return `${asset.id}:${trackKind}:${previewVariant}:${status}:${maskPath}`;
 }
 
 function projectShapeFingerprint(project: EditorialProject): string {
@@ -715,47 +724,32 @@ const StepConfigSidebar: Component<{
           <div class="inspector-accordion-stack">
           <Show when={props.step() === "editorial" && draft()}>
             {(currentDraft) => (
-              <details class="inspector-accordion" open>
-                <summary class="inspector-accordion-summary">
-                  <div class="inspector-accordion-head">
-                    <span class="inspector-accordion-symbol" aria-hidden="true"><IconScissors /></span>
-                    <div class="inspector-accordion-copy">
-                      <span class="inspector-accordion-title">Decisione editoriale</span>
-                      <span class="inspector-accordion-meta">LLM + note</span>
-                    </div>
-                  </div>
-                  <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
-                </summary>
-                <div class="inspector-accordion-body">
-                  <label class="form-field">
-                    <span>Lingua</span>
-                    <input
-                      type="text"
+              <InspectorAccordion icon={<IconScissors />} title="Decisione editoriale" meta="LLM + note" open>
+                  <FormField label="Lingua">
+                    <Input
                       value={currentDraft().language}
                       onInput={(event) =>
                         updateDraft((request) => ({ ...request, language: event.currentTarget.value }))
                       }
                     />
-                  </label>
-                  <div class="inspector-card-row">
-                    <span>Usa local LLM</span>
-                    <input
-                      type="checkbox"
+                  </FormField>
+                  <InfoRow label="">
+                    <Toggle
+                      label="Usa local LLM"
                       checked={currentDraft().toggles.use_local_llm}
                       onChange={(event) =>
                         updateDraft((request) => ({
                           ...request,
                           toggles: {
                             ...request.toggles,
-                            use_local_llm: event.currentTarget.checked,
+                            use_local_llm: (event.currentTarget as HTMLInputElement).checked,
                           },
                         }))
                       }
                     />
-                  </div>
-                  <label class="form-field">
-                    <span>Note editoriali</span>
-                    <textarea
+                  </InfoRow>
+                  <FormField label="Note editoriali">
+                    <Textarea
                       rows="8"
                       value={currentDraft().editorial_notes}
                       placeholder="Hook, tono, pacing, vincoli di taglio, CTA..."
@@ -766,50 +760,23 @@ const StepConfigSidebar: Component<{
                         }))
                       }
                     />
-                  </label>
-                </div>
-              </details>
+                  </FormField>
+              </InspectorAccordion>
             )}
           </Show>
 
           <Show when={props.step() === "render" && draft()}>
             {(currentDraft) => (
               <>
-                <details class="inspector-accordion" open>
-                  <summary class="inspector-accordion-summary">
-                    <div class="inspector-accordion-head">
-                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconVideo /></span>
-                      <div class="inspector-accordion-copy">
-                        <span class="inspector-accordion-title">Output</span>
-                        <span class="inspector-accordion-meta">Unico export finale</span>
-                      </div>
-                    </div>
-                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
-                  </summary>
-                  <div class="inspector-accordion-body">
+                <InspectorAccordion icon={<IconVideo />} title="Output" meta="Unico export finale" open>
                     <p class="inspector-note">
                       Il render esporta una sola versione finale della timeline, coerente con il canvas della preview.
                     </p>
-                  </div>
-                </details>
+                </InspectorAccordion>
 
-                <details class="inspector-accordion" open>
-                  <summary class="inspector-accordion-summary">
-                    <div class="inspector-accordion-head">
-                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconBracketsContain /></span>
-                      <div class="inspector-accordion-copy">
-                        <span class="inspector-accordion-title">Canvas</span>
-                        <span class="inspector-accordion-meta">
-                          {currentDraft().render.width}×{currentDraft().render.height}
-                        </span>
-                      </div>
-                    </div>
-                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
-                  </summary>
-                  <div class="inspector-accordion-body">
-                    <label class="form-field">
-                      <span>Preset</span>
-                      <select
+                <InspectorAccordion icon={<IconBracketsContain />} title="Canvas" meta={`${currentDraft().render.width}×${currentDraft().render.height}`} open>
+                    <FormField label="Preset">
+                      <Select
                         value={
                           CANVAS_PRESETS.find(
                             (preset) =>
@@ -827,12 +794,11 @@ const StepConfigSidebar: Component<{
                             </option>
                           )}
                         </For>
-                      </select>
-                    </label>
+                      </Select>
+                    </FormField>
                     <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
-                      <label class="form-field">
-                        <span>Width</span>
-                        <input
+                      <FormField label="Width">
+                        <Input
                           type="number"
                           min="256"
                           step="2"
@@ -847,10 +813,9 @@ const StepConfigSidebar: Component<{
                             }))
                           }
                         />
-                      </label>
-                      <label class="form-field">
-                        <span>Height</span>
-                        <input
+                      </FormField>
+                      <FormField label="Height">
+                        <Input
                           type="number"
                           min="256"
                           step="2"
@@ -865,27 +830,14 @@ const StepConfigSidebar: Component<{
                             }))
                           }
                         />
-                      </label>
+                      </FormField>
                     </div>
-                  </div>
-                </details>
+                </InspectorAccordion>
 
-                <details class="inspector-accordion">
-                  <summary class="inspector-accordion-summary">
-                    <div class="inspector-accordion-head">
-                      <span class="inspector-accordion-symbol" aria-hidden="true"><IconWaveSquare /></span>
-                      <div class="inspector-accordion-copy">
-                        <span class="inspector-accordion-title">Encoding</span>
-                        <span class="inspector-accordion-meta">ffmpeg</span>
-                      </div>
-                    </div>
-                    <span class="inspector-accordion-caret" aria-hidden="true"><IconChevronRight /></span>
-                  </summary>
-                  <div class="inspector-accordion-body">
+                <InspectorAccordion icon={<IconWaveSquare />} title="Encoding" meta="ffmpeg">
                     <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
-                      <label class="form-field">
-                        <span>Video codec</span>
-                        <select
+                      <FormField label="Video codec">
+                        <Select
                           value={currentDraft().render.video_codec}
                           onInput={(event) =>
                             updateDraft((request) => ({
@@ -897,11 +849,10 @@ const StepConfigSidebar: Component<{
                           <option value="libx264">libx264</option>
                           <option value="h264_videotoolbox">h264_videotoolbox</option>
                           <option value="hevc_videotoolbox">hevc_videotoolbox</option>
-                        </select>
-                      </label>
-                      <label class="form-field">
-                        <span>Audio codec</span>
-                        <select
+                        </Select>
+                      </FormField>
+                      <FormField label="Audio codec">
+                        <Select
                           value={currentDraft().render.audio_codec}
                           onInput={(event) =>
                             updateDraft((request) => ({
@@ -912,13 +863,12 @@ const StepConfigSidebar: Component<{
                         >
                           <option value="aac">aac</option>
                           <option value="mp3">mp3</option>
-                        </select>
-                      </label>
+                        </Select>
+                      </FormField>
                     </div>
                     <div class="form-row" style={{ "grid-template-columns": "1fr 1fr 1fr" }}>
-                    <label class="form-field">
-                      <span>Preset</span>
-                      <select
+                    <FormField label="Preset">
+                      <Select
                         value={currentDraft().render.preset}
                         onInput={(event) =>
                           updateDraft((request) => ({
@@ -933,11 +883,10 @@ const StepConfigSidebar: Component<{
                         <option value="medium">medium</option>
                         <option value="slow">slow</option>
                         <option value="slower">slower</option>
-                      </select>
-                    </label>
-                    <label class="form-field">
-                      <span>CRF</span>
-                      <input
+                      </Select>
+                    </FormField>
+                    <FormField label="CRF">
+                      <Input
                         type="number"
                         min="0"
                         max="35"
@@ -952,11 +901,9 @@ const StepConfigSidebar: Component<{
                           }))
                         }
                       />
-                    </label>
-                    <label class="form-field">
-                      <span>Audio bitrate</span>
-                      <input
-                        type="text"
+                    </FormField>
+                    <FormField label="Audio bitrate">
+                      <Input
                         value={currentDraft().render.audio_bitrate}
                         onInput={(event) =>
                           updateDraft((request) => ({
@@ -968,10 +915,9 @@ const StepConfigSidebar: Component<{
                           }))
                         }
                       />
-                    </label>
+                    </FormField>
                     </div>
-                  </div>
-                </details>
+                </InspectorAccordion>
 
               </>
             )}
@@ -985,17 +931,15 @@ const StepConfigSidebar: Component<{
               || stepSnapshot()?.blocked_reason
               || (running() ? "Salvataggio configurazione e avvio job..." : "")}
           </div>
-          <button type="button" class="btn btn-ghost" onClick={props.onClose} disabled={running()}>
+          <Button variant="ghost" onClick={props.onClose} disabled={running()}>
             Annulla
-          </button>
-          <button
-            type="button"
-            class="btn btn-primary"
+          </Button>
+          <Button
             onClick={() => void submit()}
             disabled={running() || !stepSnapshot()?.can_run}
           >
             Avvia {activeStepLabel()}
-          </button>
+          </Button>
         </div>
       </aside>
     </Show>
@@ -1190,8 +1134,10 @@ const TimelineClipPreview: Component<{
   asset: ProjectAsset;
   trackKind: "video" | "audio";
   pxPerSecond: number;
+  previewVariant?: AssetPreviewVariantKind;
 }> = (props) => {
-  const entry = () => clipPreviewEntry(props.asset, props.clip, props.trackKind);
+  const previewVariant = () => props.previewVariant ?? "original";
+  const entry = () => clipPreviewEntry(props.asset, props.trackKind, previewVariant());
   const status = () => entry()?.status ?? "missing";
   const src = () => {
     const preview = entry();
@@ -1207,6 +1153,7 @@ const TimelineClipPreview: Component<{
       classList={{
         "has-media": !!src(),
         "is-loading": status() === "generating",
+        "is-mask": previewVariant() === "mask",
       }}
       data-status={status()}
       aria-hidden="true"
@@ -1384,6 +1331,46 @@ const AudioSubtitleVisualGroup: Component<{
         />
       )}
     </For>
+  </div>
+);
+
+const TimelineVideoMaskGroup: Component<{
+  jobId: string;
+  group: VideoMaskVisualGroup;
+  clip: TimelineClip;
+  asset: ProjectAsset;
+  pxPerSecond: number;
+}> = (props) => (
+  <div
+    class={`tl-video-mask-group tl-video-mask-group--${props.group.status}`}
+    style={{
+      left: `${props.group.start * props.pxPerSecond}px`,
+      width: `${Math.max(12, (props.group.end - props.group.start) * props.pxPerSecond)}px`,
+    }}
+  >
+    <Show
+      when={props.group.status === "ready"}
+      fallback={
+        <div class={`tl-video-mask-placeholder tl-video-mask-placeholder--${props.group.status}`}>
+          <span>
+            {props.group.status === "pending"
+              ? "AI MASK"
+              : props.group.status === "failed"
+                ? "MASK ERROR"
+                : "MASK"}
+          </span>
+        </div>
+      }
+    >
+      <TimelineClipPreview
+        jobId={props.jobId}
+        clip={props.clip}
+        asset={props.asset}
+        trackKind="video"
+        pxPerSecond={props.pxPerSecond}
+        previewVariant="mask"
+      />
+    </Show>
   </div>
 );
 
@@ -1776,12 +1763,14 @@ const AssetBrowserPanel: Component<{
   view: Accessor<SidebarView>;
 }> = (props) => {
   const job = useJobQuery(selectedJobId);
+  const deleteAsset = useDeleteEditorialAssetMutation();
   const requestAssetPreviews = useRequestAssetPreviewsMutation();
   const uploadAsset = useUploadEditorialAssetMutation();
   const [filter, setFilter] = createSignal("");
   const [selectedAssetId, setSelectedAssetId] = createSignal<string | null>(null);
   const [previewAssetId, setPreviewAssetId] = createSignal<string | null>(null);
   const [draggingAssetId, setDraggingAssetId] = createSignal<string | null>(null);
+  const [deletingAssetId, setDeletingAssetId] = createSignal<string | null>(null);
   const [viewMode, setViewMode] = createSignal<"grid" | "list">("grid");
   const [thumbnails, setThumbnails] = createSignal<Map<string, string>>(new Map());
   let inputRef: HTMLInputElement | undefined;
@@ -1803,6 +1792,23 @@ const AssetBrowserPanel: Component<{
     return current && jobId ? fileUrl(jobId, current.path) : null;
   });
   const logs = createMemo(() => (job.data as JobSnapshot | undefined)?.logs ?? []);
+
+  createEffect(() => {
+    const currentAssets = project()?.assets ?? [];
+    const activeAssetIds = new Set(currentAssets.map((asset) => asset.id));
+    setThumbnails((prev) => {
+      const next = new Map(
+        [...prev.entries()].filter(([assetId]) => activeAssetIds.has(assetId)),
+      );
+      return next.size === prev.size ? prev : next;
+    });
+    if (selectedAssetId() && !activeAssetIds.has(selectedAssetId()!)) {
+      setSelectedAssetId(null);
+    }
+    if (previewAssetId() && !activeAssetIds.has(previewAssetId()!)) {
+      setPreviewAssetId(null);
+    }
+  });
 
   createEffect(() => {
     const jobId = selectedJobId();
@@ -1840,13 +1846,37 @@ const AssetBrowserPanel: Component<{
     if (inputRef) inputRef.value = "";
   };
 
+  const handleDeleteAsset = async (asset: ProjectAsset) => {
+    const jobId = selectedJobId();
+    const current = project();
+    if (!jobId || !current || asset.origin !== "library") return;
+    const timelineClipCount = current.clips.filter((clip) => clip.asset_id === asset.id).length;
+    const confirmed = window.confirm(
+      timelineClipCount > 0
+        ? `Eliminare "${asset.label}" dalla libreria? Verranno rimosse ${timelineClipCount} clip dalla timeline e tutti gli artefatti associati.`
+        : `Eliminare "${asset.label}" dalla libreria e tutti gli artefatti associati?`,
+    );
+    if (!confirmed) return;
+
+    setDeletingAssetId(asset.id);
+    try {
+      await deleteAsset.mutateAsync({ jobId, assetId: asset.id });
+      if (selectedAssetId() === asset.id) setSelectedAssetId(null);
+      if (previewAssetId() === asset.id) setPreviewAssetId(null);
+    } finally {
+      setDeletingAssetId((currentAssetId) => (
+        currentAssetId === asset.id ? null : currentAssetId
+      ));
+    }
+  };
+
   return (
     <div class="panel asset-explorer">
       <div class="sidebar-tab-body" style={{ display: props.view() === "assets" ? "flex" : "none" }}>
         <div class="asset-browser-actions">
-          <button type="button" class="btn btn-primary btn-xs" onClick={() => inputRef?.click()}>
+          <Button size="xs" onClick={() => inputRef?.click()}>
             Aggiungi asset
-          </button>
+          </Button>
           <input
             ref={inputRef}
             type="file"
@@ -1918,17 +1948,34 @@ const AssetBrowserPanel: Component<{
                     >
                       <FileTypeIcon type={asset.kind} />
                       <span class="asset-item-name">{asset.label || humanizeMediaName(asset.path)}</span>
-                      <button
-                        type="button"
-                        class={`asset-item-action${previewAssetId() === asset.id ? " active" : ""}`}
-                        title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openAssetPreview(asset);
-                        }}
-                      >
-                        <IconEye />
-                      </button>
+                      <div class="asset-item-actions">
+                        <button
+                          type="button"
+                          class={`asset-item-action${previewAssetId() === asset.id ? " active" : ""}`}
+                          title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openAssetPreview(asset);
+                          }}
+                        >
+                          <IconEye />
+                        </button>
+                        <Show when={asset.origin === "library"}>
+                          <button
+                            type="button"
+                            class="asset-item-action asset-item-action--danger"
+                            title="Elimina media"
+                            aria-label="Elimina media"
+                            disabled={deletingAssetId() === asset.id}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleDeleteAsset(asset);
+                            }}
+                          >
+                            <IconTrash />
+                          </button>
+                        </Show>
+                      </div>
                       <span class={`asset-item-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
                     </div>
                   )}
@@ -1976,17 +2023,34 @@ const AssetBrowserPanel: Component<{
                           <img class="asset-card-thumb-img" src={thumbnails().get(asset.id)} alt="" draggable={false} />
                         </Show>
                         <span class={`asset-card-badge asset-item-badge--${asset.kind}`}>{asset.kind.toUpperCase()}</span>
-                        <button
-                          type="button"
-                          class={`asset-card-preview-btn${previewAssetId() === asset.id ? " active" : ""}`}
-                          title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            openAssetPreview(asset);
-                          }}
-                        >
-                          <IconEye />
-                        </button>
+                        <div class="asset-card-actions">
+                          <button
+                            type="button"
+                            class={`asset-card-preview-btn${previewAssetId() === asset.id ? " active" : ""}`}
+                            title={previewAssetId() === asset.id ? "Preview aperta" : "Apri preview"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openAssetPreview(asset);
+                            }}
+                          >
+                            <IconEye />
+                          </button>
+                          <Show when={asset.origin === "library"}>
+                            <button
+                              type="button"
+                              class="asset-card-preview-btn asset-card-preview-btn--danger"
+                              title="Elimina media"
+                              aria-label="Elimina media"
+                              disabled={deletingAssetId() === asset.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleDeleteAsset(asset);
+                              }}
+                            >
+                              <IconTrash />
+                            </button>
+                          </Show>
+                        </div>
                       </div>
                       <span class="asset-card-name">{asset.label || humanizeMediaName(asset.path)}</span>
                     </div>
@@ -2355,20 +2419,10 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
             <div class="monitor-debug-panel">
               <div class="monitor-debug-section">
                 <div class="monitor-debug-title">runtime</div>
-                <div class="monitor-debug-row">
-                  <span>renderer</span>
-                  <strong>{monitorDiagnostics().renderer}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>playing</span>
-                  <strong>{monitorDiagnostics().runtime.playing ? "yes" : "no"}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>initialized</span>
-                  <strong>{monitorDiagnostics().runtime.initialized ? "yes" : "no"}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>raf / queued / render</span>
+                <InfoRow variant="debug" label="renderer" value={monitorDiagnostics().renderer} />
+                <InfoRow variant="debug" label="playing" value={monitorDiagnostics().runtime.playing ? "yes" : "no"} />
+                <InfoRow variant="debug" label="initialized" value={monitorDiagnostics().runtime.initialized ? "yes" : "no"} />
+                <InfoRow variant="debug" label="raf / queued / render">
                   <strong>
                     {monitorDiagnostics().runtime.rafActive ? "1" : "0"}
                     {" / "}
@@ -2376,25 +2430,12 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                     {" / "}
                     {monitorDiagnostics().runtime.rendering ? "1" : "0"}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>clock</span>
-                  <strong>{fmtTimePrecise(monitorDiagnostics().currentTime)}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>layers</span>
-                  <strong>{monitorDiagnostics().renderedLayers}/{monitorDiagnostics().activeLayers}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>decoded since seek</span>
-                  <strong>{monitorDiagnostics().decodedFrames}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>buffered</span>
-                  <strong>{monitorDiagnostics().bufferedFrames}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>pending render</span>
+                </InfoRow>
+                <InfoRow variant="debug" label="clock" value={fmtTimePrecise(monitorDiagnostics().currentTime)} />
+                <InfoRow variant="debug" label="layers" value={`${monitorDiagnostics().renderedLayers}/${monitorDiagnostics().activeLayers}`} />
+                <InfoRow variant="debug" label="decoded since seek" value={monitorDiagnostics().decodedFrames} />
+                <InfoRow variant="debug" label="buffered" value={monitorDiagnostics().bufferedFrames} />
+                <InfoRow variant="debug" label="pending render">
                   <strong>
                     {formatMonitorDebugTime(monitorDiagnostics().runtime.pendingRenderTime)}
                     {" / "}
@@ -2402,9 +2443,8 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                       ? "—"
                       : monitorDiagnostics().runtime.pendingRenderBlocking ? "blocking" : "async"}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>last req</span>
+                </InfoRow>
+                <InfoRow variant="debug" label="last req">
                   <strong>
                     {formatMonitorDebugTime(monitorDiagnostics().runtime.lastRenderRequestTime)}
                     {" / "}
@@ -2412,9 +2452,8 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                       ? "—"
                       : monitorDiagnostics().runtime.lastRenderRequestBlocking ? "blocking" : "async"}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>last done</span>
+                </InfoRow>
+                <InfoRow variant="debug" label="last done">
                   <strong>
                     {formatMonitorDebugTime(monitorDiagnostics().runtime.lastCompletedRenderTime)}
                     {" / "}
@@ -2422,21 +2461,9 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                       ? "—"
                       : monitorDiagnostics().runtime.lastCompletedRenderBlocking ? "blocking" : "async"}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>players ready</span>
-                  <strong>
-                    {monitorDiagnostics().runtime.readyVideoPlayers}/{monitorDiagnostics().runtime.videoPlayerEntries}
-                  </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>cache demux/audio</span>
-                  <strong>
-                    {monitorDiagnostics().runtime.demuxCacheEntries}
-                    {" / "}
-                    {monitorDiagnostics().runtime.audioBufferCacheEntries}
-                  </strong>
-                </div>
+                </InfoRow>
+                <InfoRow variant="debug" label="players ready" value={`${monitorDiagnostics().runtime.readyVideoPlayers}/${monitorDiagnostics().runtime.videoPlayerEntries}`} />
+                <InfoRow variant="debug" label="cache demux/audio" value={`${monitorDiagnostics().runtime.demuxCacheEntries} / ${monitorDiagnostics().runtime.audioBufferCacheEntries}`} />
                 <div class="monitor-debug-kv">
                   <span>revision</span>
                   <code>{monitorDiagnostics().runtime.compositionRevisionKey ?? "—"}</code>
@@ -2444,39 +2471,25 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
               </div>
               <div class="monitor-debug-section">
                 <div class="monitor-debug-title">audio</div>
-                <div class="monitor-debug-row">
-                  <span>state</span>
+                <InfoRow variant="debug" label="state">
                   <strong>
                     {monitorDiagnostics().audio.playing ? "playing" : "paused"}
                     {" / "}
                     {monitorDiagnostics().audio.contextState}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>ctx time</span>
+                </InfoRow>
+                <InfoRow variant="debug" label="ctx time">
                   <strong>
                     {(() => {
                       const currentTime = monitorDiagnostics().audio.contextCurrentTime;
                       return currentTime === null ? "—" : `${currentTime.toFixed(3)}s`;
                     })()}
                   </strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>start ctx</span>
-                  <strong>{monitorDiagnostics().audio.startContextTime.toFixed(3)}s</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>start tl</span>
-                  <strong>{fmtTimePrecise(monitorDiagnostics().audio.startTimelineTime)}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>scheduled nodes</span>
-                  <strong>{monitorDiagnostics().audio.scheduledNodeCount}</strong>
-                </div>
-                <div class="monitor-debug-row">
-                  <span>sample rate</span>
-                  <strong>{monitorDiagnostics().audio.sampleRate ?? "—"}</strong>
-                </div>
+                </InfoRow>
+                <InfoRow variant="debug" label="start ctx" value={`${monitorDiagnostics().audio.startContextTime.toFixed(3)}s`} />
+                <InfoRow variant="debug" label="start tl" value={fmtTimePrecise(monitorDiagnostics().audio.startTimelineTime)} />
+                <InfoRow variant="debug" label="scheduled nodes" value={monitorDiagnostics().audio.scheduledNodeCount} />
+                <InfoRow variant="debug" label="sample rate" value={monitorDiagnostics().audio.sampleRate ?? "—"} />
               </div>
               <Show when={monitorDiagnostics().layers.length > 0}>
                 <div class="monitor-debug-section">
@@ -2484,28 +2497,16 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                   <For each={monitorDiagnostics().layers}>
                     {(layer) => (
                       <div class="monitor-debug-card">
-                        <div class="monitor-debug-row">
-                          <span>{layer.clipId}</span>
-                          <strong>{layer.includedInRender ? "render" : "skip"}</strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>target / frame</span>
+                        <InfoRow variant="debug" label={layer.clipId} value={layer.includedInRender ? "render" : "skip"} />
+                        <InfoRow variant="debug" label="target / frame">
                           <strong>
                             {formatMonitorDebugUs(layer.localTimeUs)}
                             {" / "}
                             {formatMonitorDebugUs(layer.frameTimestampUs)}
                           </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>worker / accel</span>
-                          <strong>
-                            {layer.player?.workerReady ? "ready" : "boot"}
-                            {" / "}
-                            {layer.player?.selectedAcceleration ?? "—"}
-                          </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>cache</span>
+                        </InfoRow>
+                        <InfoRow variant="debug" label="worker / accel" value={`${layer.player?.workerReady ? "ready" : "boot"} / ${layer.player?.selectedAcceleration ?? "—"}`} />
+                        <InfoRow variant="debug" label="cache">
                           <strong>
                             {layer.player?.bufferedFrames ?? 0}
                             {" @ "}
@@ -2513,9 +2514,8 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                             {".."}
                             {formatMonitorDebugUs(layer.player?.bufferedRangeEndUs ?? null)}
                           </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>dispatch</span>
+                        </InfoRow>
+                        <InfoRow variant="debug" label="dispatch">
                           <strong>
                             {formatMonitorDebugUs(layer.player?.lastDispatchedTargetUs ?? null)}
                             {" / "}
@@ -2523,32 +2523,23 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                               ? "—"
                               : layer.player?.lastDispatchedPlaying ? "play" : "pause"}
                           </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>request</span>
+                        </InfoRow>
+                        <InfoRow variant="debug" label="request">
                           <strong>
                             {formatMonitorDebugUs(layer.player?.lastRequestedTargetUs ?? null)}
                             {" / "}
                             {layer.player?.lastForceSeek ? "seek" : "keep"}
                           </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>intent / session</span>
+                        </InfoRow>
+                        <InfoRow variant="debug" label="intent / session">
                           <strong>
                             {layer.player?.lastRequestedIntent ?? "—"}
                             {" / "}
                             {layer.player?.activeSessionToken ?? 0}
                             {layer.player?.pendingSessionToken ? `>${layer.player.pendingSessionToken}` : ""}
                           </strong>
-                        </div>
-                        <div class="monitor-debug-row">
-                          <span>had frame / resume seek</span>
-                          <strong>
-                            {layer.player?.lastHadFrameAtTarget ? "yes" : "no"}
-                            {" / "}
-                            {layer.player?.lastResumeRequiresSeek ? "yes" : "no"}
-                          </strong>
-                        </div>
+                        </InfoRow>
+                        <InfoRow variant="debug" label="had frame / resume seek" value={`${layer.player?.lastHadFrameAtTarget ? "yes" : "no"} / ${layer.player?.lastResumeRequiresSeek ? "yes" : "no"}`} />
                         <Show when={layer.player?.lastError}>
                           <div class="monitor-debug-kv">
                             <span>player error</span>
@@ -2584,10 +2575,9 @@ const MonitorPanel: Component<{ project: Accessor<EditorialProject | null> }> = 
                 <div class="monitor-debug-title">browser</div>
                 <For each={monitorBrowserCapabilities()}>
                   {(entry) => (
-                    <div class="monitor-debug-row">
-                      <span>{entry.label}</span>
+                    <InfoRow variant="debug" label={entry.label}>
                       <span class={`monitor-debug-status monitor-debug-status--${entry.status}`}>{entry.status}</span>
-                    </div>
+                    </InfoRow>
                   )}
                 </For>
               </div>
@@ -3115,11 +3105,18 @@ const TimelinePanel: Component<{
         if (clipRight < visibleStart || clipLeft > visibleEnd) continue;
         const asset = assetById(current, clip.asset_id);
         if (!asset) continue;
-        if (shouldRequestClipPreview(asset, clip, previewKind)) {
-          const key = previewRequestKey(asset, clip, previewKind);
+        if (shouldRequestClipPreview(asset, previewKind)) {
+          const key = previewRequestKey(asset, previewKind);
           if (key) nextRequests.set(key, asset.id);
         }
-        if (hasGeneratingClipPreview(asset, clip, previewKind)) hasGenerating = true;
+        if (hasGeneratingClipPreview(asset, previewKind)) hasGenerating = true;
+        if (track.kind === "video" && clip.mask_enabled) {
+          if (shouldRequestClipPreview(asset, "video", "mask")) {
+            const key = previewRequestKey(asset, "video", "mask");
+            if (key) nextRequests.set(key, asset.id);
+          }
+          if (hasGeneratingClipPreview(asset, "video", "mask")) hasGenerating = true;
+        }
       }
     }
 
@@ -3913,6 +3910,7 @@ const TimelinePanel: Component<{
   const renderTrackRow = (track: TimelineTrack) => {
     const pendingRanges = track.kind === "audio" ? pendingTrackSubtitleRanges(track.id) : [];
     const generatedGroups = track.kind === "audio" ? generatedTrackSubtitleGroups(track.id) : [];
+    const videoMaskGroups = track.kind === "video" ? videoMaskGroupsForLane(project()!, track.id) : [];
     const splitAudioClipIds = new Set<string>();
     if (track.kind === "audio") {
       for (const group of generatedGroups) {
@@ -3931,9 +3929,10 @@ const TimelinePanel: Component<{
       }
     }
     const hasAudioSubtitleBand = pendingRanges.length > 0 || generatedGroups.length > 0;
+    const hasVideoMaskBand = track.kind === "video" && videoMaskGroups.length > 0;
     return (
     <div
-      class={`tl-track tl-track--project tl-track--${track.kind}${track.kind === "subtitle" ? " tl-track--standalone-editorial" : ""}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}`}
+      class={`tl-track tl-track--project tl-track--${track.kind}${track.kind === "subtitle" ? " tl-track--standalone-editorial" : ""}${hasAudioSubtitleBand ? " has-audio-subtitles" : ""}${hasVideoMaskBand ? " has-video-masks" : ""}`}
       style={{ height: `${renderedTrackHeight(track)}px` }}
       onPointerDown={(event) => beginTrackViewportPan(event, track)}
       onDragOver={(e) => {
@@ -4012,6 +4011,27 @@ const TimelinePanel: Component<{
           </For>
         </div>
       </Show>
+      <Show when={track.kind === "video" && hasVideoMaskBand}>
+        <div class="tl-video-mask-band">
+          <For each={videoMaskGroups}>
+            {(group) => {
+              const clip = getClip(project()!, group.sourceClipId);
+              const asset = assetById(project()!, group.assetId);
+              const jobId = selectedJobId();
+              if (!clip || !asset || !jobId) return null;
+              return (
+                <TimelineVideoMaskGroup
+                  jobId={jobId}
+                  group={group}
+                  clip={clip}
+                  asset={asset}
+                  pxPerSecond={pxPerSecond()}
+                />
+              );
+            }}
+          </For>
+        </div>
+      </Show>
       <Show when={dragPreview() && dragPreview()!.trackIds.includes(track.id)}>
         <div class="tl-drop-caret" style={{ left: `${toPx(dragPreview()!.start)}px` }} />
         <div
@@ -4032,7 +4052,7 @@ const TimelinePanel: Component<{
           {(clip) => (
             <button
               type="button"
-              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${track.kind === "audio" && splitAudioClipIds.has(clip.id) ? " tl-seg--audio-split" : ""}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}${clip.enabled ? "" : " is-disabled"}`}
+              class={`tl-seg tl-seg--clip tl-seg--${track.kind}${track.kind === "audio" && splitAudioClipIds.has(clip.id) ? " tl-seg--audio-split" : ""}${track.kind === "video" && hasVideoMaskBand ? " tl-seg--video-split" : ""}${selectedClipId() === clip.id || (selectedLinkedGroupId() && clip.linked_group_id === selectedLinkedGroupId()) ? " is-active" : ""}${clip.enabled ? "" : " is-disabled"}`}
               style={{
                 left: `${toPx(clip.start)}px`,
                 width: `${Math.max(8, (clip.source_out - clip.source_in) * pxPerSecond())}px`,
@@ -4285,16 +4305,16 @@ const TimelinePanel: Component<{
               )}
             </Show>
             <span class="timeline-zoom-label" style={{ "min-width": "60px" }}>{fmtTimePrecise(playheadTime())}</span>
-            <button type="button" class={`btn btn-xs ${autoFollow() ? "btn-primary" : "btn-ghost"}`} onClick={() => setAutoFollow(!autoFollow())}>
+            <Button variant={autoFollow() ? "primary" : "ghost"} size="xs" onClick={() => setAutoFollow(!autoFollow())}>
               Follow
-            </button>
-            <button type="button" class="btn btn-ghost btn-xs" aria-label="Riduci zoom timeline" onClick={() => setZoomIndex(zoomIdx() - 1)}>
+            </Button>
+            <Button variant="ghost" size="xs" aria-label="Riduci zoom timeline" onClick={() => setZoomIndex(zoomIdx() - 1)}>
               <IconMinus size={12} />
-            </button>
+            </Button>
             <span class="timeline-zoom-label">{zoom()}x</span>
-            <button type="button" class="btn btn-ghost btn-xs" aria-label="Aumenta zoom timeline" onClick={() => setZoomIndex(zoomIdx() + 1)}>
+            <Button variant="ghost" size="xs" aria-label="Aumenta zoom timeline" onClick={() => setZoomIndex(zoomIdx() + 1)}>
               <IconPlus size={12} />
-            </button>
+            </Button>
           </div>
         </div>
       </div>

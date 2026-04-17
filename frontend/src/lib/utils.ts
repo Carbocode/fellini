@@ -1,4 +1,9 @@
 import type { ArtifactEntry, JobSnapshot, StepName } from "../types";
+import {
+  CANONICAL_AUDIO_FILENAME,
+  EDITED_MASTER_FILENAME,
+  SOURCE_MEZZANINE_FILENAME,
+} from "./workspaceLayout";
 
 export function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -38,9 +43,9 @@ export function isPreviewableText(path: string): boolean {
 }
 
 export function humanizeMediaName(path: string): string {
-  if (path.endsWith("edited_master.mp4")) return "Render";
-  if (path.endsWith("source_mezzanine.mp4")) return "Source";
-  if (path.endsWith("audio_16k_mono.wav")) return "Audio";
+  if (path.endsWith(EDITED_MASTER_FILENAME)) return "Render";
+  if (path.endsWith(SOURCE_MEZZANINE_FILENAME)) return "Source";
+  if (path.endsWith(CANONICAL_AUDIO_FILENAME)) return "Audio";
   return baseName(path);
 }
 
@@ -65,9 +70,9 @@ export function buildArtifactCatalog(job: JobSnapshot): ArtifactEntry[] {
 }
 
 const MONITOR_ORDER = [
-  "edited_master.mp4",
-  "source_mezzanine.mp4",
-  "audio_16k_mono.wav",
+  EDITED_MASTER_FILENAME,
+  SOURCE_MEZZANINE_FILENAME,
+  CANONICAL_AUDIO_FILENAME,
 ];
 
 export function getMonitorSources(
@@ -86,7 +91,7 @@ export function getMonitorSources(
     .filter(Boolean)
     .map((i) => ({
       path: i!.path,
-      label: i!.path.endsWith("source_mezzanine.mp4")
+      label: i!.path.endsWith(SOURCE_MEZZANINE_FILENAME)
         ? (sourceInputLabel ?? humanizeMediaName(i!.path))
         : humanizeMediaName(i!.path),
     }));

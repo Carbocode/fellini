@@ -18,6 +18,13 @@ from fellini.domain.models import (
 from fellini.log import get_logger
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+from fellini.workspace_layout import (
+    CANONICAL_AUDIO_FILENAME,
+    EDITED_MASTER_FILENAME,
+    PROJECT_SNAPSHOT_FILENAME,
+    SOURCE_MEZZANINE_FILENAME,
+    STEP_ARTIFACT_FILENAMES,
+)
 
 logger = get_logger(__name__)
 
@@ -30,7 +37,7 @@ class JobStore:
 
     def create_job(self, request: JobRequest) -> tuple[JobSnapshot, JobWorkspace]:
         job_id = uuid4().hex[:12]
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         workspace.bootstrap()
         snapshot = JobSnapshot(
             id=job_id,
@@ -52,14 +59,14 @@ class JobStore:
         target = (
             workspace.snapshot_path
             if workspace
-            else JobWorkspace(self.settings.jobs_root, snapshot.id).snapshot_path
+            else JobWorkspace(self.settings.projects_root, snapshot.id).snapshot_path
         )
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(snapshot.model_dump_json(indent=2), encoding="utf-8")
         logger.debug("job_store.save job_id=%s target=%s", snapshot.id, target)
 
     def load(self, job_id: str) -> JobSnapshot:
-        path = JobWorkspace(self.settings.jobs_root, job_id).snapshot_path
+        path = JobWorkspace(self.settings.projects_root, job_id).snapshot_path
         data = json.loads(path.read_text(encoding="utf-8"))
         snapshot = self._normalize_snapshot(JobSnapshot.model_validate(data))
         logger.debug("job_store.load job_id=%s path=%s", job_id, path)
@@ -67,7 +74,7 @@ class JobStore:
 
     def list_jobs(self) -> list[JobSnapshot]:
         jobs: list[JobSnapshot] = []
-        for path in self.settings.jobs_root.glob("*/job.json"):
+        for path in self.settings.projects_root.glob(f"*/{PROJECT_SNAPSHOT_FILENAME}"):
             data = json.loads(path.read_text(encoding="utf-8"))
             jobs.append(self._normalize_snapshot(JobSnapshot.model_validate(data)))
         logger.debug("job_store.list jobs=%s", len(jobs))
@@ -76,7 +83,7 @@ class JobStore:
         ]
 
     def delete(self, job_id: str) -> None:
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         if workspace.job_dir.exists():
             shutil.rmtree(workspace.job_dir)
             logger.info("job_store.delete job_id=%s workspace=%s", job_id, workspace.job_dir)
@@ -164,68 +171,43 @@ class JobStore:
         *,
         preserve_outputs: bool = False,
     ) -> None:
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         logger.info(
             "job_store.invalidate_workspace job_id=%s step=%s preserve_outputs=%s",
             job_id,
             step_name.value,
             preserve_outputs,
         )
-        artifact_map: dict[StepName, tuple[str, ...]] = {
-            StepName.ingest: (
-                "01_media_probe.json",
-                "02_vad_segments.json",
-                "03_transcript_raw.json",
-                "04_transcript_aligned.json",
-                "05_spans_labeled.json",
-                "06_edit_decision_list.json",
-                "07_caption_display.json",
-                "09_render_plan.json",
-            ),
-            StepName.transcription: (
-                "02_vad_segments.json",
-                "03_transcript_raw.json",
-                "04_transcript_aligned.json",
-                "05_spans_labeled.json",
-                "06_edit_decision_list.json",
-                "07_caption_display.json",
-                "09_render_plan.json",
-            ),
-            StepName.alignment: (
-                "04_transcript_aligned.json",
-                "05_spans_labeled.json",
-                "06_edit_decision_list.json",
-                "07_caption_display.json",
-                "09_render_plan.json",
-            ),
-            StepName.editorial: (
-                "05_spans_labeled.json",
-                "06_edit_decision_list.json",
-                "07_caption_display.json",
-                "09_render_plan.json",
-            ),
-            StepName.render: (),
-        }
-
-        for artifact_name in artifact_map.get(step_name, ()):
+        for artifact_name in STEP_ARTIFACT_FILENAMES.get(step_name, ()):
             artifact = workspace.artifact_path(artifact_name)
             if artifact.exists():
                 artifact.unlink()
 
         if step_name == StepName.ingest:
-            for temp_name in ("source_mezzanine.mp4", "audio_16k_mono.wav"):
-                temp_file = workspace.temp_path(temp_name)
-                if temp_file.exists():
-                    temp_file.unlink()
+            for runtime_file in (
+                workspace.runtime_path(SOURCE_MEZZANINE_FILENAME),
+                workspace.runtime_path(CANONICAL_AUDIO_FILENAME),
+            ):
+                if runtime_file.exists():
+                    runtime_file.unlink()
+
+        if step_name in {StepName.ingest, StepName.transcription, StepName.alignment}:
+            for child in list(workspace.transcriptions_dir.iterdir()) if workspace.transcriptions_dir.exists() else []:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
 
         if not preserve_outputs:
-            for output_name in ("edited_master.mp4",):
+            for output_name in (EDITED_MASTER_FILENAME,):
                 output = workspace.output_path(output_name)
                 if output.exists():
                     output.unlink()
 
         if workspace.state_path.exists():
             workspace.state_path.unlink()
+
+        workspace.clear_temp()
 
     def reset_from_step(
         self,

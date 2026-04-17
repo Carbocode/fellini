@@ -6,6 +6,14 @@ from fellini.domain.models import (
 from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+from fellini.workspace_layout import (
+    ARTIFACT_CAPTION_DISPLAY_FILENAME,
+    ARTIFACT_EDIT_DECISION_LIST_FILENAME,
+    ARTIFACT_RENDER_PLAN_FILENAME,
+    ARTIFACT_SPANS_FILENAME,
+    ARTIFACT_STORY_LANE_UNIFIED_TRANSCRIPT_FILENAME,
+    SOURCE_MEZZANINE_FILENAME,
+)
 
 logger = get_logger(__name__)
 
@@ -33,14 +41,14 @@ class EditorialStep(PipelineStep):
             context.request.toggles.use_local_llm,
         )
         unified_transcript_artifact = context.save_json_artifact(
-            "05_story_lane_unified_transcript.json",
+            ARTIFACT_STORY_LANE_UNIFIED_TRANSCRIPT_FILENAME,
             transcript,
         )
         context.report_progress(self.name, 10, "Analisi del transcript")
         bundle = context.decision_engine.build_editorial_bundle(
             transcript,
             context.state.duration_seconds,
-            "source_mezzanine.mp4",
+            SOURCE_MEZZANINE_FILENAME,
             context.request.subtitle,
             context.request.decision,
         )
@@ -59,7 +67,7 @@ class EditorialStep(PipelineStep):
         context.state.edl = context.decision_engine.build_edl(
             spans,
             context.state.duration_seconds,
-            "source_mezzanine.mp4",
+            SOURCE_MEZZANINE_FILENAME,
             context.request.decision,
         )
         context.state.captions = context.decision_engine.build_captions(
@@ -78,14 +86,14 @@ class EditorialStep(PipelineStep):
         if story_lane:
             project = context.editorial_projects.save(context.workspace, project)
         spans_artifact = context.save_json_artifact(
-            "05_spans_labeled.json",
+            ARTIFACT_SPANS_FILENAME,
             {"spans": [span.model_dump(mode="json") for span in spans]},
         )
-        edl_artifact = context.save_json_artifact("06_edit_decision_list.json", context.state.edl)
+        edl_artifact = context.save_json_artifact(ARTIFACT_EDIT_DECISION_LIST_FILENAME, context.state.edl)
         captions_artifact = context.save_json_artifact(
-            "07_caption_display.json", context.state.captions
+            ARTIFACT_CAPTION_DISPLAY_FILENAME, context.state.captions
         )
-        plan_artifact = context.save_json_artifact("09_render_plan.json", context.state.render_plan)
+        plan_artifact = context.save_json_artifact(ARTIFACT_RENDER_PLAN_FILENAME, context.state.render_plan)
         context.report_progress(self.name, 100, "Editorial completato")
         logger.info(
             "step.editorial.done spans=%s keep_ranges=%s captions=%s",

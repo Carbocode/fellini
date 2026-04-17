@@ -357,7 +357,7 @@ def test_transcript_updates_target_correct_artifact_and_downstream_step(tmp_path
             step.artifacts = [f"artifacts/{step.name}.json"]
 
     app.state.store.update(created_job["id"], mark_all_steps_completed)
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
     workspace.artifact_path("04_transcript_aligned.json").write_text(
         json.dumps({"language": "it", "source": "stale", "notes": [], "segments": []}),
         encoding="utf-8",
@@ -453,9 +453,9 @@ def test_existing_workspace_transcript_marks_transcription_as_completed(tmp_path
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -531,7 +531,7 @@ def test_job_file_endpoint_supports_attachment_download(tmp_path):
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
     target = workspace.output_path("edited_master.mp4")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"video-bytes")
@@ -566,9 +566,9 @@ def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatc
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -592,7 +592,7 @@ def test_editorial_project_bootstraps_from_ingest_workspace(tmp_path, monkeypatc
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -643,9 +643,9 @@ def test_asset_preview_request_marks_asset_as_generating(tmp_path, monkeypatch):
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -669,7 +669,7 @@ def test_asset_preview_request_marks_asset_as_generating(tmp_path, monkeypatch):
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -695,6 +695,85 @@ def test_asset_preview_request_marks_asset_as_generating(tmp_path, monkeypatch):
     assert preview["original"]["waveform"]["status"] == "generating"
 
 
+def test_delete_library_asset_removes_it_from_editorial_project(tmp_path, monkeypatch):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    app = create_app(settings)
+    client = TestClient(app)
+
+    created_job = client.post(
+        "/api/jobs",
+        data={
+            "job_payload": json.dumps(
+                {
+                    "title": "Delete asset job",
+                    "profile": "balanced",
+                    "execution_mode": "step_by_step",
+                    "language": "it",
+                }
+            )
+        },
+        files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
+    ).json()
+
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
+    workspace.artifact_path("01_media_probe.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "path": "input.mp4",
+                        "duration_seconds": 6.5,
+                        "width": 1080,
+                        "height": 1920,
+                        "fps": 30.0,
+                        "sample_rate": 48000,
+                        "has_audio": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        app.state.editorial_projects.ffmpeg,
+        "probe_media",
+        lambda path: ProbeInfo(
+            path=str(path),
+            duration_seconds=6.5,
+            width=1080,
+            height=1920,
+            fps=30.0,
+            sample_rate=48000,
+            has_audio=True,
+        ),
+    )
+
+    project = client.get(f"/api/jobs/{created_job['id']}/editorial-project").json()
+    assert len(project["assets"]) == 1
+
+    uploaded = client.post(
+        f"/api/jobs/{created_job['id']}/assets",
+        files={"file": ("broll.mp4", b"library-video", "video/mp4")},
+    )
+    assert uploaded.status_code == 200
+    uploaded_payload = uploaded.json()
+    library_asset = uploaded_payload["asset"]
+    assert library_asset["origin"] == "library"
+    library_file = workspace.resolve_relative(library_asset["path"])
+    assert library_file.exists() is True
+
+    deleted = client.delete(
+        f"/api/jobs/{created_job['id']}/assets/{library_asset['id']}"
+    )
+    assert deleted.status_code == 200
+    deleted_project = deleted.json()
+    assert [asset["id"] for asset in deleted_project["assets"]] == [project["assets"][0]["id"]]
+    assert library_file.exists() is False
+
+
 def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monkeypatch):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     app = create_app(settings)
@@ -715,9 +794,9 @@ def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monk
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -741,7 +820,7 @@ def test_editorial_project_rejects_overlapping_clips_on_same_lane(tmp_path, monk
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -836,9 +915,9 @@ def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch)
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -862,7 +941,7 @@ def test_audio_lane_transcription_updates_project_and_job(tmp_path, monkeypatch)
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -933,9 +1012,9 @@ def test_audio_clip_transcription_updates_project_and_job(tmp_path, monkeypatch)
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -959,7 +1038,7 @@ def test_audio_clip_transcription_updates_project_and_job(tmp_path, monkeypatch)
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -1048,7 +1127,10 @@ def test_audio_clip_transcription_updates_project_and_job(tmp_path, monkeypatch)
         "vad_filter": False,
         "use_whisperx": False,
     }
-    assert clip_payload["transcription_source_audio_path"] == "temp/clip_clip_audio_1_bounce.wav"
+    assert (
+        clip_payload["transcription_source_audio_path"]
+        == "jobs/transcriptions/asset_audio_1/clip_clip_audio_1_bounce.wav"
+    )
     assert [caption["text"] for caption in payload["project"]["captions"]] == ["hello", "clip"]
     assert all(caption["source_clip_id"] == clip["id"] for caption in payload["project"]["captions"])
 
@@ -1073,9 +1155,9 @@ def test_interrupted_lane_transcription_is_recovered_after_restart(tmp_path, mon
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -1099,7 +1181,7 @@ def test_interrupted_lane_transcription_is_recovered_after_restart(tmp_path, mon
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,
@@ -1192,9 +1274,9 @@ def test_interrupted_clip_transcription_is_recovered_after_restart(tmp_path, mon
         files={"files": ("clip.mp4", b"fake-video", "video/mp4")},
     ).json()
 
-    workspace = JobWorkspace(settings.jobs_root, created_job["id"])
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace = JobWorkspace(settings.projects_root, created_job["id"])
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {
@@ -1218,7 +1300,7 @@ def test_interrupted_clip_transcription_is_recovered_after_restart(tmp_path, mon
         app.state.editorial_projects.ffmpeg,
         "probe_media",
         lambda _path: ProbeInfo(
-            path="temp/source_mezzanine.mp4",
+            path="jobs/runtime/source_mezzanine.mp4",
             duration_seconds=6.5,
             width=1080,
             height=1920,

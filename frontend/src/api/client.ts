@@ -108,16 +108,13 @@ export async function startAssetBackgroundRemoval(
   );
 }
 
-export async function setAssetBackgroundRemovalVariant(
+export async function deleteEditorialAsset(
   jobId: string,
   assetId: string,
-  activeVariant: "original" | "cutout",
 ): Promise<EditorialProject> {
   return json(
-    await fetch(`/api/jobs/${jobId}/assets/${assetId}/background-removal`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ active_variant: activeVariant }),
+    await fetch(`/api/jobs/${jobId}/assets/${assetId}`, {
+      method: "DELETE",
     }),
   );
 }

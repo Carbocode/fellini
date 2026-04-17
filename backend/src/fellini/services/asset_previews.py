@@ -11,7 +11,7 @@ from fellini.domain.models import (
     AssetPreviewEntry,
     AssetPreviewStatus,
     AssetPreviewVariants,
-    AssetVariantKind,
+    AssetPreviewVariantKind,
     EditorialProject,
     JobSnapshot,
     JobStatus,
@@ -67,7 +67,7 @@ class AssetPreviewService:
         project: EditorialProject,
         asset_ids: list[str],
     ) -> EditorialProject:
-        workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
+        workspace = JobWorkspace(self.settings.projects_root, snapshot.id)
         workspace.bootstrap()
         if snapshot.status == JobStatus.running:
             return self.enrich_project(workspace, project)
@@ -126,7 +126,7 @@ class AssetPreviewService:
         self,
         workspace: JobWorkspace,
         asset: ProjectAsset,
-        variants: list[AssetVariantKind],
+        variants: list[AssetPreviewVariantKind],
     ) -> None:
         if not variants:
             return
@@ -139,11 +139,24 @@ class AssetPreviewService:
             if bundle is None:
                 continue
             self._delete_preview_files(workspace, bundle)
-            setattr(updated, variant.value, self._normalized_bundle(workspace, asset, None))
+            setattr(updated, variant.value, self._normalized_bundle(workspace, asset, None, variant=variant))
             changed = True
         if changed:
             state[asset.id] = updated
             self.save_state(workspace, state)
+
+    def _persist_generated_previews(
+        self,
+        workspace: JobWorkspace,
+        asset_id: str,
+        previews: AssetPreviewVariants,
+    ) -> None:
+        state = self.load_state(workspace)
+        if asset_id not in state:
+            self._delete_preview_files(workspace, previews)
+            return
+        state[asset_id] = previews
+        self.save_state(workspace, state)
 
     def load_state(self, workspace: JobWorkspace) -> dict[str, object]:
         path = workspace.asset_preview_state_path
@@ -179,7 +192,7 @@ class AssetPreviewService:
         thread.start()
 
     def _generate_asset_previews(self, job_id: str, asset: ProjectAsset) -> None:
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         workspace.bootstrap()
         active_key = (job_id, asset.id)
         try:
@@ -190,7 +203,12 @@ class AssetPreviewService:
                 if not source_path:
                     continue
                 source = workspace.resolve_relative(source_path)
-                bundle = getattr(previews, variant.value) or self._normalized_bundle(workspace, asset, None)
+                bundle = getattr(previews, variant.value) or self._normalized_bundle(
+                    workspace,
+                    asset,
+                    None,
+                    variant=variant,
+                )
                 if asset.kind == "video" and self._entry_needs_generation(bundle.filmstrip):
                     try:
                         bundle.filmstrip = self._generate_filmstrip_preview(workspace, source, asset, variant)
@@ -203,7 +221,11 @@ class AssetPreviewService:
                             exc,
                         )
                         bundle.filmstrip = self._failed_entry(FILMSTRIP_VERSION, exc)
-                if (asset.kind == "audio" or asset.has_audio) and self._entry_needs_generation(bundle.waveform):
+                if (
+                    variant == AssetPreviewVariantKind.original
+                    and (asset.kind == "audio" or asset.has_audio)
+                    and self._entry_needs_generation(bundle.waveform)
+                ):
                     try:
                         bundle.waveform = self._generate_waveform_preview(workspace, source, asset, variant)
                     except Exception as exc:
@@ -216,8 +238,7 @@ class AssetPreviewService:
                         )
                         bundle.waveform = self._failed_entry(WAVEFORM_VERSION, exc)
                 setattr(previews, variant.value, bundle)
-            state[asset.id] = previews
-            self.save_state(workspace, state)
+            self._persist_generated_previews(workspace, asset.id, previews)
         except Exception as exc:
             logger.exception(
                 "asset_preview.generate.failed job_id=%s asset_id=%s error=%s",
@@ -228,14 +249,22 @@ class AssetPreviewService:
             state = self.load_state(workspace)
             previews = self._normalized_previews(workspace, asset, state.get(asset.id))
             for variant in self._available_variants(asset):
-                bundle = getattr(previews, variant.value) or self._normalized_bundle(workspace, asset, None)
+                bundle = getattr(previews, variant.value) or self._normalized_bundle(
+                    workspace,
+                    asset,
+                    None,
+                    variant=variant,
+                )
                 if asset.kind == "video" and self._entry_needs_generation(bundle.filmstrip):
                     bundle.filmstrip = self._failed_entry(FILMSTRIP_VERSION, exc)
-                if (asset.kind == "audio" or asset.has_audio) and self._entry_needs_generation(bundle.waveform):
+                if (
+                    variant == AssetPreviewVariantKind.original
+                    and (asset.kind == "audio" or asset.has_audio)
+                    and self._entry_needs_generation(bundle.waveform)
+                ):
                     bundle.waveform = self._failed_entry(WAVEFORM_VERSION, exc)
                 setattr(previews, variant.value, bundle)
-            state[asset.id] = previews
-            self.save_state(workspace, state)
+            self._persist_generated_previews(workspace, asset.id, previews)
         finally:
             with self._lock:
                 self._active_assets.discard(active_key)
@@ -245,10 +274,11 @@ class AssetPreviewService:
         workspace: JobWorkspace,
         source: Path,
         asset: ProjectAsset,
-        variant: AssetVariantKind,
+        variant: AssetPreviewVariantKind,
     ) -> AssetPreviewEntry:
         cell_width = self._filmstrip_cell_width(asset)
-        target = workspace.preview_artifact_path(f"{asset.id}.{variant.value}.filmstrip.png")
+        target = workspace.preview_artifact_path(asset.id, variant.value, "filmstrip.png")
+        target.parent.mkdir(parents=True, exist_ok=True)
         meta = self.ffmpeg.generate_filmstrip(
             source,
             target,
@@ -271,7 +301,7 @@ class AssetPreviewService:
         workspace: JobWorkspace,
         source: Path,
         asset: ProjectAsset,
-        variant: AssetVariantKind,
+        variant: AssetPreviewVariantKind,
     ) -> AssetPreviewEntry:
         bucket_count = max(
             WAVEFORM_MIN_BUCKETS,
@@ -286,7 +316,8 @@ class AssetPreviewService:
             bucket_count=bucket_count,
             sample_rate=WAVEFORM_SAMPLE_RATE,
         )
-        target = workspace.preview_artifact_path(f"{asset.id}.{variant.value}.waveform.json")
+        target = workspace.preview_artifact_path(asset.id, variant.value, "waveform.json")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
             json.dumps(
                 {
@@ -334,7 +365,7 @@ class AssetPreviewService:
     ) -> bool:
         for variant in self._available_variants(asset):
             bundle = getattr(previews, variant.value, None)
-            if bundle and self._bundle_needs_generation(asset, bundle):
+            if bundle and self._bundle_needs_generation(asset, bundle, variant):
                 return True
         return False
 
@@ -342,20 +373,35 @@ class AssetPreviewService:
         self,
         asset: ProjectAsset,
         bundle: AssetPreviewBundle,
+        variant: AssetPreviewVariantKind,
     ) -> bool:
         if asset.kind == "video" and bundle.filmstrip and bundle.filmstrip.status != AssetPreviewStatus.ready:
             return True
-        if (asset.kind == "audio" or asset.has_audio) and bundle.waveform and bundle.waveform.status != AssetPreviewStatus.ready:
+        if (
+            variant == AssetPreviewVariantKind.original
+            and (asset.kind == "audio" or asset.has_audio)
+            and bundle.waveform
+            and bundle.waveform.status != AssetPreviewStatus.ready
+        ):
             return True
         return False
 
     def _mark_generating(self, asset: ProjectAsset, previews: AssetPreviewVariants) -> AssetPreviewVariants:
         updated = previews.model_copy(deep=True)
         for variant in self._available_variants(asset):
-            bundle = getattr(updated, variant.value) or self._normalized_bundle(None, asset, None)
+            bundle = getattr(updated, variant.value) or self._normalized_bundle(
+                None,
+                asset,
+                None,
+                variant=variant,
+            )
             if asset.kind == "video" and self._entry_needs_generation(bundle.filmstrip):
                 bundle.filmstrip = self._generating_entry(FILMSTRIP_VERSION)
-            if (asset.kind == "audio" or asset.has_audio) and self._entry_needs_generation(bundle.waveform):
+            if (
+                variant == AssetPreviewVariantKind.original
+                and (asset.kind == "audio" or asset.has_audio)
+                and self._entry_needs_generation(bundle.waveform)
+            ):
                 bundle.waveform = self._generating_entry(WAVEFORM_VERSION)
             setattr(updated, variant.value, bundle)
         return updated
@@ -368,10 +414,20 @@ class AssetPreviewService:
     ) -> AssetPreviewVariants:
         current = self._coerce_previews(asset, stored)
         normalized = AssetPreviewVariants()
-        normalized.original = self._normalized_bundle(workspace, asset, current.original)
-        normalized.cutout = (
-            self._normalized_bundle(workspace, asset, current.cutout)
-            if AssetVariantKind.cutout in self._available_variants(asset)
+        normalized.original = self._normalized_bundle(
+            workspace,
+            asset,
+            current.original,
+            variant=AssetPreviewVariantKind.original,
+        )
+        normalized.mask = (
+            self._normalized_bundle(
+                workspace,
+                asset,
+                current.mask,
+                variant=AssetPreviewVariantKind.mask,
+            )
+            if AssetPreviewVariantKind.mask in self._available_variants(asset)
             else None
         )
         return normalized
@@ -381,6 +437,8 @@ class AssetPreviewService:
         workspace: JobWorkspace | None,
         asset: ProjectAsset,
         bundle: AssetPreviewBundle | None,
+        *,
+        variant: AssetPreviewVariantKind,
     ) -> AssetPreviewBundle:
         current = bundle.model_copy(deep=True) if bundle else AssetPreviewBundle()
         if asset.kind == "video":
@@ -391,7 +449,9 @@ class AssetPreviewService:
             )
         else:
             current.filmstrip = None
-        if asset.kind == "audio" or asset.has_audio:
+        if variant != AssetPreviewVariantKind.original:
+            current.waveform = None
+        elif asset.kind == "audio" or asset.has_audio:
             current.waveform = self._normalized_entry(
                 workspace,
                 current.waveform,
@@ -408,9 +468,12 @@ class AssetPreviewService:
         if isinstance(stored, AssetPreviewBundle):
             return AssetPreviewVariants(**{legacy_variant.value: stored.model_copy(deep=True)})
         if isinstance(stored, dict):
-            if "original" in stored or "cutout" in stored:
+            if "original" in stored or "mask" in stored or "cutout" in stored:
                 try:
-                    return AssetPreviewVariants.model_validate(stored)
+                    normalized = dict(stored)
+                    if "cutout" in normalized and "mask" not in normalized:
+                        normalized["mask"] = normalized.pop("cutout")
+                    return AssetPreviewVariants.model_validate(normalized)
                 except Exception:
                     return AssetPreviewVariants()
             try:
@@ -467,22 +530,33 @@ class AssetPreviewService:
             meta={},
         )
 
-    def _available_variants(self, asset: ProjectAsset) -> list[AssetVariantKind]:
-        variants = [AssetVariantKind.original]
-        if asset.kind == "video" and asset.background_removal and asset.background_removal.cutout_path:
-            variants.append(AssetVariantKind.cutout)
+    def _available_variants(self, asset: ProjectAsset) -> list[AssetPreviewVariantKind]:
+        variants = [AssetPreviewVariantKind.original]
+        if asset.kind == "video" and asset.background_removal and asset.background_removal.mask_video_path:
+            variants.append(AssetPreviewVariantKind.mask)
         return variants
 
-    def _legacy_preview_variant(self, asset: ProjectAsset) -> AssetVariantKind:
+    def _legacy_preview_variant(self, asset: ProjectAsset) -> AssetPreviewVariantKind:
         background = asset.background_removal
-        if background and background.cutout_path and background.active_variant == AssetVariantKind.cutout:
-            return AssetVariantKind.cutout
-        return AssetVariantKind.original
+        legacy_cutout_path = None
+        legacy_active_variant = None
+        if background:
+            legacy_cutout_path = getattr(background, "cutout_path", None)
+            legacy_active_variant = getattr(background, "active_variant", None)
+        if background and background.mask_video_path:
+            return AssetPreviewVariantKind.mask
+        if legacy_cutout_path and legacy_active_variant == "cutout":
+            return AssetPreviewVariantKind.mask
+        return AssetPreviewVariantKind.original
 
-    def _variant_source_path(self, asset: ProjectAsset, variant: AssetVariantKind) -> str | None:
+    def _variant_source_path(self, asset: ProjectAsset, variant: AssetPreviewVariantKind) -> str | None:
         background = asset.background_removal
-        if variant == AssetVariantKind.cutout:
-            return background.cutout_path if background else None
+        if variant == AssetPreviewVariantKind.mask:
+            if background and background.mask_video_path:
+                return background.mask_video_path
+            if background:
+                return getattr(background, "cutout_path", None)
+            return None
         if background and background.original_path:
             return background.original_path
         return asset.path
@@ -497,18 +571,32 @@ class AssetPreviewService:
                 continue
             if target.exists():
                 target.unlink()
+                self._prune_empty_preview_directories(workspace, target.parent)
+
+    def _prune_empty_preview_directories(self, workspace: JobWorkspace, directory: Path) -> None:
+        preview_root = workspace.preview_dir.resolve()
+        current = directory.resolve()
+        while current != preview_root and current.is_relative_to(preview_root):
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
 
     def _iter_preview_entries(self, stored: object) -> list[AssetPreviewEntry]:
         if isinstance(stored, AssetPreviewVariants):
-            bundles = [stored.original, stored.cutout]
+            bundles = [stored.original, stored.mask]
         elif isinstance(stored, AssetPreviewBundle):
             bundles = [stored]
-        elif isinstance(stored, dict) and ("original" in stored or "cutout" in stored):
+        elif isinstance(stored, dict) and ("original" in stored or "mask" in stored or "cutout" in stored):
+            normalized = dict(stored)
+            if "cutout" in normalized and "mask" not in normalized:
+                normalized["mask"] = normalized.pop("cutout")
             try:
-                previews = AssetPreviewVariants.model_validate(stored)
+                previews = AssetPreviewVariants.model_validate(normalized)
             except Exception:
                 return []
-            bundles = [previews.original, previews.cutout]
+            bundles = [previews.original, previews.mask]
         elif isinstance(stored, dict):
             try:
                 bundles = [AssetPreviewBundle.model_validate(stored)]

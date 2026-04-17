@@ -181,16 +181,20 @@ Sul lato video, se la build locale di `ffmpeg` non include `libx264`, Fellini pr
 
 ## Workspace su disco
 
-Ogni progetto/job viene salvato in `workspace/jobs/<job_id>/`:
+Ogni progetto viene salvato in `workspace/projects/<project_id>/`:
 
 - `uploads/`: file originali caricati nel progetto
 - `project/editorial_project.json`: stato persistito dell'editor
 - `project/asset_previews.json`: stato preview per asset
-- `artifacts/`: artefatti intermedi e preview generate
-- `artifacts/previews/`: filmstrip e waveform
+- `jobs/`: risultati persistenti delle elaborazioni backend per il progetto
+- `jobs/previews/<asset_id>/<variant>/`: filmstrip e waveform per asset/variante
+- `jobs/background-removal/<asset_id>/<run_id>/`: output e log delle esecuzioni mask
+- `jobs/runtime/`: file persistenti di pipeline riutilizzati tra i tool
+- `jobs/transcriptions/<asset_id>/`: bounce audio persistiti per clip e per trascrizioni che ricadono su un singolo asset
+- `jobs/transcriptions/lane_<lane_id>/`: bounce lane-scoped quando una lane trascritta copre piu asset
 - `output/`: export del progetto
-- `temp/`: file di lavoro e stato runtime
-- `job.json`: stato del wrapper backend per esecuzioni asincrone
+- `temp/`: scratch directory effimera, svuotata a fine lavorazione
+- `project.json`: stato del wrapper backend per esecuzioni asincrone
 
 Questa cartella e' runtime-only: non viene usata per il packaging Python o per il lock delle dipendenze.
 

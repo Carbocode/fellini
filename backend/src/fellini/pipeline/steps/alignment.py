@@ -5,6 +5,7 @@ from pathlib import Path
 from fellini.domain.models import StepName
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+from fellini.workspace_layout import ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME
 
 
 class AlignmentStep(PipelineStep):
@@ -22,5 +23,5 @@ class AlignmentStep(PipelineStep):
             context.request.toggles.use_whisperx,
         )
         context.state.aligned_transcript = aligned
-        artifact = context.save_json_artifact("04_transcript_aligned.json", aligned)
+        artifact = context.save_json_artifact(ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME, aligned)
         return [artifact]

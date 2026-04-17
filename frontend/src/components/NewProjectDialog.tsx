@@ -2,6 +2,7 @@ import { createSignal, Show, type Component } from "solid-js";
 import { IconX } from "@tabler/icons-solidjs";
 import { useCreateJobMutation } from "../api/queries";
 import { dialogOpen, selectProjectInTab, setDialogOpen } from "../store";
+import { Button, IconButton, FormField, Input, Select, Textarea } from "./ui";
 
 const CANVAS_PRESETS = [
   { id: "vertical", label: "Vertical", width: 1080, height: 1920 },
@@ -77,26 +78,23 @@ const NewProjectDialog: Component = () => {
         <div class="dialog">
           <div class="dialog-header">
             <h2>Nuovo progetto</h2>
-            <button type="button" class="btn-icon" onClick={close}>
+            <IconButton onClick={close}>
               <IconX size={16} />
-            </button>
+            </IconButton>
           </div>
           <form ref={formRef} onSubmit={onSubmit}>
             <div class="dialog-body">
               <div class="form-row">
-                <label class="form-field">
-                  <span>Titolo</span>
-                  <input type="text" name="title" value="Nuovo progetto" required />
-                </label>
-                <label class="form-field">
-                  <span>Lingua</span>
-                  <input type="text" name="language" value="it" />
-                </label>
+                <FormField label="Titolo">
+                  <Input name="title" value="Nuovo progetto" required />
+                </FormField>
+                <FormField label="Lingua">
+                  <Input name="language" value="it" />
+                </FormField>
               </div>
               <div class="form-row">
-                <label class="form-field">
-                  <span>Canvas</span>
-                  <select
+                <FormField label="Canvas">
+                  <Select
                     value={presetId()}
                     onInput={(e) =>
                       applyPreset(e.currentTarget.value as (typeof CANVAS_PRESETS)[number]["id"])
@@ -107,54 +105,50 @@ const NewProjectDialog: Component = () => {
                         {preset.label} {preset.width}×{preset.height}
                       </option>
                     ))}
-                  </select>
-                </label>
+                  </Select>
+                </FormField>
                 <div class="form-row" style={{ "grid-template-columns": "1fr 1fr" }}>
-                  <label class="form-field">
-                    <span>Width</span>
-                    <input
+                  <FormField label="Width">
+                    <Input
                       type="number"
                       min="256"
                       step="2"
                       value={canvasWidth()}
                       onInput={(e) => setCanvasWidth(e.currentTarget.value)}
                     />
-                  </label>
-                  <label class="form-field">
-                    <span>Height</span>
-                    <input
+                  </FormField>
+                  <FormField label="Height">
+                    <Input
                       type="number"
                       min="256"
                       step="2"
                       value={canvasHeight()}
                       onInput={(e) => setCanvasHeight(e.currentTarget.value)}
                     />
-                  </label>
+                  </FormField>
                 </div>
               </div>
-              <label class="form-field">
-                <span>Note editoriali</span>
-                <textarea
+              <FormField label="Note editoriali">
+                <Textarea
                   name="editorial_notes"
                   rows="2"
                   placeholder="Tone, hook, istruzioni di taglio..."
                 />
-              </label>
+              </FormField>
             </div>
             <div class="dialog-footer">
               <span class={`dialog-status${error() ? " error" : ""}`}>
                 {error() || (createJob.isPending ? "Creazione in corso..." : "")}
               </span>
-              <button type="button" class="btn btn-ghost" onClick={close}>
+              <Button variant="ghost" onClick={close}>
                 Annulla
-              </button>
-              <button
+              </Button>
+              <Button
                 type="submit"
-                class="btn btn-primary"
                 disabled={createJob.isPending}
               >
                 Crea progetto
-              </button>
+              </Button>
             </div>
           </form>
         </div>

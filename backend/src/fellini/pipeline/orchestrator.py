@@ -59,7 +59,7 @@ class PipelineOrchestrator:
             stop_after.value if stop_after else None,
             prepared,
         )
-        workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
+        workspace = JobWorkspace(self.settings.projects_root, snapshot.id)
         context = PipelineContext(
             settings=self.settings,
             request=snapshot.request,
@@ -126,6 +126,8 @@ class PipelineOrchestrator:
             self.store.fail_step(snapshot.id, failed_step, str(exc))
             self.store.append_log(snapshot.id, f"failed: {exc}")
             return self.store.mark_failed(snapshot.id, str(exc))
+        finally:
+            workspace.clear_temp()
 
     def _prepare(
         self,
@@ -140,7 +142,7 @@ class PipelineOrchestrator:
             start_at.value,
             stop_after.value if stop_after else None,
         )
-        workspace = JobWorkspace(self.settings.jobs_root, snapshot.id)
+        workspace = JobWorkspace(self.settings.projects_root, snapshot.id)
         context = PipelineContext(
             settings=self.settings,
             request=snapshot.request,

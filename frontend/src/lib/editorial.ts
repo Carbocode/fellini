@@ -1,7 +1,6 @@
 import type {
   AssetTranscription,
   AssetTranscriptionWord,
-  AssetVariantKind,
   AudioTrackRole,
   EditorialProject,
   ProjectAsset,
@@ -21,20 +20,7 @@ function clipDuration(clip: Pick<TimelineClip, "source_in" | "source_out">): num
   return Math.max(0, clip.source_out - clip.source_in);
 }
 
-function defaultClipVariant(
-  project: EditorialProject,
-  clip: TimelineClip,
-): AssetVariantKind {
-  const track = getTrack(project, clip.track_id);
-  if (track?.kind !== "video") return "original";
-  const asset = assetById(project, clip.asset_id);
-  if (asset?.background_removal?.cutout_path && asset.background_removal.active_variant === "cutout") {
-    return "cutout";
-  }
-  return "original";
-}
-
-function normalizeClipAssetVariants(project: EditorialProject): EditorialProject {
+function normalizeClipMasks(project: EditorialProject): EditorialProject {
   let assetsChanged = false;
   const assets = project.assets.map((asset) => {
     const originalPath = asset.background_removal?.original_path;
@@ -47,7 +33,7 @@ function normalizeClipAssetVariants(project: EditorialProject): EditorialProject
     ...nextProject,
     clips: nextProject.clips.map((clip) => ({
       ...clip,
-      asset_variant: clip.asset_variant ?? defaultClipVariant(nextProject, clip),
+      mask_enabled: clip.mask_enabled ?? false,
     })),
   };
 }
@@ -387,6 +373,17 @@ export interface SubtitleVisualGroup {
   isFallback: boolean;
 }
 
+export interface VideoMaskVisualGroup {
+  id: string;
+  sourceLaneId: string;
+  sourceClipId: string;
+  assetId: string;
+  linkedGroupId: string | null;
+  start: number;
+  end: number;
+  status: "ready" | "pending" | "missing" | "failed";
+}
+
 export function visibleTimelineCaptions(project: EditorialProject): SubtitleBlock[] {
   return project.captions.filter((caption) => (
     caption.origin !== "generated"
@@ -471,23 +468,18 @@ export function assetById(project: EditorialProject, assetId: string): ProjectAs
   return project.assets.find((asset) => asset.id === assetId);
 }
 
-export function assetPathForVariant(
-  asset: ProjectAsset,
-  variant: AssetVariantKind,
-): string | null {
-  if (variant === "cutout") {
-    return asset.background_removal?.cutout_path ?? null;
-  }
+export function assetOriginalPath(asset: ProjectAsset): string | null {
   return asset.background_removal?.original_path ?? asset.path ?? null;
 }
 
-export function clipAssetVariant(
+export function maskPathForClip(
   project: EditorialProject,
   clip: TimelineClip,
-): AssetVariantKind {
+): string | null {
   const track = getTrack(project, clip.track_id);
-  if (track?.kind !== "video") return "original";
-  return clip.asset_variant ?? defaultClipVariant(project, clip);
+  if (track?.kind !== "video" || !clip.mask_enabled) return null;
+  const asset = assetById(project, clip.asset_id);
+  return asset?.background_removal?.mask_video_path ?? null;
 }
 
 export function mediaPathForClip(
@@ -496,8 +488,40 @@ export function mediaPathForClip(
 ): string | null {
   const asset = assetById(project, clip.asset_id);
   if (!asset) return null;
-  const variant = clipAssetVariant(project, clip);
-  return assetPathForVariant(asset, variant) ?? assetPathForVariant(asset, "original");
+  return assetOriginalPath(asset);
+}
+
+export function videoMaskGroupsForLane(
+  project: EditorialProject,
+  laneId: string,
+): VideoMaskVisualGroup[] {
+  return trackClips(project, laneId)
+    .filter((clip) => {
+      const track = getTrack(project, clip.track_id);
+      return track?.kind === "video" && clip.mask_enabled;
+    })
+    .map((clip) => {
+      const asset = assetById(project, clip.asset_id);
+      const background = asset?.background_removal;
+      const status = background?.status === "running"
+        ? "pending"
+        : background?.status === "failed"
+          ? "failed"
+          : background?.mask_video_path
+            ? "ready"
+            : "missing";
+      return {
+        id: `mask_group_${laneId}_${clip.id}`,
+        sourceLaneId: laneId,
+        sourceClipId: clip.id,
+        assetId: clip.asset_id,
+        linkedGroupId: clip.linked_group_id,
+        start: clip.start,
+        end: clip.start + clipDuration(clip),
+        status,
+      } satisfies VideoMaskVisualGroup;
+    })
+    .sort((a, b) => (a.start - b.start) || a.sourceClipId.localeCompare(b.sourceClipId));
 }
 
 function firstTrackOfKind(project: EditorialProject, kind: TimelineTrackKind): TimelineTrack | undefined {
@@ -714,7 +738,7 @@ export function normalizeTrackLayout(project: EditorialProject): EditorialProjec
 }
 
 export function normalizeEditorialProject(project: EditorialProject): EditorialProject {
-  return normalizeGeneratedSubtitles(normalizeTrackLayout(normalizeClipAssetVariants(project)));
+  return normalizeGeneratedSubtitles(normalizeTrackLayout(normalizeClipMasks(project)));
 }
 
 type PlacementInterval = { min: number; max: number };
@@ -893,7 +917,7 @@ export function createClip(
     z_index: 0,
     enabled: true,
     origin: "manual",
-    asset_variant: "original",
+    mask_enabled: false,
     transform: {
       x: 0,
       y: 0,

@@ -27,6 +27,15 @@ from fellini.services.editorial_project import EditorialProjectStore
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+from fellini.workspace_layout import (
+    ARTIFACT_CAPTION_DISPLAY_FILENAME,
+    ARTIFACT_EDIT_DECISION_LIST_FILENAME,
+    ARTIFACT_MEDIA_PROBE_FILENAME,
+    ARTIFACT_RENDER_PLAN_FILENAME,
+    ARTIFACT_SPANS_FILENAME,
+    ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME,
+    ARTIFACT_TRANSCRIPT_RAW_FILENAME,
+)
 
 logger = get_logger(__name__)
 
@@ -70,7 +79,7 @@ class PipelineContext:
             snapshot_state is not None,
         )
         state = snapshot_state.model_copy(deep=True) if snapshot_state else PipelineState()
-        probe_artifact = self.workspace.artifact_path("01_media_probe.json")
+        probe_artifact = self.workspace.artifact_path(ARTIFACT_MEDIA_PROBE_FILENAME)
         if probe_artifact.exists():
             payload = json.loads(probe_artifact.read_text(encoding="utf-8"))
             state.probe_info = [
@@ -78,20 +87,18 @@ class PipelineContext:
             ]
             state.duration_seconds = sum(item.duration_seconds for item in state.probe_info)
 
-        mezzanine_path = self.workspace.temp_path("source_mezzanine.mp4")
-        if mezzanine_path.exists():
-            state.mezzanine_path = str(mezzanine_path)
+        if self.workspace.mezzanine_path.exists():
+            state.mezzanine_path = str(self.workspace.mezzanine_path)
 
-        audio_path = self.workspace.temp_path("audio_16k_mono.wav")
-        if audio_path.exists():
-            state.audio_path = str(audio_path)
+        if self.workspace.audio_path.exists():
+            state.audio_path = str(self.workspace.audio_path)
 
         artifact_map: list[tuple[str, str, type[BaseModel] | None]] = [
-            ("03_transcript_raw.json", "raw_transcript", TranscriptArtifact),
-            ("04_transcript_aligned.json", "aligned_transcript", TranscriptArtifact),
-            ("06_edit_decision_list.json", "edl", EditDecisionList),
-            ("07_caption_display.json", "captions", CaptionArtifact),
-            ("09_render_plan.json", "render_plan", RenderPlan),
+            (ARTIFACT_TRANSCRIPT_RAW_FILENAME, "raw_transcript", TranscriptArtifact),
+            (ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME, "aligned_transcript", TranscriptArtifact),
+            (ARTIFACT_EDIT_DECISION_LIST_FILENAME, "edl", EditDecisionList),
+            (ARTIFACT_CAPTION_DISPLAY_FILENAME, "captions", CaptionArtifact),
+            (ARTIFACT_RENDER_PLAN_FILENAME, "render_plan", RenderPlan),
         ]
         for filename, field_name, model_type in artifact_map:
             artifact = self.workspace.artifact_path(filename)
@@ -101,7 +108,7 @@ class PipelineContext:
             value = model_type.model_validate(payload) if model_type else payload
             setattr(state, field_name, value)
 
-        spans_artifact = self.workspace.artifact_path("05_spans_labeled.json")
+        spans_artifact = self.workspace.artifact_path(ARTIFACT_SPANS_FILENAME)
         if spans_artifact.exists():
             payload = json.loads(spans_artifact.read_text(encoding="utf-8"))
             state.labeled_spans = [

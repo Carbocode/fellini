@@ -11,8 +11,8 @@ from pathlib import Path
 
 from fellini.domain.models import (
     AssetBackgroundRemoval,
+    AssetPreviewVariantKind,
     AssetProcessingStatus,
-    AssetVariantKind,
     EditorialProject,
     JobStatus,
     ProjectAsset,
@@ -59,26 +59,25 @@ class BackgroundRemovalService:
     def start(self, job_id: str, asset_id: str) -> EditorialProject:
         snapshot = self.store.load(job_id)
         if snapshot.status == JobStatus.running:
-            msg = "Attendi la fine del job corrente prima di avviare lo scontorno."
+            msg = "Attendi la fine del job corrente prima di avviare la generazione mask."
             raise BackgroundRemovalError(msg)
 
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         workspace.bootstrap()
         project = self._load_project(workspace)
         asset = self._require_video_asset(project, asset_id)
         if self._is_active(job_id, asset_id):
-            msg = "Lo scontorno di questo asset è già in esecuzione."
+            msg = "La generazione mask di questo asset è già in esecuzione."
             raise BackgroundRemovalError(msg)
 
         background = self._background_removal_for(asset)
         if background.status == AssetProcessingStatus.running:
-            msg = "Lo scontorno di questo asset è già in esecuzione."
+            msg = "La generazione mask di questo asset è già in esecuzione."
             raise BackgroundRemovalError(msg)
 
         source_path = background.original_path or asset.path
         run_dir = (
-            workspace.artifacts_dir
-            / "background-removal"
+            workspace.background_removal_dir
             / asset.id
             / datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         )
@@ -89,9 +88,10 @@ class BackgroundRemovalService:
                 "status": AssetProcessingStatus.running,
                 "phase": "queued",
                 "progress": 0.0,
-                "message": "Preparazione scontorno video",
+                "message": "Preparazione mask video",
                 "error": None,
                 "original_path": source_path,
+                "mask_video_path": background.mask_video_path,
                 "progress_path": workspace.relative(progress_path),
                 "updated_at": utcnow(),
             },
@@ -105,7 +105,7 @@ class BackgroundRemovalService:
         )
         saved = self.editorial_projects.save(workspace, updated_project)
         self._mark_active(job_id, asset_id)
-        self.store.append_log(job_id, f"Background removal queued for asset {asset.label}.")
+        self.store.append_log(job_id, f"Mask generation queued for asset {asset.label}.")
 
         thread = threading.Thread(
             target=self._run_background_removal,
@@ -116,61 +116,6 @@ class BackgroundRemovalService:
         thread.start()
         return self.asset_previews.enrich_project(workspace, saved)
 
-    def set_active_variant(
-        self,
-        job_id: str,
-        asset_id: str,
-        variant: AssetVariantKind,
-    ) -> EditorialProject:
-        snapshot = self.store.load(job_id)
-        if snapshot.status == JobStatus.running:
-            msg = "Attendi la fine del job corrente prima di cambiare variante."
-            raise BackgroundRemovalError(msg)
-
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
-        workspace.bootstrap()
-        project = self._load_project(workspace)
-        asset = self._require_video_asset(project, asset_id)
-        background = self._background_removal_for(asset)
-
-        if variant == AssetVariantKind.cutout and not background.cutout_path:
-            msg = "Non esiste ancora una variante scontornata disponibile."
-            raise BackgroundRemovalError(msg)
-        if variant == AssetVariantKind.original and not background.original_path:
-            msg = "L'asset non ha un percorso originale registrato."
-            raise BackgroundRemovalError(msg)
-
-        target_path = (
-            background.cutout_path
-            if variant == AssetVariantKind.cutout
-            else background.original_path
-        )
-        if not target_path:
-            msg = "Variante non disponibile."
-            raise BackgroundRemovalError(msg)
-
-        updated_background = background.model_copy(
-            update={
-                "active_variant": variant,
-                "message": (
-                    "Variante scontornata attiva"
-                    if variant == AssetVariantKind.cutout
-                    else "Variante originale attiva"
-                ),
-                "updated_at": utcnow(),
-            },
-            deep=True,
-        )
-        updated_project = self._patch_asset(
-            project,
-            asset_id,
-            background_removal=updated_background,
-        )
-        self.editorial_projects.save(workspace, updated_project)
-        enriched = self.asset_previews.enrich_project(workspace, self.editorial_projects.load(workspace))
-        self.store.append_log(job_id, f"Background removal variant set to {variant.value} for asset {asset.label}.")
-        return enriched
-
     def _run_background_removal(
         self,
         job_id: str,
@@ -178,7 +123,7 @@ class BackgroundRemovalService:
         source_path: str,
         run_dir: Path,
     ) -> None:
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         workspace.bootstrap()
         run_dir.mkdir(parents=True, exist_ok=True)
         progress_path = run_dir / "progress.json"
@@ -221,12 +166,12 @@ class BackgroundRemovalService:
                 raise BackgroundRemovalError(msg)
 
             benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
-            cutout_path = benchmark.get("foreground_with_audio_path") or benchmark.get("foreground_path")
-            if not isinstance(cutout_path, str) or not cutout_path:
-                msg = "MatAnyone completed without producing a foreground output."
+            mask_video_path = benchmark.get("alpha_path")
+            if not isinstance(mask_video_path, str) or not mask_video_path:
+                msg = "MatAnyone completed without producing an alpha mask output."
                 raise BackgroundRemovalError(msg)
 
-            relative_cutout_path = workspace.relative(Path(cutout_path))
+            relative_mask_video_path = workspace.relative(Path(mask_video_path))
             relative_benchmark_path = workspace.relative(benchmark_path)
             relative_progress_path = workspace.relative(progress_path)
 
@@ -236,13 +181,12 @@ class BackgroundRemovalService:
             updated_background = background.model_copy(
                 update={
                     "status": AssetProcessingStatus.completed,
-                    "active_variant": AssetVariantKind.cutout,
                     "phase": "completed",
                     "progress": 1.0,
-                    "message": "Scontorno completato",
+                    "message": "Mask completata",
                     "error": None,
                     "original_path": background.original_path or source_path,
-                    "cutout_path": relative_cutout_path,
+                    "mask_video_path": relative_mask_video_path,
                     "benchmark_path": relative_benchmark_path,
                     "progress_path": relative_progress_path,
                     "updated_at": utcnow(),
@@ -258,12 +202,12 @@ class BackgroundRemovalService:
             self.asset_previews.invalidate_asset_variants(
                 workspace,
                 asset,
-                [AssetVariantKind.cutout],
+                [AssetPreviewVariantKind.mask],
             )
             self.asset_previews.enrich_project(workspace, saved)
             self.store.append_log(
                 job_id,
-                f"Background removal completed for asset {asset.label}.",
+                f"Mask generation completed for asset {asset.label}.",
             )
         except Exception as exc:
             logger.exception(
@@ -273,7 +217,7 @@ class BackgroundRemovalService:
                 exc,
             )
             self._mark_failed(job_id, asset_id, str(exc))
-            self.store.append_log(job_id, f"Background removal failed for asset {asset_id}: {exc}")
+            self.store.append_log(job_id, f"Mask generation failed for asset {asset_id}: {exc}")
         finally:
             self._clear_active(job_id, asset_id)
 
@@ -296,10 +240,10 @@ class BackgroundRemovalService:
         ratio = payload.get("ratio")
         explicit_progress = float(ratio) if isinstance(ratio, (float, int)) else None
         progress_value = explicit_progress if explicit_progress is not None else self._phase_progress(phase)
-        message = str(payload.get("message") or "Scontorno video in corso")
+        message = str(payload.get("message") or "Generazione mask video in corso")
         status = str(payload.get("status") or "running")
 
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         project = self._load_project(workspace)
         asset = self.editorial_projects.asset_by_id(project, asset_id)
         if asset is None:
@@ -326,6 +270,7 @@ class BackgroundRemovalService:
                 "phase": phase,
                 "progress": progress_value,
                 "message": message,
+                "mask_video_path": background.mask_video_path,
                 "updated_at": utcnow(),
             },
             deep=True,
@@ -334,7 +279,7 @@ class BackgroundRemovalService:
         self.editorial_projects.save(workspace, updated_project)
 
     def _mark_failed(self, job_id: str, asset_id: str, error: str) -> None:
-        workspace = JobWorkspace(self.settings.jobs_root, job_id)
+        workspace = JobWorkspace(self.settings.projects_root, job_id)
         project = self._load_project(workspace)
         asset = self.editorial_projects.asset_by_id(project, asset_id)
         if asset is None:
@@ -344,8 +289,9 @@ class BackgroundRemovalService:
             update={
                 "status": AssetProcessingStatus.failed,
                 "phase": "failed",
-                "message": "Scontorno fallito",
+                "message": "Mask fallita",
                 "error": error,
+                "mask_video_path": background.mask_video_path,
                 "updated_at": utcnow(),
             },
             deep=True,
@@ -359,7 +305,6 @@ class BackgroundRemovalService:
             return current.model_copy(deep=True)
         return AssetBackgroundRemoval(
             original_path=asset.path,
-            active_variant=AssetVariantKind.original,
         )
 
     def _patch_asset(
@@ -420,7 +365,6 @@ class BackgroundRemovalService:
             "preprocessing_frames": 0.58,
             "preparing_mask": 0.64,
             "encoding_outputs": 0.94,
-            "muxing_audio": 0.97,
             "completed": 1.0,
             "failed": 1.0,
         }
@@ -458,5 +402,4 @@ class BackgroundRemovalService:
             "--warmup",
             str(self.DEFAULT_WARMUP),
             "--enable-mps-fallback",
-            "--preserve-audio",
         ]

@@ -6,6 +6,11 @@ from fellini.domain.models import StepName
 from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+from fellini.workspace_layout import (
+    ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME,
+    ARTIFACT_TRANSCRIPT_RAW_FILENAME,
+    ARTIFACT_VAD_SEGMENTS_FILENAME,
+)
 
 logger = get_logger(__name__)
 
@@ -42,11 +47,11 @@ class TranscriptionStep(PipelineStep):
 
         context.report_progress(self.name, 85, "Salvataggio transcript e alignment")
         vad_artifact = context.save_json_artifact(
-            "02_vad_segments.json",
+            ARTIFACT_VAD_SEGMENTS_FILENAME,
             {"segments": [segment.model_dump(mode="json") for segment in speech_segments]},
         )
-        transcript_artifact = context.save_json_artifact("03_transcript_raw.json", transcript)
-        aligned_artifact = context.save_json_artifact("04_transcript_aligned.json", aligned)
+        transcript_artifact = context.save_json_artifact(ARTIFACT_TRANSCRIPT_RAW_FILENAME, transcript)
+        aligned_artifact = context.save_json_artifact(ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME, aligned)
         context.report_progress(self.name, 100, "Transcription completata")
         logger.info(
             "step.transcription.done speech_segments=%s transcript_segments=%s aligned_segments=%s source=%s",

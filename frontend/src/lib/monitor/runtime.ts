@@ -114,8 +114,12 @@ function cloneFrameForRender(frame: VideoFrame): VideoFrame | null {
   }
 }
 
+function playerKeyForMedia(clipId: string, mediaPath: string): string {
+  return `${clipId}:${mediaPath}`;
+}
+
 function playerKeyForLayer(layer: MonitorVideoLayer): string {
-  return `${layer.clipId}:${layer.mediaPath}`;
+  return playerKeyForMedia(layer.clipId, layer.mediaPath);
 }
 
 export class CanvasMonitorRuntime {
@@ -335,13 +339,13 @@ export class CanvasMonitorRuntime {
     return pending;
   }
 
-  private getVideoPlayer(layer: MonitorVideoLayer): Promise<VideoClipPlayer | null> {
-    const key = playerKeyForLayer(layer);
+  private getVideoPlayerForMedia(clipId: string, mediaPath: string): Promise<VideoClipPlayer | null> {
+    const key = playerKeyForMedia(clipId, mediaPath);
     const cached = this.videoPlayers.get(key);
     if (cached !== undefined) {
       return isPromiseLike(cached) ? cached : Promise.resolve(cached);
     }
-    const pending = this.ensureDemuxed(layer.mediaPath)
+    const pending = this.ensureDemuxed(mediaPath)
       .then((asset) => {
         if (!asset.video) return null;
         const player = new VideoClipPlayer(
@@ -363,9 +367,17 @@ export class CanvasMonitorRuntime {
     return pending;
   }
 
+  private getVideoPlayer(layer: MonitorVideoLayer): Promise<VideoClipPlayer | null> {
+    return this.getVideoPlayerForMedia(layer.clipId, layer.mediaPath);
+  }
+
   private async reconcileVideoPlayers(): Promise<void> {
     if (!this.composition) return;
-    const wantedKeys = new Set(this.composition.videoLayers.map(playerKeyForLayer));
+    const wantedKeys = new Set<string>();
+    for (const layer of this.composition.videoLayers) {
+      wantedKeys.add(playerKeyForLayer(layer));
+      if (layer.maskMediaPath) wantedKeys.add(playerKeyForMedia(layer.clipId, layer.maskMediaPath));
+    }
     let removed = 0;
     for (const [key, value] of this.videoPlayers.entries()) {
       if (wantedKeys.has(key)) continue;
@@ -382,6 +394,7 @@ export class CanvasMonitorRuntime {
     if (!this.composition) return;
     const uniqueMediaPaths = new Set([
       ...this.composition.videoLayers.map((layer) => layer.mediaPath),
+      ...this.composition.videoLayers.map((layer) => layer.maskMediaPath).filter((path): path is string => !!path),
       ...this.composition.audioClips.map((clip) => clip.mediaPath),
     ]);
     for (const mediaPath of uniqueMediaPaths) {
@@ -484,6 +497,26 @@ export class CanvasMonitorRuntime {
       const playerState = player.getDebugState();
       const frame = player.getFrameAtTime(localTimeUs);
       const renderFrame = frame ? cloneFrameForRender(frame) : null;
+      let renderMaskFrame: VideoFrame | null = null;
+      if (layer.maskMediaPath) {
+        const maskPlayer = await this.getVideoPlayerForMedia(layer.clipId, layer.maskMediaPath);
+        if (maskPlayer) {
+          if (blocking) {
+            await maskPlayer.requestFrame(localTimeUs, { playing, intent, blocking: true }).catch((error) => {
+              this.reportError(error instanceof Error ? error : new Error("Decode mask video fallita"));
+            });
+          } else {
+            void maskPlayer.requestFrame(localTimeUs, { playing, intent, blocking: false }).catch((error) => {
+              this.reportError(error instanceof Error ? error : new Error("Decode mask video fallita"));
+            });
+          }
+          const maskStats = maskPlayer.getStats();
+          decodedFrameCount += maskStats.decodedFrames;
+          bufferedFrameCount += maskStats.bufferedFrames;
+          const maskFrame = maskPlayer.getFrameAtTime(localTimeUs);
+          renderMaskFrame = maskFrame ? cloneFrameForRender(maskFrame) : null;
+        }
+      }
       const includedInRender = !!renderFrame;
       layerDiagnostics.push({
         key: layerKey,
@@ -497,7 +530,7 @@ export class CanvasMonitorRuntime {
         player: playerState,
       });
       if (!renderFrame) continue;
-      renderLayers.push({ spec: layer, frame: renderFrame });
+      renderLayers.push({ spec: layer, frame: renderFrame, maskFrame: renderMaskFrame });
     }
     return {
       activeLayerCount: activeLayers.length,

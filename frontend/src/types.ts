@@ -114,7 +114,7 @@ export type AudioTrackRole = "story" | "support";
 export type ClipOrigin = "generated" | "manual";
 export type LaneTranscriptionStatus = "idle" | "running" | "completed" | "failed";
 export type AssetPreviewStatus = "missing" | "generating" | "ready" | "failed";
-export type AssetVariantKind = "original" | "cutout";
+export type AssetPreviewVariantKind = "original" | "mask";
 export type AssetProcessingStatus = "idle" | "running" | "completed" | "failed";
 
 export interface ClipCrop {
@@ -163,18 +163,17 @@ export interface AssetPreviewBundle {
 
 export interface AssetPreviewVariants {
   original: AssetPreviewBundle | null;
-  cutout: AssetPreviewBundle | null;
+  mask: AssetPreviewBundle | null;
 }
 
 export interface AssetBackgroundRemoval {
   status: AssetProcessingStatus;
-  active_variant: AssetVariantKind;
   phase: string | null;
   progress: number;
   message: string;
   error: string | null;
   original_path: string | null;
-  cutout_path: string | null;
+  mask_video_path: string | null;
   benchmark_path: string | null;
   progress_path: string | null;
   updated_at: string;
@@ -220,7 +219,7 @@ export interface TimelineClip {
   z_index: number;
   enabled: boolean;
   origin: ClipOrigin;
-  asset_variant: AssetVariantKind;
+  mask_enabled: boolean;
   transform: ClipTransform;
   audio: ClipAudio;
   captions_enabled: boolean;

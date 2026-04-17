@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
@@ -10,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from fellini.domain.models import (
-    AssetVariantKind,
+    AssetProcessingStatus,
     ClipTranscriptionOptions,
     EditorialProject,
     InputAsset,
@@ -31,9 +33,26 @@ from fellini.services.job_manager import JobManager
 from fellini.services.job_store import JobStore
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings, load_settings, project_root
+from fellini.workspace_layout import (
+    ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME,
+    ARTIFACT_TRANSCRIPT_RAW_FILENAME,
+    ARTIFACT_VAD_SEGMENTS_FILENAME,
+    CANONICAL_AUDIO_FILENAME,
+    RECOVERABLE_STEP_ARTIFACT_FILENAMES,
+)
 
 logger = get_logger(__name__)
 INTERRUPTED_RUN_MESSAGE = "Run interrupted while the backend was offline. Retry the step."
+
+
+def _hardlink_or_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        target.unlink()
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copyfile(source, target)
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -150,9 +169,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         asset_previews=asset_previews,
     )
     logger.info(
-        "app.create settings workspace_root=%s jobs_root=%s host=%s port=%s log_level=%s",
+        "app.create settings workspace_root=%s projects_root=%s host=%s port=%s log_level=%s",
         app_settings.workspace_root,
-        app_settings.jobs_root,
+        app_settings.projects_root,
         app_settings.host,
         app_settings.port,
         app_settings.log_level,
@@ -176,7 +195,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         )
         store.recover_interrupted_run(snapshot.id, INTERRUPTED_RUN_MESSAGE)
         store.append_log(snapshot.id, INTERRUPTED_RUN_MESSAGE)
-        workspace = JobWorkspace(app_settings.jobs_root, snapshot.id)
+        workspace = JobWorkspace(app_settings.projects_root, snapshot.id)
         editorial_projects.recover_interrupted_runtime_state(workspace, INTERRUPTED_RUN_MESSAGE)
 
     @app.middleware("http")
@@ -214,7 +233,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
 
     def build_context(snapshot: JobSnapshot) -> PipelineContext:
         logger.debug("context.build job_id=%s", snapshot.id)
-        workspace = JobWorkspace(app_settings.jobs_root, snapshot.id)
+        workspace = JobWorkspace(app_settings.projects_root, snapshot.id)
         context = PipelineContext(
             settings=app_settings,
             request=snapshot.request,
@@ -303,26 +322,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         snapshot: JobSnapshot,
         context: PipelineContext,
     ) -> None:
-        artifact_map: dict[StepName, tuple[str, ...]] = {
-            StepName.ingest: ("01_media_probe.json",),
-            StepName.transcription: (
-                "02_vad_segments.json",
-                "03_transcript_raw.json",
-                "04_transcript_aligned.json",
-            ),
-            StepName.editorial: (
-                "05_story_lane_unified_transcript.json",
-                "05_spans_labeled.json",
-                "06_edit_decision_list.json",
-                "09_render_plan.json",
-            ),
-            StepName.render: (
-                "09_render_plan.json",
-            ),
-        }
-
         for step in snapshot.steps:
-            recovered = existing_artifacts(context, artifact_map.get(step.name, ()))
+            recovered = existing_artifacts(
+                context,
+                RECOVERABLE_STEP_ARTIFACT_FILENAMES.get(step.name, ()),
+            )
             if recovered:
                 logger.debug(
                     "job.artifacts.recovered job_id=%s step=%s artifacts=%s",
@@ -397,10 +401,10 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         artifacts: list[str] = []
         if speech_segments is not None:
             artifacts.append(
-                context.save_json_artifact("02_vad_segments.json", {"segments": speech_segments})
+                context.save_json_artifact(ARTIFACT_VAD_SEGMENTS_FILENAME, {"segments": speech_segments})
             )
-        artifacts.append(context.save_json_artifact("03_transcript_raw.json", transcript))
-        artifacts.append(context.save_json_artifact("04_transcript_aligned.json", transcript))
+        artifacts.append(context.save_json_artifact(ARTIFACT_TRANSCRIPT_RAW_FILENAME, transcript))
+        artifacts.append(context.save_json_artifact(ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME, transcript))
         context.state.raw_transcript = transcript
         context.state.aligned_transcript = transcript
         context.save_state()
@@ -422,37 +426,55 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         store.mark_running(job_id)
         store.begin_step(job_id, StepName.transcription, f"Transcribing audio lane {lane.name}")
 
-        bounce_path = context.workspace.temp_path(f"lane_{lane_id}_bounce.wav")
+        temp_bounce_path = context.workspace.temp_path(f"lane_{lane_id}_bounce.wav")
+        stored_bounce_path = context.workspace.transcription_path(
+            editorial_projects.transcription_scope_for_lane(project, lane_id),
+            f"lane_{lane_id}_bounce.wav",
+        )
         try:
             store.update_step_progress(job_id, StepName.transcription, 15, "Bounce della audio lane")
             context.ffmpeg.mix_audio_lane(
                 workspace_root=context.workspace.job_dir,
                 project=project,
                 track_id=lane_id,
-                target=bounce_path,
+                target=temp_bounce_path,
             )
 
             store.update_step_progress(job_id, StepName.transcription, 45, "Trascrizione della lane")
             speech_segments, transcript = context.transcriber.transcribe(
-                bounce_path,
+                temp_bounce_path,
                 context.request.transcription,
                 context.request.language,
             )
 
             store.update_step_progress(job_id, StepName.transcription, 70, "Allineamento della lane")
             aligned = context.aligner.align(
-                bounce_path,
+                temp_bounce_path,
                 transcript,
                 context.request.transcription,
                 context.request.language,
                 context.request.toggles.use_whisperx,
             )
+            stored_bounce_path.parent.mkdir(parents=True, exist_ok=True)
+            if stored_bounce_path.exists():
+                stored_bounce_path.unlink()
+            shutil.move(str(temp_bounce_path), str(stored_bounce_path))
+            asset_source_audio_paths: dict[str, str] = {}
+            for asset_id in editorial_projects.transcription_asset_ids_for_lane(project, lane_id):
+                asset_bounce_path = context.workspace.transcription_path(
+                    asset_id,
+                    f"lane_{lane_id}_bounce.wav",
+                )
+                if asset_bounce_path != stored_bounce_path:
+                    _hardlink_or_copy_file(stored_bounce_path, asset_bounce_path)
+                asset_source_audio_paths[asset_id] = context.workspace.relative(asset_bounce_path)
             saved_project = editorial_projects.set_lane_transcription(
                 context.workspace,
                 project=project,
                 lane_id=lane_id,
                 transcript=aligned,
-                source_audio_path=context.workspace.relative(bounce_path),
+                source_audio_path=context.workspace.relative(stored_bounce_path),
+                asset_source_audio_paths=asset_source_audio_paths,
             )
 
             artifacts = [context.workspace.relative(context.workspace.editorial_project_path)]
@@ -490,6 +512,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             store.fail_step(job_id, StepName.transcription, str(exc))
             store.mark_failed(job_id, str(exc))
             raise
+        finally:
+            context.workspace.clear_temp()
 
     def run_clip_transcription(
         job_id: str,
@@ -525,26 +549,30 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         store.mark_running(job_id)
         store.begin_step(job_id, StepName.transcription, f"Transcribing audio clip {clip_id}")
 
-        bounce_path = context.workspace.temp_path(f"clip_{clip_id}_bounce.wav")
+        temp_bounce_path = context.workspace.temp_path(f"clip_{clip_id}_bounce.wav")
+        stored_bounce_path = context.workspace.transcription_path(
+            clip.asset_id,
+            f"clip_{clip_id}_bounce.wav",
+        )
         try:
             store.update_step_progress(job_id, StepName.transcription, 15, "Bounce della clip audio")
             context.ffmpeg.mix_audio_clip(
                 workspace_root=context.workspace.job_dir,
                 project=editorial_projects.load(context.workspace),
                 clip_id=clip_id,
-                target=bounce_path,
+                target=temp_bounce_path,
             )
 
             store.update_step_progress(job_id, StepName.transcription, 45, "Trascrizione della clip")
             _speech_segments, transcript = context.transcriber.transcribe(
-                bounce_path,
+                temp_bounce_path,
                 clip_config,
                 clip_language,
             )
 
             store.update_step_progress(job_id, StepName.transcription, 70, "Allineamento della clip")
             aligned = context.aligner.align(
-                bounce_path,
+                temp_bounce_path,
                 transcript,
                 clip_config,
                 clip_language,
@@ -556,12 +584,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     "Nessuna voce rilevata nella clip"
                     + (" (VAD ha filtrato tutto l'audio)" if clip_config.vad_filter else "")
                 )
+            stored_bounce_path.parent.mkdir(parents=True, exist_ok=True)
+            if stored_bounce_path.exists():
+                stored_bounce_path.unlink()
+            shutil.move(str(temp_bounce_path), str(stored_bounce_path))
             saved_project = editorial_projects.set_clip_transcription(
                 context.workspace,
                 project=editorial_projects.load(context.workspace),
                 clip_id=clip_id,
                 transcript=aligned,
-                source_audio_path=context.workspace.relative(bounce_path),
+                source_audio_path=context.workspace.relative(stored_bounce_path),
                 message=completion_message,
             )
 
@@ -599,6 +631,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             store.fail_step(job_id, StepName.transcription, str(exc))
             store.mark_failed(job_id, str(exc))
             raise
+        finally:
+            context.workspace.clear_temp()
 
     frontend_dist = _resolve_frontend_dist()
 
@@ -703,7 +737,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             )
             raise HTTPException(status_code=400, detail=f"Invalid transcript: {exc}") from exc
 
-        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        workspace = JobWorkspace(app_settings.projects_root, job_id)
         logger.info(
             "api.jobs.transcript.update job_id=%s target=%s segments=%s source=%s",
             job_id,
@@ -713,14 +747,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         )
         if target == "transcription":
             payload_json = transcript.model_dump_json(indent=2)
-            workspace.artifact_path("03_transcript_raw.json").write_text(
+            workspace.artifact_path(ARTIFACT_TRANSCRIPT_RAW_FILENAME).write_text(
                 payload_json, encoding="utf-8"
             )
-            workspace.artifact_path("04_transcript_aligned.json").write_text(
+            workspace.artifact_path(ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME).write_text(
                 payload_json, encoding="utf-8"
             )
         else:
-            workspace.artifact_path("04_transcript_aligned.json").write_text(
+            workspace.artifact_path(ARTIFACT_TRANSCRIPT_ALIGNED_FILENAME).write_text(
                 transcript.model_dump_json(indent=2), encoding="utf-8"
             )
         context = build_context(snapshot)
@@ -732,7 +766,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 project=project,
                 lane_id=story_lane.id,
                 transcript=transcript,
-                source_audio_path=context.workspace.relative(context.workspace.temp_path("audio_16k_mono.wav")),
+                source_audio_path=context.workspace.relative(
+                    context.workspace.runtime_path(CANONICAL_AUDIO_FILENAME)
+                ),
             )
         return enrich_snapshot(store.load(job_id))
 
@@ -778,7 +814,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     raise HTTPException(status_code=400, detail=detail)
                 previous_end = max(previous_end, clip.end)
                 previous_clip_id = clip.id
-        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        workspace = JobWorkspace(app_settings.projects_root, job_id)
         try:
             saved = editorial_projects.save_with_revision_check(workspace, project)
         except ValueError as exc:
@@ -797,7 +833,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         snapshot = _require_job(store, job_id)
         if snapshot.status == JobStatus.running:
             raise HTTPException(status_code=409, detail="Cannot upload assets while a run is in progress.")
-        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        workspace = JobWorkspace(app_settings.projects_root, job_id)
         payload = await file.read()
         original_name = file.filename or "asset.bin"
 
@@ -841,30 +877,34 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         enriched_asset = next((item for item in enriched_project.assets if item.id == asset.id), asset)
         return {"asset": enriched_asset, "project": enriched_project}
 
+    @app.delete("/api/jobs/{job_id}/assets/{asset_id}")
+    async def delete_editorial_asset(job_id: str, asset_id: str):
+        snapshot = _require_job(store, job_id)
+        if snapshot.status == JobStatus.running:
+            raise HTTPException(status_code=409, detail="Cannot delete assets while a run is in progress.")
+        workspace = JobWorkspace(app_settings.projects_root, job_id)
+        workspace.bootstrap()
+        project = ensure_editorial_project(snapshot)
+        asset = editorial_projects.asset_by_id(project, asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Asset not found.")
+        if asset.origin != "library":
+            raise HTTPException(status_code=409, detail="Only library assets can be deleted.")
+        if asset.background_removal and asset.background_removal.status == AssetProcessingStatus.running:
+            raise HTTPException(status_code=409, detail="Cannot delete an asset while mask generation is running.")
+        asset_previews.invalidate_assets(workspace, [asset_id])
+        try:
+            saved = editorial_projects.remove_asset(workspace, asset_id=asset_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        store.append_log(job_id, f"Asset deleted from library: {asset.label}.")
+        return asset_previews.enrich_project(workspace, saved)
+
     @app.post("/api/jobs/{job_id}/assets/{asset_id}/background-removal")
     async def start_background_removal(job_id: str, asset_id: str):
         _require_job(store, job_id)
         try:
             return background_removal.start(job_id, asset_id)
-        except BackgroundRemovalError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    @app.put("/api/jobs/{job_id}/assets/{asset_id}/background-removal")
-    async def set_background_removal_variant(
-        job_id: str,
-        asset_id: str,
-        payload: dict[str, str] = Body(...),
-    ):
-        _require_job(store, job_id)
-        variant = payload.get("active_variant")
-        if variant not in {"original", "cutout"}:
-            raise HTTPException(status_code=400, detail="active_variant must be 'original' or 'cutout'.")
-        try:
-            return background_removal.set_active_variant(
-                job_id,
-                asset_id,
-                AssetVariantKind(variant),
-            )
         except BackgroundRemovalError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -922,7 +962,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         relative_path: str,
         download: bool = Query(False),
     ):
-        workspace = JobWorkspace(app_settings.jobs_root, job_id)
+        workspace = JobWorkspace(app_settings.projects_root, job_id)
         try:
             target = workspace.resolve_relative(relative_path)
         except ValueError as exc:

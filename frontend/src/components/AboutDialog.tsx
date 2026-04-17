@@ -8,6 +8,7 @@ import {
   ABOUT_METRICS,
   ABOUT_SOFTWARE_SECTIONS,
 } from "../lib/about";
+import { Button, IconButton } from "./ui";
 
 const AboutDialog: Component = () => {
   const close = () => setAboutDialogOpen(false);
@@ -38,9 +39,9 @@ const AboutDialog: Component = () => {
         <div class="dialog about-dialog" role="dialog" aria-modal="true" aria-labelledby="about-title">
           <div class="dialog-header">
             <h2 id="about-title">About Fellini</h2>
-            <button type="button" class="btn-icon" onClick={close} aria-label="Chiudi finestra About">
+            <IconButton onClick={close} aria-label="Chiudi finestra About">
               <IconX size={16} />
-            </button>
+            </IconButton>
           </div>
           <div class="dialog-body about-dialog-body">
             <div class="about-layout">
@@ -146,9 +147,9 @@ const AboutDialog: Component = () => {
           </div>
           <div class="dialog-footer">
             <span class="dialog-status">{ABOUT_FOOTNOTE}</span>
-            <button type="button" class="btn btn-primary" onClick={close}>
+            <Button onClick={close}>
               Chiudi
-            </button>
+            </Button>
           </div>
         </div>
       </div>

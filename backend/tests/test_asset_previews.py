@@ -1,9 +1,10 @@
 from fellini.domain.models import (
+    AssetBackgroundRemoval,
     AssetPreviewBundle,
     AssetPreviewEntry,
     AssetPreviewStatus,
     AssetPreviewVariants,
-    AssetVariantKind,
+    AssetPreviewVariantKind,
     ProjectAsset,
     ProjectAssetKind,
 )
@@ -15,9 +16,9 @@ from fellini.settings import AppSettings
 def test_normalized_previews_invalidate_old_waveform_versions(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     service = AssetPreviewService(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_waveform_preview_version")
+    workspace = JobWorkspace(settings.projects_root, "job_waveform_preview_version")
     workspace.bootstrap()
-    preview_path = workspace.preview_artifact_path("asset_audio.original.waveform.json")
+    preview_path = workspace.preview_artifact_path("asset_audio", "original", "waveform.json")
     preview_path.write_text("{}", encoding="utf-8")
     asset = ProjectAsset(
         id="asset_audio",
@@ -50,7 +51,7 @@ def test_normalized_previews_invalidate_old_waveform_versions(tmp_path):
 def test_generate_waveform_preview_uses_higher_bucket_density(tmp_path, monkeypatch):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     service = AssetPreviewService(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_waveform_density")
+    workspace = JobWorkspace(settings.projects_root, "job_waveform_density")
     workspace.bootstrap()
     source = workspace.temp_path("voice.wav")
     source.write_bytes(b"audio")
@@ -76,7 +77,7 @@ def test_generate_waveform_preview_uses_higher_bucket_density(tmp_path, monkeypa
         workspace,
         source,
         asset,
-        AssetVariantKind.original,
+        AssetPreviewVariantKind.original,
     )
 
     assert entry.status == AssetPreviewStatus.ready
@@ -86,3 +87,51 @@ def test_generate_waveform_preview_uses_higher_bucket_density(tmp_path, monkeypa
         "bucket_count": 23040,
         "sample_rate": 8000,
     }
+
+
+def test_normalized_previews_maps_legacy_cutout_to_mask_without_waveform(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    service = AssetPreviewService(settings)
+    workspace = JobWorkspace(settings.projects_root, "job_mask_preview")
+    workspace.bootstrap()
+    filmstrip_path = workspace.preview_artifact_path("asset_video", "mask", "filmstrip.png")
+    waveform_path = workspace.preview_artifact_path("asset_video", "mask", "waveform.json")
+    filmstrip_path.write_bytes(b"filmstrip")
+    waveform_path.write_text("{}", encoding="utf-8")
+    asset = ProjectAsset(
+        id="asset_video",
+        kind=ProjectAssetKind.video,
+        label="clip.mp4",
+        path="uploads/clip.mp4",
+        duration=12.0,
+        width=1920,
+        height=1080,
+        background_removal=AssetBackgroundRemoval(
+            original_path="uploads/clip.mp4",
+            mask_video_path="jobs/background-removal/asset_video/mask.mp4",
+        ),
+    )
+
+    previews = service._normalized_previews(
+        workspace,
+        asset,
+        {
+            "cutout": {
+                "filmstrip": {
+                    "status": "ready",
+                    "resource_path": workspace.relative(filmstrip_path),
+                    "version": 3,
+                },
+                "waveform": {
+                    "status": "ready",
+                    "resource_path": workspace.relative(waveform_path),
+                    "version": WAVEFORM_VERSION,
+                },
+            }
+        },
+    )
+
+    assert previews.mask is not None
+    assert previews.mask.filmstrip is not None
+    assert previews.mask.filmstrip.status == AssetPreviewStatus.ready
+    assert previews.mask.waveform is None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -10,8 +11,8 @@ from fellini.domain.models import (
     AssetTranscription,
     AssetTranscriptionWord,
     AudioTrackRole,
-    ClipTranscriptionOptions,
     ClipOrigin,
+    ClipTranscriptionOptions,
     EditorialProject,
     InputAsset,
     LabeledSpan,
@@ -34,6 +35,11 @@ from fellini.domain.models import (
 from fellini.log import get_logger
 from fellini.services.workspace import JobWorkspace
 from fellini.settings import AppSettings
+from fellini.workspace_layout import (
+    ARTIFACT_CAPTION_DISPLAY_FILENAME,
+    SOURCE_MEZZANINE_FILENAME,
+    TRANSCRIPTION_LANE_SCOPE_PREFIX,
+)
 
 logger = get_logger(__name__)
 DEFAULT_TRACK_PAIR_COUNT = 2
@@ -57,7 +63,7 @@ class EditorialProjectStore:
 
     def load(self, workspace: JobWorkspace) -> EditorialProject:
         payload = json.loads(workspace.editorial_project_path.read_text(encoding="utf-8"))
-        payload = self._migrate_legacy_clip_asset_variants(payload)
+        payload = self._migrate_legacy_clip_masks(payload)
         return EditorialProject.model_validate(payload)
 
     def normalize_project(self, project: EditorialProject) -> EditorialProject:
@@ -101,7 +107,7 @@ class EditorialProjectStore:
             asset.preview = None
         return stripped
 
-    def _migrate_legacy_clip_asset_variants(self, payload: dict) -> dict:
+    def _migrate_legacy_clip_masks(self, payload: dict) -> dict:
         assets = payload.get("assets")
         clips = payload.get("clips")
         tracks = payload.get("tracks")
@@ -119,31 +125,36 @@ class EditorialProjectStore:
             if isinstance(asset, dict) and isinstance(asset.get("id"), str)
         }
 
-        for asset in assets_by_id.values():
+        legacy_cutout_assets: set[str] = set()
+        for asset_id, asset in assets_by_id.items():
             background = asset.get("background_removal")
             if not isinstance(background, dict):
                 continue
             original_path = background.get("original_path")
             if isinstance(original_path, str) and original_path:
                 asset["path"] = original_path
+            legacy_active_variant = background.get("active_variant")
+            if "mask_video_path" not in background:
+                legacy_cutout_path = background.get("cutout_path")
+                background["mask_video_path"] = legacy_cutout_path if isinstance(legacy_cutout_path, str) else None
+            if background.get("mask_video_path") and legacy_active_variant == "cutout":
+                legacy_cutout_assets.add(asset_id)
+            background.pop("active_variant", None)
+            background.pop("cutout_path", None)
 
         for clip in clips:
-            if not isinstance(clip, dict) or "asset_variant" in clip:
+            if not isinstance(clip, dict) or "mask_enabled" in clip:
                 continue
             track = tracks_by_id.get(clip.get("track_id"))
             if not isinstance(track, dict) or track.get("kind") != "video":
-                clip["asset_variant"] = "original"
+                clip["mask_enabled"] = False
                 continue
             asset = assets_by_id.get(clip.get("asset_id"))
-            background = asset.get("background_removal") if isinstance(asset, dict) else None
-            if (
-                isinstance(background, dict)
-                and background.get("cutout_path")
-                and background.get("active_variant") == "cutout"
-            ):
-                clip["asset_variant"] = "cutout"
-            else:
-                clip["asset_variant"] = "original"
+            clip["mask_enabled"] = bool(
+                clip.get("asset_variant") == "cutout"
+                or clip.get("asset_id") in legacy_cutout_assets
+            )
+            clip.pop("asset_variant", None)
         return payload
 
     def save_with_revision_check(
@@ -241,6 +252,76 @@ class EditorialProjectStore:
         project = self.save(workspace, project)
         return project, asset, stored_name
 
+    def remove_asset(self, workspace: JobWorkspace, *, asset_id: str) -> EditorialProject:
+        project = self.load(workspace)
+        asset = self.asset_by_id(project, asset_id)
+        if asset is None:
+            msg = f"Asset {asset_id} was not found."
+            raise ValueError(msg)
+        if asset.origin != "library":
+            msg = "Only library assets can be deleted."
+            raise ValueError(msg)
+
+        removed_clips = [clip for clip in project.clips if clip.asset_id == asset_id]
+        removed_clip_ids = {clip.id for clip in removed_clips}
+        tracks_by_id = {track.id: track for track in project.tracks}
+        affected_audio_lane_ids = {
+            clip.track_id
+            for clip in removed_clips
+            if tracks_by_id.get(clip.track_id) and tracks_by_id[clip.track_id].kind == TimelineTrackKind.audio
+        }
+        cleanup_paths = self._asset_cleanup_relative_paths(
+            project,
+            asset,
+            removed_clips=removed_clips,
+            affected_audio_lane_ids=affected_audio_lane_ids,
+        )
+        cleanup_dirs = self._asset_cleanup_directories(workspace, asset)
+
+        updated = project.model_copy(deep=True)
+        updated.assets = [item for item in updated.assets if item.id != asset_id]
+        updated.clips = [clip for clip in updated.clips if clip.asset_id != asset_id]
+        updated.asset_transcriptions = [
+            transcription
+            for transcription in updated.asset_transcriptions
+            if transcription.asset_id != asset_id
+        ]
+        updated.lane_transcriptions = [
+            lane
+            for lane in updated.lane_transcriptions
+            if lane.lane_id not in affected_audio_lane_ids
+        ]
+
+        removed_caption_ids = {
+            caption.id
+            for caption in updated.captions
+            if self._caption_references_deleted_asset(
+                caption,
+                asset_id=asset_id,
+                removed_clip_ids=removed_clip_ids,
+                affected_audio_lane_ids=affected_audio_lane_ids,
+            )
+        }
+        updated.captions = [
+            caption for caption in updated.captions if caption.id not in removed_caption_ids
+        ]
+
+        if updated.selection.clip_id in removed_clip_ids:
+            updated.selection.clip_id = None
+        if updated.selection.subtitle_block_id in removed_caption_ids:
+            updated.selection.subtitle_block_id = None
+
+        updated, _ = self._normalize_generated_subtitles(updated)
+        if updated.selection.clip_id and not any(clip.id == updated.selection.clip_id for clip in updated.clips):
+            updated.selection.clip_id = None
+        if updated.selection.subtitle_block_id and not any(
+            caption.id == updated.selection.subtitle_block_id for caption in updated.captions
+        ):
+            updated.selection.subtitle_block_id = None
+        saved = self.save(workspace, updated)
+        self._delete_workspace_paths(workspace, cleanup_paths, cleanup_dirs)
+        return saved
+
     def set_lane_transcription(
         self,
         workspace: JobWorkspace,
@@ -249,6 +330,7 @@ class EditorialProjectStore:
         lane_id: str,
         transcript: TranscriptArtifact,
         source_audio_path: str,
+        asset_source_audio_paths: dict[str, str] | None = None,
     ) -> EditorialProject:
         next_lane = LaneTranscription(
             lane_id=lane_id,
@@ -268,6 +350,7 @@ class EditorialProjectStore:
             lane_id,
             transcript,
             source_audio_path=source_audio_path,
+            asset_source_audio_paths=asset_source_audio_paths,
         )
         project, _ = self._normalize_generated_subtitles(project)
         return self.save(workspace, project)
@@ -512,6 +595,107 @@ class EditorialProjectStore:
     def asset_by_id(self, project: EditorialProject, asset_id: str) -> ProjectAsset | None:
         return next((asset for asset in project.assets if asset.id == asset_id), None)
 
+    def transcription_scope_for_lane(self, project: EditorialProject, lane_id: str) -> str:
+        asset_ids = {clip.asset_id for clip in self.track_clips(project, lane_id)}
+        if len(asset_ids) == 1:
+            return next(iter(asset_ids))
+        if not asset_ids:
+            fallback_asset = self._fallback_asset_for_lane_transcription(project)
+            if fallback_asset is not None:
+                return fallback_asset.id
+        return f"{TRANSCRIPTION_LANE_SCOPE_PREFIX}{lane_id}"
+
+    def transcription_asset_ids_for_lane(
+        self,
+        project: EditorialProject,
+        lane_id: str,
+    ) -> set[str]:
+        asset_ids = {clip.asset_id for clip in self.track_clips(project, lane_id)}
+        if asset_ids:
+            return asset_ids
+        fallback_asset = self._fallback_asset_for_lane_transcription(project)
+        return {fallback_asset.id} if fallback_asset else set()
+
+    def _caption_references_deleted_asset(
+        self,
+        caption: SubtitleBlock,
+        *,
+        asset_id: str,
+        removed_clip_ids: set[str],
+        affected_audio_lane_ids: set[str],
+    ) -> bool:
+        if caption.source_asset_id == asset_id:
+            return True
+        if caption.source_clip_id and caption.source_clip_id in removed_clip_ids:
+            return True
+        return (
+            caption.origin == ClipOrigin.generated
+            and caption.source_lane_id in affected_audio_lane_ids
+        )
+
+    def _asset_cleanup_relative_paths(
+        self,
+        project: EditorialProject,
+        asset: ProjectAsset,
+        *,
+        removed_clips: list[TimelineClip],
+        affected_audio_lane_ids: set[str],
+    ) -> set[str]:
+        paths: set[str] = set()
+
+        def include(path: str | None) -> None:
+            if isinstance(path, str) and path:
+                paths.add(path)
+
+        include(asset.path)
+        background = asset.background_removal
+        if background:
+            include(background.original_path)
+            include(background.mask_video_path)
+            include(background.benchmark_path)
+            include(background.progress_path)
+
+        for clip in removed_clips:
+            include(clip.transcription_source_audio_path)
+
+        for lane in project.lane_transcriptions:
+            if lane.lane_id in affected_audio_lane_ids:
+                include(lane.source_audio_path)
+
+        return paths
+
+    def _asset_cleanup_directories(
+        self,
+        workspace: JobWorkspace,
+        asset: ProjectAsset,
+    ) -> list[Path]:
+        directories: list[Path] = []
+        if asset.background_removal:
+            directories.append(workspace.background_removal_dir / asset.id)
+        directories.append(workspace.transcriptions_dir / asset.id)
+        return directories
+
+    def _delete_workspace_paths(
+        self,
+        workspace: JobWorkspace,
+        relative_paths: set[str],
+        directories: list[Path],
+    ) -> None:
+        for relative_path in sorted(relative_paths):
+            try:
+                target = workspace.resolve_relative(relative_path)
+            except ValueError:
+                continue
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                continue
+            if target.exists():
+                target.unlink()
+
+        for directory in directories:
+            if directory.exists():
+                shutil.rmtree(directory, ignore_errors=True)
+
     def set_story_lane(self, project: EditorialProject, lane_id: str) -> EditorialProject:
         updated = project.model_copy(deep=True)
         for track in updated.tracks:
@@ -580,7 +764,7 @@ class EditorialProjectStore:
             (
                 asset
                 for asset in project.assets
-                if asset.origin == "ingest" and asset.path.endswith("source_mezzanine.mp4")
+                if asset.origin == "ingest" and asset.path.endswith(SOURCE_MEZZANINE_FILENAME)
             ),
             None,
         )
@@ -838,7 +1022,7 @@ class EditorialProjectStore:
     def _hydrate_legacy_captions(
         self, workspace: JobWorkspace, project: EditorialProject
     ) -> EditorialProject:
-        legacy = workspace.artifact_path("07_caption_display.json")
+        legacy = workspace.artifact_path(ARTIFACT_CAPTION_DISPLAY_FILENAME)
         if not legacy.exists() or project.captions:
             return project
 
@@ -1002,6 +1186,7 @@ class EditorialProjectStore:
         transcript: TranscriptArtifact,
         *,
         source_audio_path: str | None,
+        asset_source_audio_paths: dict[str, str] | None = None,
     ) -> bool:
         lane_clips = self.track_clips(project, lane_id)
         fallback_asset = self._fallback_asset_for_lane_transcription(project) if not lane_clips else None
@@ -1085,6 +1270,11 @@ class EditorialProjectStore:
                 updated_asset_transcriptions.append(item)
                 continue
 
+            asset_source_audio_path = (
+                asset_source_audio_paths.get(item.asset_id, source_audio_path)
+                if asset_source_audio_paths
+                else source_audio_path
+            )
             ranges = touched_ranges_by_asset[item.asset_id]
             preserved = [
                 word
@@ -1104,26 +1294,35 @@ class EditorialProjectStore:
                         "language": transcript.language,
                         "words": merged_words,
                         "source_lane_id": lane_id,
-                        "source_audio_path": source_audio_path,
+                        "source_audio_path": asset_source_audio_path,
                         "updated_at": utcnow(),
                         "error": None,
                     },
                     deep=True,
                 )
             )
-            if item.words != merged_words or item.source_lane_id != lane_id:
+            if (
+                item.words != merged_words
+                or item.source_lane_id != lane_id
+                or item.source_audio_path != asset_source_audio_path
+            ):
                 changed = True
 
         for asset_id, words in next_words_by_asset.items():
             if asset_id in existing_by_asset:
                 continue
+            asset_source_audio_path = (
+                asset_source_audio_paths.get(asset_id, source_audio_path)
+                if asset_source_audio_paths
+                else source_audio_path
+            )
             updated_asset_transcriptions.append(
                 AssetTranscription(
                     asset_id=asset_id,
                     language=transcript.language,
                     words=sorted(words.values(), key=lambda word: (word.start, word.end, word.text, word.id)),
                     source_lane_id=lane_id,
-                    source_audio_path=source_audio_path,
+                    source_audio_path=asset_source_audio_path,
                     error=None,
                 )
             )

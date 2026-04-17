@@ -11,7 +11,7 @@ def test_background_removal_uses_auto_device_for_sam2():
     assert BackgroundRemovalService.DEFAULT_SAM2_DEVICE == "auto"
 
 
-def test_background_removal_runner_command_skips_compare_generation(tmp_path):
+def test_background_removal_runner_command_requests_mask_only_outputs(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     service = BackgroundRemovalService(
         settings,
@@ -22,5 +22,5 @@ def test_background_removal_runner_command_skips_compare_generation(tmp_path):
 
     command = service._runner_command(Path("/tmp/source.mp4"), Path("/tmp/output"))
 
-    assert "--preserve-audio" in command
+    assert "--preserve-audio" not in command
     assert "--make-compare" not in command

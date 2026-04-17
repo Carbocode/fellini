@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import json
+import math
 import re
 import shlex
 import shutil
@@ -11,7 +11,6 @@ from array import array
 from pathlib import Path
 
 from fellini.domain.models import (
-    AssetVariantKind,
     EditDecisionList,
     EditorialProject,
     ProbeInfo,
@@ -22,6 +21,7 @@ from fellini.domain.models import (
 )
 from fellini.log import get_logger
 from fellini.settings import AppSettings
+from fellini.workspace_layout import EDITED_MASTER_FILENAME
 
 logger = get_logger(__name__)
 
@@ -338,7 +338,7 @@ class FFmpegAdapter:
 
         concat_list = output_dir / "segments.txt"
         self._write_concat_list(concat_list, segment_paths)
-        edited_master = output_dir / "edited_master.mp4"
+        edited_master = output_dir / EDITED_MASTER_FILENAME
         args = [
             self.settings.ffmpeg_bin,
             "-y",
@@ -569,21 +569,38 @@ class FFmpegAdapter:
 
         video_clips = self._video_render_clips(project)
         audio_clips = self._audio_render_clips(project)
-        inputs, input_indexes = self._project_inputs_for_clips(
-            workspace_root,
-            project,
-            [(clip, False) for clip in video_clips] + [(clip, True) for clip in audio_clips],
-            start_index=1,
-        )
+        inputs: list[Path] = []
+        input_indexes: dict[str, int] = {}
+
+        def register_input(key: str | None) -> None:
+            if not key or key in input_indexes:
+                return
+            input_indexes[key] = len(inputs) + 1
+            inputs.append(workspace_root / key)
+
+        for clip in video_clips:
+            register_input(self._clip_video_source_key(project, clip))
+            register_input(self._clip_mask_source_key(project, clip))
+        for clip in audio_clips:
+            register_input(self._clip_audio_source_key(project, clip))
 
         filters: list[str] = []
         overlay_inputs: list[tuple[str, float, float]] = []
         audio_labels: list[str] = []
 
         for clip in video_clips:
-            asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=False)]
-            label = f"v{len(overlay_inputs)}"
-            crop_left, crop_top, visible_width, visible_height, scaled_width, scaled_height = (
+            asset_index = input_indexes[self._clip_video_source_key(project, clip)]
+            source_label = f"vsrc{len(overlay_inputs)}"
+            (
+                frame_width,
+                frame_height,
+                crop_left,
+                crop_top,
+                visible_width,
+                visible_height,
+                scaled_width,
+                scaled_height,
+            ) = (
                 self._clip_video_geometry(
                     project,
                     clip,
@@ -604,16 +621,49 @@ class FFmpegAdapter:
                             f"rotate={(clip.transform.rotation or 0.0) * (math.pi / 180):.6f}:"
                             "ow=rotw(iw):oh=roth(ih):c=none"
                         ),
-                        f"colorchannelmixer=aa={max(0.0, min(1.0, clip.transform.opacity or 0.0)):.6f}",
                         "format=rgba",
                     ]
                 )
-                + f"[{label}]"
+                + f"[{source_label}]"
+            )
+            composed_label = f"[{source_label}]"
+            mask_source_key = self._clip_mask_source_key(project, clip)
+            if mask_source_key:
+                mask_index = input_indexes[mask_source_key]
+                mask_label = f"vmask{len(overlay_inputs)}"
+                filters.append(
+                    ",".join(
+                        [
+                            f"[{mask_index}:v]trim=start={clip.source_in:.3f}:end={clip.source_out:.3f}",
+                            f"setpts=PTS-STARTPTS+{clip.start:.3f}/TB",
+                            f"scale={frame_width}:{frame_height}:flags=bicubic",
+                            "setsar=1",
+                            f"crop={visible_width}:{visible_height}:{crop_left}:{crop_top}",
+                            f"scale={scaled_width}:{scaled_height}:flags=bicubic",
+                            "setsar=1",
+                            "format=gray",
+                            (
+                                f"rotate={(clip.transform.rotation or 0.0) * (math.pi / 180):.6f}:"
+                                "ow=rotw(iw):oh=roth(ih):c=black"
+                            ),
+                            "format=gray",
+                        ]
+                    )
+                    + f"[{mask_label}]"
+                )
+                alpha_label = f"valpha{len(overlay_inputs)}"
+                filters.append(f"[{source_label}][{mask_label}]alphamerge[{alpha_label}]")
+                composed_label = f"[{alpha_label}]"
+
+            label = f"v{len(overlay_inputs)}"
+            filters.append(
+                f"{composed_label}colorchannelmixer=aa={max(0.0, min(1.0, clip.transform.opacity or 0.0)):.6f},"
+                f"format=rgba[{label}]"
             )
             overlay_inputs.append((f"[{label}]", clip.transform.x or 0.0, clip.transform.y or 0.0))
 
         for clip in audio_clips:
-            asset_index = input_indexes[self._clip_source_key(project, clip, for_audio=True)]
+            asset_index = input_indexes[self._clip_audio_source_key(project, clip)]
             label = f"a{len(audio_labels)}"
             delay_ms = max(0, round(clip.start * 1000))
             duration_clip = max(0.02, clip.source_out - clip.source_in)
@@ -663,7 +713,7 @@ class FFmpegAdapter:
                 (
                     f"{base_label}{overlay_label}"
                     f"overlay=x='(main_w-overlay_w)/2+{translate_x:.6f}':"
-                    f"y='(main_h-overlay_h)/2-{translate_y:.6f}':"
+                    f"y='(main_h-overlay_h)/2+{translate_y:.6f}':"
                     "eof_action=pass:format=auto"
                     f"{next_label}"
                 )
@@ -720,7 +770,7 @@ class FFmpegAdapter:
         *,
         sequence_width: int,
         sequence_height: int,
-    ) -> tuple[int, int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, int, int, int]:
         asset = next((item for item in project.assets if item.id == clip.asset_id), None)
         if asset is None:
             msg = f"Asset {clip.asset_id} referenced by clip {clip.id} was not found."
@@ -756,6 +806,8 @@ class FFmpegAdapter:
         scaled_width = max(1, round(visible_width * contain_scale * user_scale))
         scaled_height = max(1, round(visible_height * contain_scale * user_scale))
         return (
+            frame_width,
+            frame_height,
             round(crop_left),
             round(crop_top),
             visible_width,
@@ -919,6 +971,40 @@ class FFmpegAdapter:
             inputs.append(workspace_root / key)
         return inputs, input_indexes
 
+    def _asset_for_clip(self, project: EditorialProject, clip: TimelineClip):
+        asset = next((item for item in project.assets if item.id == clip.asset_id), None)
+        if asset is None:
+            msg = f"Asset {clip.asset_id} referenced by clip {clip.id} was not found."
+            raise FFmpegError(msg)
+        return asset
+
+    def _clip_video_source_key(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+    ) -> str:
+        asset = self._asset_for_clip(project, clip)
+        background = asset.background_removal
+        return background.original_path if background and background.original_path else asset.path
+
+    def _clip_audio_source_key(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+    ) -> str:
+        return self._clip_video_source_key(project, clip)
+
+    def _clip_mask_source_key(
+        self,
+        project: EditorialProject,
+        clip: TimelineClip,
+    ) -> str | None:
+        if not clip.mask_enabled:
+            return None
+        asset = self._asset_for_clip(project, clip)
+        background = asset.background_removal
+        return background.mask_video_path if background and background.mask_video_path else None
+
     def _clip_source_key(
         self,
         project: EditorialProject,
@@ -926,20 +1012,11 @@ class FFmpegAdapter:
         *,
         for_audio: bool,
     ) -> str:
-        asset = next((item for item in project.assets if item.id == clip.asset_id), None)
-        if asset is None:
-            msg = f"Asset {clip.asset_id} referenced by clip {clip.id} was not found."
-            raise FFmpegError(msg)
-        background = asset.background_removal
-        if for_audio:
-            return (background.original_path if background and background.original_path else asset.path)
-        if (
-            clip.asset_variant == AssetVariantKind.cutout
-            and background
-            and background.cutout_path
-        ):
-            return background.cutout_path
-        return (background.original_path if background and background.original_path else asset.path)
+        return (
+            self._clip_audio_source_key(project, clip)
+            if for_audio
+            else self._clip_video_source_key(project, clip)
+        )
 
     def _resolve_video_encoder(self, preferred: str) -> str:
         available = self._available_encoders()

@@ -4,6 +4,7 @@ from fellini.domain.models import RenderPlan, StepName
 from fellini.log import get_logger
 from fellini.pipeline.context import PipelineContext
 from fellini.pipeline.steps.base import PipelineStep
+from fellini.workspace_layout import ARTIFACT_RENDER_PLAN_FILENAME, EDITED_MASTER_FILENAME
 
 logger = get_logger(__name__)
 
@@ -25,7 +26,7 @@ class RenderStep(PipelineStep):
             len(project.clips),
         )
         context.report_progress(self.name, 10, "Rendering finale della timeline")
-        edited_master = context.workspace.output_path("edited_master.mp4")
+        edited_master = context.workspace.output_path(EDITED_MASTER_FILENAME)
         context.ffmpeg.render_project_master(
             workspace_root=context.workspace.job_dir,
             project=project,
@@ -38,7 +39,7 @@ class RenderStep(PipelineStep):
         context.state.render_plan.subtitles_path = None
         outputs = [context.output_relative(edited_master)]
         artifacts = [
-            context.save_json_artifact("09_render_plan.json", context.state.render_plan),
+            context.save_json_artifact(ARTIFACT_RENDER_PLAN_FILENAME, context.state.render_plan),
             context.workspace.relative(context.workspace.editorial_project_path),
         ]
         context.report_progress(self.name, 100, "Render completato")

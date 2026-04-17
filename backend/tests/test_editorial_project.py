@@ -8,7 +8,6 @@ from fellini.domain.models import (
     AssetPreviewEntry,
     AssetPreviewStatus,
     AssetPreviewVariants,
-    AssetVariantKind,
     AudioTrackRole,
     ClipOrigin,
     EditorialProject,
@@ -37,7 +36,7 @@ from fellini.settings import AppSettings
 def test_save_strips_runtime_asset_preview_fields(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_preview_strip")
+    workspace = JobWorkspace(settings.projects_root, "job_preview_strip")
     workspace.bootstrap()
     project = EditorialProject(
         sequence=ProjectSequence(),
@@ -52,7 +51,7 @@ def test_save_strips_runtime_asset_preview_fields(tmp_path):
                     original=AssetPreviewBundle(
                         filmstrip=AssetPreviewEntry(
                             status=AssetPreviewStatus.ready,
-                            resource_path="artifacts/previews/asset_source.original.filmstrip.png",
+                            resource_path="jobs/previews/asset_source/original/filmstrip.png",
                         )
                     )
                 ),
@@ -69,7 +68,7 @@ def test_save_strips_runtime_asset_preview_fields(tmp_path):
 def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_variant_migration")
+    workspace = JobWorkspace(settings.projects_root, "job_variant_migration")
     workspace.bootstrap()
     workspace.editorial_project_path.write_text(
         json.dumps(
@@ -86,14 +85,23 @@ def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
                         id="asset_source",
                         kind=ProjectAssetKind.video,
                         label="clip.mp4",
-                        path="artifacts/background-removal/asset_source/cutout.mp4",
+                        path="jobs/background-removal/asset_source/cutout.mp4",
                         duration=5.0,
                         background_removal=AssetBackgroundRemoval(
-                            active_variant=AssetVariantKind.cutout,
                             original_path="uploads/clip.mp4",
-                            cutout_path="artifacts/background-removal/asset_source/cutout.mp4",
+                            mask_video_path=None,
                         ),
-                    ).model_dump(mode="json"),
+                    ).model_dump(mode="json")
+                    | {
+                        "background_removal": {
+                            "status": "idle",
+                            "progress": 0.0,
+                            "message": "",
+                            "original_path": "uploads/clip.mp4",
+                            "active_variant": "cutout",
+                            "cutout_path": "jobs/background-removal/asset_source/cutout.mp4",
+                        }
+                    },
                 ],
                 "clips": [
                     TimelineClip(
@@ -103,7 +111,7 @@ def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
                         start=0.0,
                         source_in=0.0,
                         source_out=5.0,
-                    ).model_dump(mode="json", exclude={"asset_variant"}),
+                    ).model_dump(mode="json", exclude={"mask_enabled"}),
                     TimelineClip(
                         id="clip_audio",
                         asset_id="asset_source",
@@ -111,7 +119,7 @@ def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
                         start=0.0,
                         source_in=0.0,
                         source_out=5.0,
-                    ).model_dump(mode="json", exclude={"asset_variant"}),
+                    ).model_dump(mode="json", exclude={"mask_enabled"}),
                 ],
                 "captions": [],
                 "asset_transcriptions": [],
@@ -125,8 +133,187 @@ def test_load_migrates_legacy_asset_variant_from_asset_level_state(tmp_path):
     project = store.load(workspace)
 
     assert project.assets[0].path == "uploads/clip.mp4"
-    assert project.clips[0].asset_variant == AssetVariantKind.cutout
-    assert project.clips[1].asset_variant == AssetVariantKind.original
+    assert project.assets[0].background_removal is not None
+    assert project.assets[0].background_removal.mask_video_path == (
+        "jobs/background-removal/asset_source/cutout.mp4"
+    )
+    assert project.clips[0].mask_enabled is True
+    assert project.clips[1].mask_enabled is False
+
+
+def test_remove_asset_cleans_related_project_state_and_files(tmp_path):
+    settings = AppSettings(workspace_root=tmp_path / "workspace")
+    store = EditorialProjectStore(settings)
+    workspace = JobWorkspace(settings.projects_root, "job_asset_delete")
+    workspace.bootstrap()
+
+    library_media = workspace.upload_path("lib_clip.mp4")
+    library_media.write_bytes(b"video")
+    keep_media = workspace.upload_path("keep.wav")
+    keep_media.write_bytes(b"audio")
+    mask_dir = workspace.artifacts_dir / "background-removal" / "asset_library"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    mask_video = mask_dir / "mask.mp4"
+    benchmark = mask_dir / "benchmark.json"
+    progress = mask_dir / "progress.json"
+    mask_video.write_bytes(b"mask")
+    benchmark.write_text("{}", encoding="utf-8")
+    progress.write_text("{}", encoding="utf-8")
+    clip_bounce = workspace.transcription_path("asset_library", "clip_clip_audio_remove_bounce.wav")
+    lane_bounce = workspace.transcription_path("asset_library", "lane_track_audio_1_bounce.wav")
+    clip_bounce.write_bytes(b"clip-audio")
+    lane_bounce.write_bytes(b"lane-audio")
+
+    project = EditorialProject(
+        sequence=ProjectSequence(),
+        tracks=[
+            TimelineTrack(id="track_video_1", kind=TimelineTrackKind.video, name="Video 1"),
+            TimelineTrack(id="track_audio_1", kind=TimelineTrackKind.audio, name="Audio 1", role=AudioTrackRole.story),
+            TimelineTrack(id="track_subtitle_1", kind=TimelineTrackKind.subtitle, name="Editorial"),
+        ],
+        assets=[
+            ProjectAsset(
+                id="asset_library",
+                origin="library",
+                kind=ProjectAssetKind.video,
+                label="library.mp4",
+                path=workspace.relative(library_media),
+                duration=5.0,
+                width=1920,
+                height=1080,
+                has_audio=True,
+                background_removal=AssetBackgroundRemoval(
+                    original_path=workspace.relative(library_media),
+                    mask_video_path=workspace.relative(mask_video),
+                    benchmark_path=workspace.relative(benchmark),
+                    progress_path=workspace.relative(progress),
+                ),
+            ),
+            ProjectAsset(
+                id="asset_keep",
+                origin="library",
+                kind=ProjectAssetKind.audio,
+                label="keep.wav",
+                path=workspace.relative(keep_media),
+                duration=3.0,
+                has_audio=True,
+            ),
+        ],
+        clips=[
+            TimelineClip(
+                id="clip_video_remove",
+                asset_id="asset_library",
+                track_id="track_video_1",
+                start=0.0,
+                source_in=0.0,
+                source_out=5.0,
+            ),
+            TimelineClip(
+                id="clip_audio_remove",
+                asset_id="asset_library",
+                track_id="track_audio_1",
+                start=0.0,
+                source_in=0.0,
+                source_out=5.0,
+                transcription_source_audio_path=workspace.relative(clip_bounce),
+                transcription_status=LaneTranscriptionStatus.completed,
+            ),
+        ],
+        captions=[
+            SubtitleBlock(
+                id="caption_remove",
+                track_id="track_subtitle_1",
+                source_lane_id="track_audio_1",
+                source_clip_id="clip_audio_remove",
+                source_asset_id="asset_library",
+                source_asset_start=0.0,
+                source_asset_end=0.5,
+                start=0.0,
+                end=0.5,
+                text="ciao",
+                origin=ClipOrigin.generated,
+            ),
+            SubtitleBlock(
+                id="caption_manual",
+                track_id="track_subtitle_1",
+                source_lane_id="track_subtitle_1",
+                start=1.0,
+                end=1.5,
+                text="manuale",
+                origin=ClipOrigin.manual,
+            ),
+        ],
+        asset_transcriptions=[
+            AssetTranscription(
+                asset_id="asset_library",
+                language="it",
+                words=[
+                    AssetTranscriptionWord(
+                        id="word_remove",
+                        start=0.0,
+                        end=0.5,
+                        text="ciao",
+                        source_word_refs=[SourceWordRef(segment_id="seg_remove", word_index=0)],
+                    )
+                ],
+                source_lane_id="track_audio_1",
+                source_audio_path=workspace.relative(lane_bounce),
+            ),
+            AssetTranscription(
+                asset_id="asset_keep",
+                language="it",
+                words=[
+                    AssetTranscriptionWord(
+                        id="word_keep",
+                        start=0.0,
+                        end=0.5,
+                        text="resta",
+                        source_word_refs=[SourceWordRef(segment_id="seg_keep", word_index=0)],
+                    )
+                ],
+            ),
+        ],
+        lane_transcriptions=[
+            LaneTranscription(
+                lane_id="track_audio_1",
+                status=LaneTranscriptionStatus.completed,
+                language="it",
+                segments=[
+                    TranscriptSegment(
+                        id="seg_remove",
+                        start=0.0,
+                        end=0.5,
+                        text="ciao",
+                        words=[WordTiming(text="ciao", start=0.0, end=0.5, confidence=1.0)],
+                    )
+                ],
+                source_audio_path=workspace.relative(lane_bounce),
+            )
+        ],
+        selection=ProjectSelection(
+            track_id="track_audio_1",
+            clip_id="clip_audio_remove",
+            subtitle_block_id="caption_remove",
+        ),
+    )
+    store.save(workspace, project)
+
+    updated = store.remove_asset(workspace, asset_id="asset_library")
+
+    assert [asset.id for asset in updated.assets] == ["asset_keep"]
+    assert updated.clips == []
+    assert [item.asset_id for item in updated.asset_transcriptions] == ["asset_keep"]
+    assert updated.lane_transcriptions == []
+    caption_ids = {caption.id for caption in updated.captions}
+    assert "caption_remove" not in caption_ids
+    assert "caption_manual" in caption_ids
+    assert updated.selection.clip_id is None
+    assert updated.selection.subtitle_block_id is None
+    assert library_media.exists() is False
+    assert mask_dir.exists() is False
+    assert clip_bounce.exists() is False
+    assert lane_bounce.exists() is False
+    assert keep_media.exists() is True
 
 
 def test_normalize_linked_clip_groups_pairs_matching_video_and_audio(tmp_path):
@@ -311,7 +498,7 @@ def test_normalize_track_layout_adds_new_pair_when_all_pairs_are_occupied(tmp_pa
 def test_set_lane_transcription_uses_editorial_lane_for_generated_subtitles(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_subtitles_host")
+    workspace = JobWorkspace(settings.projects_root, "job_subtitles_host")
     workspace.bootstrap()
     project = EditorialProject(
         sequence=ProjectSequence(),
@@ -376,10 +563,21 @@ def test_set_lane_transcription_uses_editorial_lane_for_generated_subtitles(tmp_
                 )
             ],
         ),
-        source_audio_path="temp/lane_track_audio_1_bounce.wav",
+        source_audio_path="jobs/transcriptions/asset_source/lane_track_audio_1_bounce.wav",
+        asset_source_audio_paths={
+            "asset_source": "jobs/transcriptions/asset_source/lane_track_audio_1_bounce.wav",
+        },
     )
 
     assert updated.lane_transcriptions[0].lane_id == "track_audio_1"
+    assert (
+        updated.lane_transcriptions[0].source_audio_path
+        == "jobs/transcriptions/asset_source/lane_track_audio_1_bounce.wav"
+    )
+    assert (
+        updated.asset_transcriptions[0].source_audio_path
+        == "jobs/transcriptions/asset_source/lane_track_audio_1_bounce.wav"
+    )
     assert [caption.track_id for caption in updated.captions] == ["track_subtitle_1", "track_subtitle_1"]
     assert [caption.text for caption in updated.captions] == ["ciao", "lane"]
 
@@ -432,7 +630,7 @@ def test_story_lane_editorial_transcript_uses_story_clip_transcriptions(tmp_path
                     AssetTranscriptionWord(id="word_after", start=2.2, end=2.4, text="dopo"),
                 ],
                 source_lane_id="track_audio_1",
-                source_audio_path="temp/clip_audio_1_bounce.wav",
+                source_audio_path="jobs/transcriptions/asset_source/clip_audio_1_bounce.wav",
             )
         ],
     )
@@ -474,7 +672,7 @@ def test_normalize_generated_subtitles_preserves_editorial_result_blocks(tmp_pat
                 language="it",
                 words=[],
                 source_lane_id="track_audio_1",
-                source_audio_path="temp/clip_audio_1_bounce.wav",
+                source_audio_path="jobs/transcriptions/asset_source/clip_audio_1_bounce.wav",
             )
         ],
     )
@@ -557,7 +755,7 @@ def test_replace_editorial_result_captions_uses_labeled_spans_for_editorial_lane
 def test_set_clip_transcription_replaces_only_the_selected_clip_range(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_clip_transcription")
+    workspace = JobWorkspace(settings.projects_root, "job_clip_transcription")
     workspace.bootstrap()
     project = EditorialProject(
         sequence=ProjectSequence(),
@@ -643,14 +841,17 @@ def test_set_clip_transcription_replaces_only_the_selected_clip_range(tmp_path):
                 )
             ],
         ),
-        source_audio_path="temp/clip_audio_1_bounce.wav",
+        source_audio_path="jobs/transcriptions/asset_source/clip_audio_1_bounce.wav",
     )
 
     clip = next(item for item in updated.clips if item.id == "clip_audio_1")
     words = updated.asset_transcriptions[0].words
 
     assert clip.transcription_status == LaneTranscriptionStatus.completed
-    assert clip.transcription_source_audio_path == "temp/clip_audio_1_bounce.wav"
+    assert (
+        clip.transcription_source_audio_path
+        == "jobs/transcriptions/asset_source/clip_audio_1_bounce.wav"
+    )
     assert [word.text for word in words] == ["prima", "ciao", "clip", "dopo"]
     assert [(round(word.start, 2), round(word.end, 2)) for word in words[1:3]] == [
         (1.0, 1.24),
@@ -663,7 +864,7 @@ def test_set_clip_transcription_replaces_only_the_selected_clip_range(tmp_path):
 def test_recover_interrupted_runtime_state_marks_lane_and_clip_failed(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = EditorialProjectStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job_runtime_recovery")
+    workspace = JobWorkspace(settings.projects_root, "job_runtime_recovery")
     workspace.bootstrap()
     project = EditorialProject(
         sequence=ProjectSequence(),
@@ -855,7 +1056,7 @@ def test_normalize_generated_subtitles_materializes_same_asset_for_multiple_clip
                     ),
                 ],
                 source_lane_id="track_audio_1",
-                source_audio_path="temp/lane_track_audio_1_bounce.wav",
+                source_audio_path="jobs/transcriptions/asset_source/lane_track_audio_1_bounce.wav",
             )
         ],
     )

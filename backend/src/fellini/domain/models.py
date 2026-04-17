@@ -71,9 +71,9 @@ class AssetPreviewStatus(StrEnum):
     failed = "failed"
 
 
-class AssetVariantKind(StrEnum):
+class AssetPreviewVariantKind(StrEnum):
     original = "original"
-    cutout = "cutout"
+    mask = "mask"
 
 
 class AssetProcessingStatus(StrEnum):
@@ -169,18 +169,17 @@ class AssetPreviewBundle(BaseModel):
 
 class AssetPreviewVariants(BaseModel):
     original: AssetPreviewBundle | None = None
-    cutout: AssetPreviewBundle | None = None
+    mask: AssetPreviewBundle | None = None
 
 
 class AssetBackgroundRemoval(BaseModel):
     status: AssetProcessingStatus = AssetProcessingStatus.idle
-    active_variant: AssetVariantKind = AssetVariantKind.original
     phase: str | None = None
     progress: float = 0.0
     message: str = ""
     error: str | None = None
     original_path: str | None = None
-    cutout_path: str | None = None
+    mask_video_path: str | None = None
     benchmark_path: str | None = None
     progress_path: str | None = None
     updated_at: datetime = Field(default_factory=utcnow)
@@ -217,7 +216,7 @@ class TimelineClip(BaseModel):
     z_index: int = 0
     enabled: bool = True
     origin: ClipOrigin = ClipOrigin.manual
-    asset_variant: AssetVariantKind = AssetVariantKind.original
+    mask_enabled: bool = False
     transform: ClipTransform = Field(default_factory=ClipTransform)
     audio: ClipAudio = Field(default_factory=ClipAudio)
     captions_enabled: bool = True

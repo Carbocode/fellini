@@ -19,11 +19,11 @@ from fellini.settings import AppSettings
 def test_load_state_prefers_updated_artifacts_over_cached_pipeline_snapshot(tmp_path):
     settings = AppSettings(workspace_root=tmp_path / "workspace")
     store = JobStore(settings)
-    workspace = JobWorkspace(settings.jobs_root, "job123")
+    workspace = JobWorkspace(settings.projects_root, "job123")
     workspace.bootstrap()
 
-    workspace.temp_path("source_mezzanine.mp4").write_bytes(b"video")
-    workspace.temp_path("audio_16k_mono.wav").write_bytes(b"audio")
+    workspace.mezzanine_path.write_bytes(b"video")
+    workspace.audio_path.write_bytes(b"audio")
     workspace.artifact_path("01_media_probe.json").write_text(
         json.dumps(
             {

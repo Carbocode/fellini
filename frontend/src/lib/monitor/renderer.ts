@@ -14,6 +14,7 @@ type GpuObjects = {
 export interface RenderVideoLayer {
   spec: MonitorVideoLayer;
   frame: VideoFrame;
+  maskFrame?: VideoFrame | null;
 }
 
 const UNIFORM_FLOATS = 16;
@@ -87,6 +88,12 @@ function releaseRenderLayerFrames(layers: RenderVideoLayer[]): void {
     } catch {
       // Ignore already-released frames.
     }
+    if (!layer.maskFrame) continue;
+    try {
+      layer.maskFrame.close();
+    } catch {
+      // Ignore already-released frames.
+    }
   }
 }
 
@@ -125,7 +132,7 @@ function layerUniforms(sequence: MonitorSequenceSpec, layer: RenderVideoLayer): 
     Math.sin(radians),
     clamp(layer.spec.transform.opacity ?? 1, 0, 1),
     aspect,
-    0,
+    layer.maskFrame ? 1 : 0,
     0,
     0,
     0,
@@ -191,6 +198,8 @@ export class MonitorWebGpuRenderer {
               rotation: vec2f,
               opacity: f32,
               aspect: f32,
+              use_mask: f32,
+              _pad0: f32,
               _pad1: vec2f,
             };
             struct VertexOut {
@@ -232,8 +241,22 @@ export class MonitorWebGpuRenderer {
       fragment: {
         module: device.createShaderModule({
           code: `
+            struct LayerUniforms {
+              scale: vec2f,
+              translate: vec2f,
+              uv_origin: vec2f,
+              uv_scale: vec2f,
+              rotation: vec2f,
+              opacity: f32,
+              aspect: f32,
+              use_mask: f32,
+              _pad0: f32,
+              _pad1: vec2f,
+            };
+            @group(0) @binding(0) var<uniform> uniforms: LayerUniforms;
             @group(0) @binding(1) var frameSampler: sampler;
             @group(0) @binding(2) var frameTexture: texture_external;
+            @group(0) @binding(3) var maskTexture: texture_external;
 
             @fragment
             fn main(
@@ -241,7 +264,10 @@ export class MonitorWebGpuRenderer {
               @location(1) opacity: f32,
             ) -> @location(0) vec4f {
               let color = textureSampleBaseClampToEdge(frameTexture, frameSampler, uv);
-              return vec4f(color.rgb, color.a * opacity);
+              let maskColor = textureSampleBaseClampToEdge(maskTexture, frameSampler, uv);
+              let maskAlpha = dot(maskColor.rgb, vec3f(0.299, 0.587, 0.114));
+              let alpha = mix(color.a, maskAlpha, uniforms.use_mask) * opacity;
+              return vec4f(color.rgb, alpha);
             }
           `,
         }),
@@ -326,12 +352,16 @@ export class MonitorWebGpuRenderer {
           const externalTexture = device.importExternalTexture({
             source: layer.frame,
           });
+          const maskTexture = device.importExternalTexture({
+            source: layer.maskFrame ?? layer.frame,
+          });
           const bindGroup = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
             entries: [
               { binding: 0, resource: { buffer: uniformBuffer } },
               { binding: 1, resource: sampler },
               { binding: 2, resource: externalTexture },
+              { binding: 3, resource: maskTexture },
             ],
           });
           pass.setBindGroup(0, bindGroup);

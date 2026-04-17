@@ -1,0 +1,101 @@
+{
+  "workspace": {
+    "projects_dirname": "projects",
+    "legacy_projects_dirname": "jobs"
+  },
+  "project": {
+    "uploads_dirname": "uploads",
+    "jobs_dirname": "jobs",
+    "legacy_jobs_dirname": "artifacts",
+    "output_dirname": "output",
+    "state_dirname": "project",
+    "temp_dirname": "temp"
+  },
+  "project_files": {
+    "snapshot": "project.json",
+    "legacy_snapshot": "job.json",
+    "editorial_project": "editorial_project.json",
+    "asset_preview_state": "asset_previews.json"
+  },
+  "job_dirs": {
+    "previews": "previews",
+    "background_removal": "background-removal",
+    "runtime": "runtime",
+    "transcriptions": "transcriptions"
+  },
+  "runtime_files": {
+    "pipeline_state": "pipeline_state.json",
+    "source_mezzanine": "source_mezzanine.mp4",
+    "canonical_audio": "audio_16k_mono.wav",
+    "edited_master": "edited_master.mp4"
+  },
+  "naming": {
+    "transcription_lane_scope_prefix": "lane_",
+    "transcription_orphan_scope_dirname": "_orphaned"
+  },
+  "artifacts": {
+    "media_probe": "01_media_probe.json",
+    "vad_segments": "02_vad_segments.json",
+    "transcript_raw": "03_transcript_raw.json",
+    "transcript_aligned": "04_transcript_aligned.json",
+    "story_lane_unified_transcript": "05_story_lane_unified_transcript.json",
+    "spans_labeled": "05_spans_labeled.json",
+    "edit_decision_list": "06_edit_decision_list.json",
+    "caption_display": "07_caption_display.json",
+    "render_plan": "09_render_plan.json"
+  },
+  "step_artifacts": {
+    "ingest": [
+      "01_media_probe.json",
+      "02_vad_segments.json",
+      "03_transcript_raw.json",
+      "04_transcript_aligned.json",
+      "05_spans_labeled.json",
+      "06_edit_decision_list.json",
+      "07_caption_display.json",
+      "09_render_plan.json"
+    ],
+    "transcription": [
+      "02_vad_segments.json",
+      "03_transcript_raw.json",
+      "04_transcript_aligned.json",
+      "05_spans_labeled.json",
+      "06_edit_decision_list.json",
+      "07_caption_display.json",
+      "09_render_plan.json"
+    ],
+    "alignment": [
+      "04_transcript_aligned.json",
+      "05_spans_labeled.json",
+      "06_edit_decision_list.json",
+      "07_caption_display.json",
+      "09_render_plan.json"
+    ],
+    "editorial": [
+      "05_spans_labeled.json",
+      "06_edit_decision_list.json",
+      "07_caption_display.json",
+      "09_render_plan.json"
+    ],
+    "render": []
+  },
+  "recoverable_step_artifacts": {
+    "ingest": [
+      "01_media_probe.json"
+    ],
+    "transcription": [
+      "02_vad_segments.json",
+      "03_transcript_raw.json",
+      "04_transcript_aligned.json"
+    ],
+    "editorial": [
+      "05_story_lane_unified_transcript.json",
+      "05_spans_labeled.json",
+      "06_edit_decision_list.json",
+      "09_render_plan.json"
+    ],
+    "render": [
+      "09_render_plan.json"
+    ]
+  }
+}

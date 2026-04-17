@@ -2,6 +2,7 @@ from subprocess import CompletedProcess
 
 from fellini.adapters.ffmpeg import FFmpegAdapter
 from fellini.domain.models import (
+    AssetBackgroundRemoval,
     ClipCrop,
     ClipTransform,
     EditorialProject,
@@ -105,6 +106,10 @@ def test_ffmpeg_render_project_master_uses_sequence_state_and_timeline_geometry(
                 width=1920,
                 height=1080,
                 has_audio=True,
+                background_removal=AssetBackgroundRemoval(
+                    original_path="uploads/front.mp4",
+                    mask_video_path="jobs/background-removal/asset_front/mask.mp4",
+                ),
             ),
             ProjectAsset(
                 id="asset_audio",
@@ -134,6 +139,7 @@ def test_ffmpeg_render_project_master_uses_sequence_state_and_timeline_geometry(
                 start=1.0,
                 source_in=0.0,
                 source_out=2.0,
+                mask_enabled=True,
                 transform=ClipTransform(
                     x=32.0,
                     y=18.0,
@@ -182,7 +188,12 @@ def test_ffmpeg_render_project_master_uses_sequence_state_and_timeline_geometry(
     assert "color=c=0x112233:s=720x1280:r=25:d=3.000" in serialized
     assert "sample_rate=44100:d=3.000" in serialized
     assert "crop=1680:960:120:60" in filter_complex
+    assert (
+        "scale=1920:1080:flags=bicubic,setsar=1,crop=1680:960:120:60,scale=828:473:flags=bicubic"
+        in filter_complex
+    )
     assert "rotate=0.261799:ow=rotw(iw):oh=roth(ih):c=none" in filter_complex
+    assert "alphamerge" in filter_complex
     assert "colorchannelmixer=aa=0.700000" in filter_complex
-    assert "overlay=x='(main_w-overlay_w)/2+32.000000':y='(main_h-overlay_h)/2-18.000000'" in filter_complex
+    assert "overlay=x='(main_w-overlay_w)/2+32.000000':y='(main_h-overlay_h)/2+18.000000'" in filter_complex
     assert filter_complex.index("[1:v]") < filter_complex.index("[2:v]")
